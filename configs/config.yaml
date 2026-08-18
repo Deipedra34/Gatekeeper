@@ -1,0 +1,89 @@
+# Gatekeeper configuration.
+#
+# This file is loaded once at startup (see -config flag on the
+# gatekeeper binary). See README.md for a full field-by-field
+# explanation and for the trade-offs between the three rate-limiting
+# algorithms.
+
+server:
+  listen_addr: ":8080"
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 60s
+
+# storage.backend selects where rate-limit counters live:
+#   memory - a mutex-protected map, local to this process. Simplest,
+#            fastest, but each instance enforces its own independent
+#            limit if you run more than one.
+#   redis  - shared counters in Redis, so a fleet of gatekeeper
+#            instances behind a load balancer enforce one combined
+#            limit per client. If Redis becomes unreachable, gatekeeper
+#            automatically falls back to in-memory limiting and logs a
+#            warning rather than failing requests.
+storage:
+  backend: memory
+  redis:
+    addr: "localhost:6379"
+    password: ""
+    db: 0
+    dial_timeout: 2s
+
+rate_limit:
+  # One of: token_bucket, sliding_window_log, fixed_window.
+  algorithm: token_bucket
+
+  # How a request is attributed to a client: api_key, ip, or header.
+  scope: api_key
+
+  # Only used when scope is "header".
+  header_name: "X-Client-ID"
+
+  # Per-tier allowance. requests_per_second is the sustained refill
+  # rate used by token_bucket; burst is the bucket capacity for
+  # token_bucket and the max requests per one-second window for
+  # sliding_window_log / fixed_window. "default" applies to any client
+  # not listed under `clients` below and must always be present.
+  tiers:
+    default:
+      requests_per_second: 2
+      burst: 5
+    free:
+      requests_per_second: 5
+      burst: 10
+    premium:
+      requests_per_second: 50
+      burst: 100
+
+  # Maps a client identifier (matching the chosen `scope`) to a tier.
+  clients:
+    "demo-free-key": free
+    "demo-premium-key": premium
+
+auth:
+  enabled: true
+  header: "X-API-Key"
+  api_keys:
+    - "demo-free-key"
+    - "demo-premium-key"
+
+cors:
+  enabled: true
+  allowed_origins: ["*"]
+  allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+  allowed_headers: ["Content-Type", "Authorization", "X-API-Key"]
+  allow_credentials: false
+  max_age: 300
+
+# Backend services requests are proxied to. Matched by hostname first,
+# then by longest matching path prefix.
+routes:
+  - path_prefix: "/api/users"
+    target: "http://localhost:9001"
+  - path_prefix: "/api/orders"
+    target: "http://localhost:9002"
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+
+metrics:
+  enabled: true
+  path: "/metrics"

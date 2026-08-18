@@ -1,0 +1,20 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go workspace / cache
+/vendor/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local overrides / secrets
+.env
+*.local.yaml

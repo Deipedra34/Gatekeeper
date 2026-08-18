@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Gatekeeper Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --accent: #5b8cff;
+    --ok: #35c46a;
+    --bad: #ef4a5f;
+    --mono: "Cascadia Code", "SF Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    padding: 32px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); margin: 0 0 24px; font-size: 13px; }
+  .grid {
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 20px;
+    align-items: start;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .panel h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+  label { display: block; font-size: 13px; margin-bottom: 6px; color: var(--muted); }
+  select, input {
+    width: 100%;
+    background: #0c0e12;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+    margin-bottom: 14px;
+  }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 14px;
+    cursor: pointer;
+    width: 100%;
+    margin-bottom: 10px;
+    font-weight: 600;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.secondary { background: #2a2f3a; }
+  button:disabled { opacity: .5; cursor: default; }
+
+  .tally { display: flex; gap: 10px; margin: 14px 0; }
+  .tally .box {
+    flex: 1;
+    background: #0c0e12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+  }
+  .tally .num { font-size: 26px; font-weight: 700; font-family: var(--mono); }
+  .tally .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; margin-top: 2px; }
+  .ok .num { color: var(--ok); }
+  .bad .num { color: var(--bad); }
+
+  .bar {
+    height: 10px;
+    border-radius: 5px;
+    background: #0c0e12;
+    overflow: hidden;
+    display: flex;
+    margin-bottom: 18px;
+    border: 1px solid var(--border);
+  }
+  .bar .seg-ok { background: var(--ok); }
+  .bar .seg-bad { background: var(--bad); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td.mono, th.mono { font-family: var(--mono); }
+  .status-200 { color: var(--ok); font-weight: 700; }
+  .status-429 { color: var(--bad); font-weight: 700; }
+  .status-other { color: #e0a95b; font-weight: 700; }
+
+  #log { max-height: 340px; overflow-y: auto; }
+  .log-row { display: grid; grid-template-columns: 90px 60px 100px 1fr; gap: 10px; font-family: var(--mono); font-size: 12px; padding: 4px 0; border-bottom: 1px solid #1c202a; }
+  .log-row .t { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>Gatekeeper Dashboard</h1>
+<p class="subtitle">This page sends real requests directly to the running Gatekeeper instance (same origin) — it is not a simulation.</p>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Controls</h2>
+
+    <label for="target">Target path</label>
+    <input id="target" value="/api/ping" />
+
+    <label for="apiKey">Client (API key)</label>
+    <select id="apiKey">
+      <option value="demo-free-key">demo-free-key (free tier)</option>
+      <option value="demo-premium-key">demo-premium-key (premium tier)</option>
+      <option value="">(no key — auth should fail)</option>
+    </select>
+
+    <button id="singleBtn">Send single request</button>
+
+    <label for="burstCount" style="margin-top:6px">Burst test — concurrent request count</label>
+    <input id="burstCount" type="number" value="30" min="1" max="500" />
+    <button id="burstBtn" class="secondary">Run burst test</button>
+    <button id="clearBtn" class="secondary">Clear log</button>
+
+    <div class="tally">
+      <div class="box ok"><div class="num" id="tallyOk">0</div><div class="lbl">200 OK</div></div>
+      <div class="box bad"><div class="num" id="tallyBad">0</div><div class="lbl">429 / other</div></div>
+    </div>
+    <div class="bar" id="tallyBar"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Live metrics (/metrics)</h2>
+    <table id="metricsTable">
+      <thead><tr><th>Client</th><th>Tier</th><th class="mono">Allowed</th><th class="mono">Rejected</th><th class="mono">Remaining</th></tr></thead>
+      <tbody></tbody>
+    </table>
+
+    <h2 style="margin-top:20px">Request log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const logEl = document.getElementById('log');
+const tallyOkEl = document.getElementById('tallyOk');
+const tallyBadEl = document.getElementById('tallyBad');
+const tallyBarEl = document.getElementById('tallyBar');
+let okCount = 0, badCount = 0;
+
+function statusClass(status) {
+  if (status === 200) return 'status-200';
+  if (status === 429) return 'status-429';
+  return 'status-other';
+}
+
+function addLogRow(key, status, remaining, ms) {
+  const row = document.createElement('div');
+  row.className = 'log-row';
+  const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+  row.innerHTML =
+    '<span class="t">' + time + '</span>' +
+    '<span class="' + statusClass(status) + '">' + status + '</span>' +
+    '<span>' + (key || '(no key)') + '</span>' +
+    '<span>remaining=' + remaining + '  ·  ' + ms + 'ms</span>';
+  logEl.prepend(row);
+  while (logEl.children.length > 200) logEl.removeChild(logEl.lastChild);
+}
+
+function updateTally() {
+  tallyOkEl.textContent = okCount;
+  tallyBadEl.textContent = badCount;
+  const total = okCount + badCount || 1;
+  tallyBarEl.innerHTML =
+    '<div class="seg-ok" style="width:' + (100 * okCount / total) + '%"></div>' +
+    '<div class="seg-bad" style="width:' + (100 * badCount / total) + '%"></div>';
+}
+
+async function sendOne(target, key) {
+  const start = performance.now();
+  try {
+    const headers = key ? { 'X-API-Key': key } : {};
+    const res = await fetch(target, { headers, cache: 'no-store' });
+    const ms = Math.round(performance.now() - start);
+    const remaining = res.headers.get('X-Ratelimit-Remaining') ?? '—';
+    if (res.status === 200) okCount++; else badCount++;
+    addLogRow(key, res.status, remaining, ms);
+  } catch (e) {
+    badCount++;
+    addLogRow(key, 0, 'error', Math.round(performance.now() - start));
+  }
+  updateTally();
+}
+
+document.getElementById('singleBtn').addEventListener('click', () => {
+  sendOne(document.getElementById('target').value, document.getElementById('apiKey').value);
+});
+
+document.getElementById('burstBtn').addEventListener('click', async () => {
+  const n = parseInt(document.getElementById('burstCount').value, 10) || 1;
+  const target = document.getElementById('target').value;
+  const key = document.getElementById('apiKey').value;
+  const btn = document.getElementById('burstBtn');
+  btn.disabled = true;
+  const jobs = [];
+  for (let i = 0; i < n; i++) jobs.push(sendOne(target, key));
+  await Promise.allSettled(jobs);
+  btn.disabled = false;
+});
+
+document.getElementById('clearBtn').addEventListener('click', () => {
+  okCount = 0; badCount = 0;
+  logEl.innerHTML = '';
+  updateTally();
+});
+
+// --- Live /metrics polling ---
+function parseMetrics(text) {
+  const rows = {};
+  const re = /^gatekeeper_(requests_allowed_total|requests_rejected_total|limiter_remaining)\{client="([^"]*)",tier="([^"]*)"\}\s+([0-9.eE+-]+)/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const [, metric, client, tier, value] = m;
+    const key = client + '|' + tier;
+    rows[key] = rows[key] || { client, tier, allowed: '0', rejected: '0', remaining: '0' };
+    if (metric === 'requests_allowed_total') rows[key].allowed = value;
+    if (metric === 'requests_rejected_total') rows[key].rejected = value;
+    if (metric === 'limiter_remaining') rows[key].remaining = value;
+  }
+  return Object.values(rows);
+}
+
+async function refreshMetrics() {
+  try {
+    const res = await fetch('/metrics', { cache: 'no-store' });
+    const text = await res.text();
+    const rows = parseMetrics(text);
+    const tbody = document.querySelector('#metricsTable tbody');
+    tbody.innerHTML = rows.map(r =>
+      '<tr><td>' + r.client + '</td><td>' + r.tier + '</td>' +
+      '<td class="mono">' + r.allowed + '</td>' +
+      '<td class="mono">' + r.rejected + '</td>' +
+      '<td class="mono">' + r.remaining + '</td></tr>'
+    ).join('') || '<tr><td colspan="5" style="color:var(--muted)">No data yet — send a request.</td></tr>';
+  } catch (e) { /* metrics endpoint might be disabled; ignore */ }
+}
+
+refreshMetrics();
+setInterval(refreshMetrics, 2000);
+updateTally();
+</script>
+</body>
+</html>
