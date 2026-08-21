@@ -215,6 +215,48 @@ latency  min=0s  p50=2.447ms  p95=21.656ms  p99=22.16ms  max=22.674ms
 
 102 allowed, not a round 100 — those extra 2 came from the bucket refilling at 50 tokens/sec during the ~54ms it took to send the burst. That's Token Bucket's continuous refill showing up in practice, as opposed to the hard cutoff you'd get from a Fixed Window Counter.
 
+## Benchmarks
+
+[`internal/ratelimiter/bench_test.go`](internal/ratelimiter/bench_test.go) benchmarks all three algorithms against both storage backends, driving `Limiter.Allow` in a tight sequential loop for a single client key. The Redis numbers run against [`miniredis`](https://github.com/alicebob/miniredis) — an in-process fake Redis reached over a real TCP loopback connection — so they capture the cost of the Lua round trip and payload serialization without requiring a live Redis instance to reproduce:
+
+```bash
+go test -bench=. -benchmem ./...
+```
+
+This is real output from a local run (Windows, 13th Gen Intel Core i7-13700HX):
+
+```
+goos: windows
+goarch: amd64
+pkg: gatekeeper/internal/ratelimiter
+cpu: 13th Gen Intel(R) Core(TM) i7-13700HX
+BenchmarkTokenBucket_Memory-24         	  787939	      1428 ns/op	     440 B/op	       9 allocs/op
+BenchmarkTokenBucket_Redis-24          	    4186	    429837 ns/op	  219485 B/op	     845 allocs/op
+BenchmarkSlidingWindowLog_Memory-24    	   10000	    304404 ns/op	   81168 B/op	      19 allocs/op
+BenchmarkSlidingWindowLog_Redis-24     	    3078	    930296 ns/op	  422332 B/op	     867 allocs/op
+BenchmarkFixedWindow_Memory-24         	 5546469	       194.3 ns/op	      48 B/op	       3 allocs/op
+BenchmarkFixedWindow_Redis-24          	    3928	    302200 ns/op	  187867 B/op	     750 allocs/op
+```
+
+Summarized, with throughput derived from ns/op:
+
+| Algorithm | Store | ns/op | B/op | allocs/op | Throughput (ops/sec) |
+|---|---|--:|--:|--:|--:|
+| Token Bucket | Memory | 1,428 | 440 | 9 | ~700,000 |
+| Token Bucket | Redis | 429,837 | 219,485 | 845 | ~2,300 |
+| Sliding Window Log | Memory | 304,404 | 81,168 | 19 | ~3,300 |
+| Sliding Window Log | Redis | 930,296 | 422,332 | 867 | ~1,100 |
+| Fixed Window Counter | Memory | 194.3 | 48 | 3 | ~5,150,000 |
+| Fixed Window Counter | Redis | 302,200 | 187,867 | 750 | ~3,300 |
+
+This lines up with the trade-offs described above. **Fixed Window Counter is the fastest and lightest by a wide margin** — a single atomic increment and O(1) storage, no CAS loop — at the cost of the boundary-doubling behavior described earlier. **Token Bucket sits in the middle**: its CAS loop and float refill math cost roughly 7x Fixed Window on the memory store, but its per-client state stays a fixed size regardless of burst, so that cost doesn't grow with configured limits. **Sliding Window Log is the memory-heaviest of the three**, and it shows: on the memory store it's already ~200x slower than Fixed Window and allocates ~1.7KB per call, because every `Allow` has to unmarshal, prune, and re-marshal a per-client log of up to `burst` timestamps — exactly the O(burst) cost the trade-off table above calls out.
+
+The Redis numbers tell a second, independent story: every algorithm gets roughly 300–1000x slower once state has to round-trip a Lua script over the network instead of staying behind a local mutex, which is the real cost of coordinating limits fleet-wide ([ADR 2](docs/adr/0002-redis-lua-atomic-operations.md)) — and it's also why [`FallbackStore`](docs/adr/0004-fallback-store-graceful-degradation.md) existing at all matters: losing Redis costs you fleet-wide accuracy, but staying on it costs raw throughput even when it's healthy.
+
+## Architecture Decisions
+
+Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists — live in [`docs/adr/`](docs/adr/).
+
 ## Configuration reference
 
 See the fully-commented [`configs/config.yaml`](configs/config.yaml) for every field. The shape at a glance:
