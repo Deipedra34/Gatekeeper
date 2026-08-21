@@ -270,3 +270,7 @@ cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow
 routes:      [ { path_prefix | host, target } ]
 metrics:     { enabled, path }
 ```
+
+---
+
+-by Deipedra
