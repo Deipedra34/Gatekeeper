@@ -273,4 +273,4 @@ metrics:     { enabled, path }
 
 ---
 
--by Deipedra
+<p align="center"><i>-by Deipedra</i></p>
