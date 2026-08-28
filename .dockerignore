@@ -1,0 +1,40 @@
+# VCS
+.git/
+.gitignore
+.github/
+
+# Build artifacts / local binaries
+bin/
+dist/
+*.exe
+*.test
+*.out
+gatekeeper
+
+# Go workspace / cache
+vendor/
+
+# Test files
+*_test.go
+testdata/
+
+# Docs (kept out of the build context; not needed at build/run time)
+docs/
+CONTRIBUTING.md
+LICENSE
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local overrides / secrets
+.env
+*.local.yaml
+
+# Misc local-only files
+start.bat
+start-demo.bat
+vendordeps/

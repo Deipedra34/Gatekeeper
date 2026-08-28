@@ -118,6 +118,34 @@ Two `.bat` files are included so you don't have to type any of the above by hand
 - **[`start.bat`](start.bat)** — builds and runs the real `gatekeeper` binary against `configs/config.yaml`. Edit that config's `routes` first so they point at real services. No demo backend, no dashboard — this is the production-shaped path.
 - **[`start-demo.bat`](start-demo.bat)** — a self-contained demo. Builds a throwaway stand-in backend and Gatekeeper, starts both, and opens an interactive dashboard in your browser (`-dashboard` flag, served by Gatekeeper itself at `/_dashboard`). Pick a client — free, premium, or no key — fire a single request or a burst of concurrent ones, and watch allowed vs. rate-limited counts update live next to `/metrics`. Good for seeing the limiter actually do something without wiring up real services first.
 
+## Run with Docker
+
+A multi-stage [`Dockerfile`](Dockerfile) is included: it builds the `gatekeeper` binary in a `golang:1.26-alpine` stage, then copies just the binary and `configs/config.yaml` into a minimal `alpine` runtime image.
+
+Build the image:
+
+```bash
+docker build -t gatekeeper .
+```
+
+Run it with the bundled config:
+
+```bash
+docker run --rm -p 8080:8080 gatekeeper
+```
+
+To use your own config instead of the one baked into the image, mount it over the in-image path:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/configs/config.yaml:/app/configs/config.yaml:ro" \
+  gatekeeper
+```
+
+If `routes` in your config point at services on the host (e.g. `localhost:9000`), remember that `localhost` inside the container refers to the container itself. On Docker Desktop (Mac/Windows), point routes at `host.docker.internal` instead; on Linux, add `--add-host=host.docker.internal:host-gateway` to the `docker run` command or use `--network host`.
+
+The image exposes port `8080`, matching the default `server.listen_addr` in [`configs/config.yaml`](configs/config.yaml) — adjust the `-p` mapping if you change that value.
+
 ## Example usage
 
 Using the example config's `demo-free-key` (free tier: 5 req/s, burst 10) against a route proxying `/api/*` to a backend:
