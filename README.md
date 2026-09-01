@@ -16,6 +16,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **A normal middleware chain.** Rate limiting, request logging, API key auth, and CORS, composed the same way you'd compose any `net/http` middleware.
 - **Per-client tiers.** Limits scoped by API key, source IP, or a custom header, with independent free/premium/whatever tiers defined in config.
 - **A Prometheus-compatible `/metrics` endpoint.** Requests allowed/rejected per client and tier, current limiter state, request latency histograms.
+- **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
 ## Architecture
@@ -55,7 +56,8 @@ Every request runs through the same chain: CORS, then API key auth, then the rat
 ### Package layout
 
 ```
-cmd/gatekeeper/        entrypoint: wires config, storage, limiters, middleware, proxy
+cmd/gatekeeper/        entrypoint: wires storage + metrics, runs the server, handles signals
+internal/gateway/      assembles the request pipeline from config; rebuilds and swaps it on SIGHUP
 internal/config/       YAML config loading, defaults, and validation
 internal/ratelimiter/  the three algorithms + the Store abstraction they share
   └─ store/            MemoryStore, RedisStore, and FallbackStore (Redis → memory failover)
@@ -117,6 +119,37 @@ Two `.bat` files are included so you don't have to type any of the above by hand
 
 - **[`start.bat`](start.bat)** — builds and runs the real `gatekeeper` binary against `configs/config.yaml`. Edit that config's `routes` first so they point at real services. No demo backend, no dashboard — this is the production-shaped path.
 - **[`start-demo.bat`](start-demo.bat)** — a self-contained demo. Builds a throwaway stand-in backend and Gatekeeper, starts both, and opens an interactive dashboard in your browser (`-dashboard` flag, served by Gatekeeper itself at `/_dashboard`). Pick a client — free, premium, or no key — fire a single request or a burst of concurrent ones, and watch allowed vs. rate-limited counts update live next to `/metrics`. Good for seeing the limiter actually do something without wiring up real services first.
+
+## Dynamic config reload (SIGHUP)
+
+Gatekeeper re-reads its config file on `SIGHUP`, so you can change routes,
+rate-limit rules, client tiers, the algorithm, and the auth/CORS settings
+without restarting the process or dropping in-flight requests.
+
+Edit `configs/config.yaml` (the same path passed to `-config`), then:
+
+```bash
+kill -HUP <pid>
+```
+
+On reload Gatekeeper re-parses and validates the file, builds a fresh
+routing table and set of per-tier limiters, and swaps them in atomically.
+A request in flight during the swap finishes on the config it started
+with; the next request uses the new one. Rate-limit counter state is kept
+across the reload rather than reset.
+
+If the new config is missing, malformed, or fails validation, the reload
+is **rejected**: Gatekeeper logs the error and keeps serving with the
+previous config. It never crashes or serves a half-applied config.
+
+```
+gatekeeper: SIGHUP received, reloading config
+gatekeeper: config reload failed, keeping previous config: config: invalid: rate_limit.tiers.free.burst must be > 0
+```
+
+`server.*`, `storage.*`, and `metrics.*` are read only at startup —
+changing the listen address, the storage backend, or the metrics path
+still requires a restart.
 
 ## Run with Docker
 

@@ -2,6 +2,12 @@
 // config file, wires up the configured storage backend and rate-limit
 // algorithm, and serves the reverse proxy and Prometheus metrics
 // endpoint until it receives a shutdown signal.
+//
+// Sending the process SIGHUP re-reads the same config file and swaps the
+// new routes, rate-limit rules, client tiers, algorithm, auth, and CORS
+// settings into the running gateway without dropping in-flight requests.
+// An invalid new config is logged and ignored; the gateway keeps running
+// on the previous one.
 package main
 
 import (
@@ -16,10 +22,8 @@ import (
 
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/dashboard"
+	"gatekeeper/internal/gateway"
 	"gatekeeper/internal/metrics"
-	"gatekeeper/internal/middleware"
-	"gatekeeper/internal/proxy"
-	"gatekeeper/internal/ratelimiter"
 	"gatekeeper/internal/ratelimiter/store"
 )
 
@@ -40,23 +44,15 @@ func main() {
 	st := buildStore(cfg)
 	defer st.Close()
 
-	limiters := buildLimiters(cfg, st)
 	m := metrics.New()
 
-	router, err := proxy.NewRouter(cfg.Routes)
+	gw, err := gateway.New(cfg, *configPath, st, m, log.Default())
 	if err != nil {
 		log.Fatalf("gatekeeper: %v", err)
 	}
 
-	handler := middleware.Chain(router,
-		middleware.RequestLogger(log.Default()),
-		middleware.CORS(cfg.CORS),
-		middleware.APIKeyAuth(cfg.Auth),
-		middleware.RateLimit(cfg.RateLimit, limiters, m),
-	)
-
 	mux := http.NewServeMux()
-	mux.Handle("/", handler)
+	mux.Handle("/", gw)
 	if cfg.Metrics.Enabled {
 		mux.Handle(cfg.Metrics.Path, m.Handler())
 	}
@@ -78,6 +74,23 @@ func main() {
 			cfg.Server.ListenAddr, cfg.RateLimit.Algorithm, cfg.RateLimit.Scope, cfg.Storage.Backend)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("gatekeeper: server error: %v", err)
+		}
+	}()
+
+	// SIGHUP triggers an in-place config reload. server.*, storage.*, and
+	// metrics.* are read only at startup; everything else swaps live.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			log.Println("gatekeeper: SIGHUP received, reloading config")
+			if err := gw.Reload(); err != nil {
+				log.Printf("gatekeeper: config reload failed, keeping previous config: %v", err)
+				continue
+			}
+			c := gw.Config()
+			log.Printf("gatekeeper: config reloaded (algorithm=%s scope=%s routes=%d)",
+				c.RateLimit.Algorithm, c.RateLimit.Scope, len(c.Routes))
 		}
 	}()
 
@@ -119,20 +132,4 @@ func buildStore(cfg *config.Config) store.Store {
 	}
 
 	return store.NewFallbackStore(redisStore, store.NewMemoryStore(), redisHealthCheckInterval, log.Default())
-}
-
-// buildLimiters creates one Limiter per configured client tier, all
-// sharing st so clients in the same tier contend for the same counters
-// regardless of which Gatekeeper instance handles their request.
-func buildLimiters(cfg *config.Config, st store.Store) map[string]ratelimiter.Limiter {
-	limiters := make(map[string]ratelimiter.Limiter, len(cfg.RateLimit.Tiers))
-	for name, tier := range cfg.RateLimit.Tiers {
-		rule := ratelimiter.Rule{Rate: tier.RequestsPerSecond, Burst: tier.Burst}
-		limiter, err := ratelimiter.New(cfg.RateLimit.Algorithm, st, rule)
-		if err != nil {
-			log.Fatalf("gatekeeper: %v", err)
-		}
-		limiters[name] = limiter
-	}
-	return limiters
 }
