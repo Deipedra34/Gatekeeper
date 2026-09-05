@@ -179,6 +179,40 @@ If `routes` in your config point at services on the host (e.g. `localhost:9000`)
 
 The image exposes port `8080`, matching the default `server.listen_addr` in [`configs/config.yaml`](configs/config.yaml) — adjust the `-p` mapping if you change that value.
 
+## Run the full stack with Docker Compose
+
+[`docker-compose.yml`](docker-compose.yml) brings up a complete, self-contained stack so you can exercise the whole gateway — routing, auth, rate limiting, and Redis-backed counters — without standing up any real backend services first:
+
+- **`gatekeeper`** — built from the [`Dockerfile`](Dockerfile), same as above.
+- **`redis`** (`redis:alpine`) — backs the rate limiter's shared counters.
+- **`mock-backend`** — a tiny standalone HTTP server in [`mockbackend/`](mockbackend/) that echoes back the request it received as JSON, standing in for a real upstream so requests have somewhere to be proxied to.
+
+Gatekeeper runs against [`configs/config.docker.yaml`](configs/config.docker.yaml) inside the stack (mounted over the image's baked-in config), not `configs/config.yaml`. It's identical except `storage.redis.addr` points at `redis:6379` and every route's `target` points at `http://mock-backend:9000` — both reached by their compose service name rather than `localhost`, since each service is its own container on the compose network.
+
+Start everything with:
+
+```bash
+docker-compose up --build
+```
+
+Only `gatekeeper` publishes a port to the host — `8080`, matching `server.listen_addr`. `redis` and `mock-backend` are reachable from `gatekeeper` on the compose network but not from the host.
+
+Once the stack is up, hit it the same way as [Example usage](#example-usage) below, just via `docker-compose` instead of a locally built binary:
+
+```bash
+curl -i http://localhost:8080/api/ping -H "X-API-Key: demo-free-key"
+```
+
+```
+HTTP/1.1 200 OK
+X-Ratelimit-Limit: 10
+X-Ratelimit-Remaining: 9
+
+{"message":"hello from mock-backend","method":"GET","path":"/api/ping", ...}
+```
+
+The JSON body comes from `mock-backend`, confirming the request actually made it through Gatekeeper's auth and rate-limit middleware and was proxied end-to-end. Send more than 10 requests in quick succession with the same key and you'll start getting `429 Too Many Requests` back, same as in [Example usage](#example-usage). `curl http://localhost:8080/metrics` and the gateway's own logs (`docker-compose logs gatekeeper`) work as usual too.
+
 ## Example usage
 
 Using the example config's `demo-free-key` (free tier: 5 req/s, burst 10) against a route proxying `/api/*` to a backend:

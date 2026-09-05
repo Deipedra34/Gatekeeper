@@ -1,0 +1,72 @@
+# Gatekeeper configuration for the docker-compose stack (see
+# docker-compose.yml). This is the same shape as configs/config.yaml,
+# except storage points at the "redis" service and routes point at the
+# "mock-backend" service, both reached by their compose service name
+# rather than localhost.
+#
+# docker-compose.yml mounts this file over /app/configs/config.yaml
+# inside the gatekeeper container, so it's what actually runs when you
+# do `docker-compose up`. See README.md for details.
+
+server:
+  listen_addr: ":8080"
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 60s
+
+storage:
+  backend: redis
+  redis:
+    addr: "redis:6379"
+    password: ""
+    db: 0
+    dial_timeout: 2s
+
+rate_limit:
+  algorithm: token_bucket
+  scope: api_key
+  header_name: "X-Client-ID"
+
+  tiers:
+    default:
+      requests_per_second: 2
+      burst: 5
+    free:
+      requests_per_second: 5
+      burst: 10
+    premium:
+      requests_per_second: 50
+      burst: 100
+
+  clients:
+    "demo-free-key": free
+    "demo-premium-key": premium
+
+auth:
+  enabled: true
+  header: "X-API-Key"
+  api_keys:
+    - "demo-free-key"
+    - "demo-premium-key"
+
+cors:
+  enabled: true
+  allowed_origins: ["*"]
+  allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+  allowed_headers: ["Content-Type", "Authorization", "X-API-Key"]
+  allow_credentials: false
+  max_age: 300
+
+# Everything proxies to the mock-backend service, reachable by its
+# compose service name on the port it listens on (see mockbackend/).
+routes:
+  - path_prefix: "/api/users"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/api/orders"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/"
+    target: "http://mock-backend:9000"
+
+metrics:
+  enabled: true
+  path: "/metrics"
