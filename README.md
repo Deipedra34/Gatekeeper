@@ -4,6 +4,8 @@
 
 # Gatekeeper
 
+[![CI](https://github.com/Deipedra34/Gatekeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/Deipedra34/Gatekeeper/actions/workflows/ci.yml)
+
 Gatekeeper is a rate limiter and API gateway written in Go. It sits in front of your backend services, decides which requests get through based on per-client limits, and proxies the rest to wherever they're supposed to go. Metrics and graceful degradation come standard, not bolted on afterward.
 
 I built it as a reference implementation more than a one-off tool. All three rate-limiting algorithms you'd actually reach for in production — Token Bucket, Sliding Window Log, Fixed Window Counter — run against the same storage abstraction, so switching one for another (or memory for Redis) is a config change, not a rewrite.
