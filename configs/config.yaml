@@ -87,3 +87,18 @@ routes:
 metrics:
   enabled: true
   path: "/metrics"
+
+# Controls how requests are forwarded to the backends above.
+proxy:
+  # Per-attempt timeout for a backend call (default: 5s if unset).
+  timeout: 5s
+
+  retry:
+    # How many additional attempts after the first (default: 3).
+    max_retries: 3
+    # Delay before the first retry; doubles each attempt after that,
+    # with jitter (default: 100ms).
+    base_backoff: 100ms
+    # Upper bound on the backoff delay, no matter how many retries have
+    # happened (default: 2s).
+    max_backoff: 2s

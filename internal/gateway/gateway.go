@@ -100,7 +100,7 @@ func (g *Gateway) Reload() error {
 // touches nothing on g, so a failure part-way through leaves the active
 // pipeline untouched.
 func (g *Gateway) build(cfg *config.Config) (http.Handler, error) {
-	router, err := proxy.NewRouter(cfg.Routes)
+	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics)
 	if err != nil {
 		return nil, err
 	}

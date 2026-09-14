@@ -23,6 +23,18 @@ type Metrics struct {
 	RequestsRejected *prometheus.CounterVec
 	LimiterRemaining *prometheus.GaugeVec
 	RequestDuration  *prometheus.HistogramVec
+
+	// ProxyRetries counts retry attempts made against backend services,
+	// by route. It does not include each request's initial attempt, so
+	// it stays independent of RequestsAllowed and a retried request is
+	// never double-counted against a client's rate limit.
+	ProxyRetries *prometheus.CounterVec
+
+	// ProxyOutcomes counts the final outcome of each proxied request —
+	// "success" or "failure" — after any retries, by route. It's
+	// incremented exactly once per incoming request regardless of how
+	// many backend attempts it took.
+	ProxyOutcomes *prometheus.CounterVec
 }
 
 // New creates and registers all of Gatekeeper's collectors.
@@ -48,6 +60,14 @@ func New() *Metrics {
 			Help:    "End-to-end latency of requests handled by the gateway, including the proxied backend call.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"route", "status"}),
+		ProxyRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_proxy_retries_total",
+			Help: "Total number of retry attempts made against backend services, by route. Excludes each request's initial attempt.",
+		}, []string{"route"}),
+		ProxyOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_proxy_request_outcomes_total",
+			Help: "Final outcome of each proxied request after any retries, by route and outcome (success or failure). Counted once per request regardless of attempt count.",
+		}, []string{"route", "outcome"}),
 	}
 
 	registry.MustRegister(
@@ -55,6 +75,8 @@ func New() *Metrics {
 		m.RequestsRejected,
 		m.LimiterRemaining,
 		m.RequestDuration,
+		m.ProxyRetries,
+		m.ProxyOutcomes,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)

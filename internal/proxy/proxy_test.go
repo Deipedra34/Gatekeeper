@@ -6,12 +6,27 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"gatekeeper/internal/config"
 )
+
+// noRetryProxyConfig is used by tests that exercise routing behaviour
+// rather than retry behaviour: a short timeout and no retries keeps
+// them fast and deterministic.
+func noRetryProxyConfig() config.ProxyConfig {
+	return config.ProxyConfig{
+		Timeout: config.Duration{Duration: 2 * time.Second},
+		Retry: config.RetryConfig{
+			MaxRetries:  0,
+			BaseBackoff: config.Duration{Duration: time.Millisecond},
+			MaxBackoff:  config.Duration{Duration: 5 * time.Millisecond},
+		},
+	}
+}
 
 // backend starts an httptest server that always responds with name in
 // the body, so a test can tell which backend actually served a request.
@@ -35,7 +50,7 @@ func TestRouter_RoutesByLongestPathPrefix(t *testing.T) {
 		{PathPrefix: "/api/users", Target: users.URL},
 		{PathPrefix: "/api/users/vip", Target: usersVIP.URL},
 		{PathPrefix: "/", Target: catchAll.URL},
-	})
+	}, noRetryProxyConfig(), nil)
 	require.NoError(t, err)
 
 	cases := []struct {
@@ -64,7 +79,7 @@ func TestRouter_RoutesByHostBeforePathPrefix(t *testing.T) {
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: byPath.URL},
 		{Host: "orders.example.com", Target: byHost.URL},
-	})
+	}, noRetryProxyConfig(), nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/anything", nil)
@@ -78,7 +93,7 @@ func TestRouter_RoutesByHostBeforePathPrefix(t *testing.T) {
 func TestRouter_ReturnsNotFoundWhenNoRouteMatches(t *testing.T) {
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/api", Target: backend(t, "api").URL},
-	})
+	}, noRetryProxyConfig(), nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/unrouted", nil)
@@ -94,7 +109,7 @@ func TestRouter_ReturnsBadGatewayWhenBackendIsDown(t *testing.T) {
 
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: down.URL},
-	})
+	}, noRetryProxyConfig(), nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -114,7 +129,7 @@ func TestRouter_ForwardsRequestBodyAndMethod(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	router, err := NewRouter([]config.Route{{PathPrefix: "/", Target: srv.URL}})
+	router, err := NewRouter([]config.Route{{PathPrefix: "/", Target: srv.URL}}, noRetryProxyConfig(), nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodPost, "/create", strings.NewReader("hello"))
@@ -129,6 +144,6 @@ func TestRouter_ForwardsRequestBodyAndMethod(t *testing.T) {
 func TestNewRouter_RejectsInvalidTargetURL(t *testing.T) {
 	_, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: "://not-a-valid-url"},
-	})
+	}, noRetryProxyConfig(), nil)
 	assert.Error(t, err)
 }

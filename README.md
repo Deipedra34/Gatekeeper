@@ -15,6 +15,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Three pluggable rate-limiting algorithms.** Token Bucket, Sliding Window Log, Fixed Window Counter, selectable via config, all built on one `Store` interface.
 - **Two storage backends.** An in-memory map for single-instance deployments, or Redis when you need limits coordinated across a fleet.
 - **Reverse proxy core.** Routes requests to backend services by path prefix or hostname, using `net/http/httputil.ReverseProxy` under the hood.
+- **Configurable backend timeout and retry.** Every backend attempt is bounded by a per-attempt timeout; a timeout, connection failure, or 5xx response is retried with exponential backoff and jitter, up to a configurable limit. 4xx responses are never retried.
 - **A normal middleware chain.** Rate limiting, request logging, API key auth, and CORS, composed the same way you'd compose any `net/http` middleware.
 - **Per-client tiers.** Limits scoped by API key, source IP, or a custom header, with independent free/premium/whatever tiers defined in config.
 - **A Prometheus-compatible `/metrics` endpoint.** Requests allowed/rejected per client and tier, current limiter state, request latency histograms.
@@ -63,7 +64,7 @@ internal/gateway/      assembles the request pipeline from config; rebuilds and 
 internal/config/       YAML config loading, defaults, and validation
 internal/ratelimiter/  the three algorithms + the Store abstraction they share
   └─ store/            MemoryStore, RedisStore, and FallbackStore (Redis → memory failover)
-internal/proxy/        the reverse-proxy router (path prefix / hostname matching)
+internal/proxy/        the reverse-proxy router (path prefix / hostname matching), backend timeout + retry/backoff
 internal/middleware/   logging, CORS, API key auth, rate-limit middleware
 internal/metrics/      Prometheus collectors + /metrics handler
 configs/                example config.yaml
@@ -96,6 +97,29 @@ When `storage.backend: redis` is set, Gatekeeper wraps the Redis store in a `Fal
 - A background check pings Redis every 5 seconds. Once it's back, Gatekeeper logs the recovery and starts using it again.
 
 The trade-off while Redis is down: limits become per-instance instead of fleet-wide, same as if you'd configured `memory` in the first place — until Redis comes back. What doesn't happen is a crash or a gateway that stops responding.
+
+## Backend request timeout and retry
+
+Every request the proxy forwards to a backend is bounded by `proxy.timeout` and, if it fails, retried according to `proxy.retry` — both configurable in `configs/config.yaml`:
+
+```yaml
+proxy:
+  timeout: 5s          # per-attempt timeout (default: 5s)
+  retry:
+    max_retries: 3     # additional attempts after the first (default: 3)
+    base_backoff: 100ms # delay before the first retry (default: 100ms)
+    max_backoff: 2s      # cap on the backoff delay (default: 2s)
+```
+
+All four fields are optional; any left unset get the defaults shown above.
+
+- **Timeout** applies per attempt, not to the whole request — a request that ends up retrying 3 times can take up to roughly `4 × timeout` plus backoff delays in the worst case, not just `timeout`.
+- **Retries** kick in only for failures a retry can plausibly fix: a timed-out attempt, a connection error (backend down/unreachable), or a `5xx` response. A **`4xx` response is never retried** — it means the backend understood the request and rejected it, and sending the same request again wouldn't change that.
+- **Backoff** is exponential with jitter: the delay before retry *n* is `min(base_backoff × 2^(n-1), max_backoff)`, then a random value between 0 and that number is actually used, so many clients retrying at once don't all hit the backend in the same instant.
+- The request body is buffered so it can be replayed identically on every retry attempt.
+- If every attempt fails, the proxy returns whatever the last attempt produced: the backend's own `5xx` if that's what kept coming back, or a `502 Bad Gateway` if the backend was unreachable.
+
+**Interaction with rate limiting and metrics:** the rate limiter middleware sits in front of the proxy and only ever sees the original incoming request once, so retries against the backend never cost a client extra rate-limit budget — a request that retries twice before succeeding still counts as exactly one allowed request against that client's limit. Retry attempts and final outcomes are tracked as their own metrics, separate from the raw allow/reject counters (see [Metrics](#metrics) below).
 
 ## Setup
 
@@ -257,7 +281,12 @@ gatekeeper_requests_allowed_total{client="demo-free-key",tier="free"} 11
 gatekeeper_requests_allowed_total{client="demo-premium-key",tier="premium"} 102
 gatekeeper_requests_rejected_total{client="demo-free-key",tier="free"} 190
 gatekeeper_requests_rejected_total{client="demo-premium-key",tier="premium"} 98
+gatekeeper_proxy_retries_total{route="/api"} 4
+gatekeeper_proxy_request_outcomes_total{route="/api",outcome="success"} 108
+gatekeeper_proxy_request_outcomes_total{route="/api",outcome="failure"} 3
 ```
+
+`gatekeeper_proxy_retries_total` counts individual retry attempts against a backend (not the initial attempt), and `gatekeeper_proxy_request_outcomes_total` counts each proxied request exactly once — as `success` or `failure` — after all retries are done. Both are independent of `gatekeeper_requests_allowed_total`/`_rejected_total`, which reflect the rate limiter's decision on the original client request, not what happened while forwarding it.
 
 (`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
 
@@ -272,6 +301,7 @@ What's covered:
 - A shared conformance suite (`store.testStoreConformance`) that runs against *both* `MemoryStore` and a `miniredis`-backed `RedisStore`, so the two backends are held to identical guarantees without needing a real Redis instance in CI.
 - `FallbackStore` failover and recovery.
 - Gateway routing: longest-path-prefix matching, host-based routing, a 404 when nothing matches, a 502 when the backend is dead.
+- Backend timeout/retry: a request that succeeds on the first try, one that fails once then succeeds on retry, one that exhausts all retries and fails, a connection-refused backend being retried, and confirming a `4xx` response is never retried — including that retries never inflate the request's rate-limit cost.
 - A full end-to-end test (`TestGateway_EndToEnd`) that wires config → storage → limiters → the whole middleware chain → the proxy, then drives it through auth, CORS, per-tier rate limiting, and routing together, not in isolation.
 
 ## Load testing
@@ -366,6 +396,7 @@ auth:        { enabled, header, api_keys: [...] }
 cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow_credentials, max_age }
 routes:      [ { path_prefix | host, target } ]
 metrics:     { enabled, path }
+proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
 ```
 
 ---

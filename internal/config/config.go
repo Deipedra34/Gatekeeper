@@ -40,6 +40,7 @@ type Config struct {
 	CORS      CORSConfig      `yaml:"cors"`
 	Routes    []Route         `yaml:"routes"`
 	Metrics   MetricsConfig   `yaml:"metrics"`
+	Proxy     ProxyConfig     `yaml:"proxy"`
 }
 
 // ServerConfig controls the HTTP listener Gatekeeper itself exposes.
@@ -129,6 +130,37 @@ type MetricsConfig struct {
 	Path    string `yaml:"path"`
 }
 
+// ProxyConfig controls how requests are forwarded to backend services:
+// the per-attempt timeout and the retry/backoff policy applied when an
+// attempt fails.
+type ProxyConfig struct {
+	// Timeout bounds how long a single attempt to reach the backend may
+	// take. It applies per attempt, not to the overall request including
+	// retries — a request that retries 3 times can take up to roughly
+	// 3x Timeout plus backoff delays.
+	Timeout Duration `yaml:"timeout"`
+
+	Retry RetryConfig `yaml:"retry"`
+}
+
+// RetryConfig controls retries for backend requests that fail with a
+// timeout, a connection error, or a 5xx response. 4xx responses are
+// never retried, since those indicate a client error the retry can't fix.
+type RetryConfig struct {
+	// MaxRetries is how many additional attempts are made after the
+	// first one fails. 0 disables retries.
+	MaxRetries int `yaml:"max_retries"`
+
+	// BaseBackoff is the delay before the first retry. Each subsequent
+	// retry's delay doubles, up to MaxBackoff, and a random jitter is
+	// applied so many clients retrying at once don't hit the backend in
+	// lockstep.
+	BaseBackoff Duration `yaml:"base_backoff"`
+
+	// MaxBackoff caps the backoff delay regardless of attempt count.
+	MaxBackoff Duration `yaml:"max_backoff"`
+}
+
 // Load reads and parses the YAML config file at path, applies defaults
 // for any unset fields, and validates the result.
 func Load(path string) (*Config, error) {
@@ -195,6 +227,19 @@ func (c *Config) applyDefaults() {
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
 	}
+
+	if c.Proxy.Timeout.Duration == 0 {
+		c.Proxy.Timeout.Duration = 5 * time.Second
+	}
+	if c.Proxy.Retry.MaxRetries == 0 {
+		c.Proxy.Retry.MaxRetries = 3
+	}
+	if c.Proxy.Retry.BaseBackoff.Duration == 0 {
+		c.Proxy.Retry.BaseBackoff.Duration = 100 * time.Millisecond
+	}
+	if c.Proxy.Retry.MaxBackoff.Duration == 0 {
+		c.Proxy.Retry.MaxBackoff.Duration = 2 * time.Second
+	}
 }
 
 func (c *Config) validate() error {
@@ -245,6 +290,19 @@ func (c *Config) validate() error {
 
 	if c.Auth.Enabled && len(c.Auth.APIKeys) == 0 {
 		return fmt.Errorf("auth.enabled is true but auth.api_keys is empty")
+	}
+
+	if c.Proxy.Timeout.Duration <= 0 {
+		return fmt.Errorf("proxy.timeout must be > 0")
+	}
+	if c.Proxy.Retry.MaxRetries < 0 {
+		return fmt.Errorf("proxy.retry.max_retries must be >= 0")
+	}
+	if c.Proxy.Retry.BaseBackoff.Duration <= 0 {
+		return fmt.Errorf("proxy.retry.base_backoff must be > 0")
+	}
+	if c.Proxy.Retry.MaxBackoff.Duration < c.Proxy.Retry.BaseBackoff.Duration {
+		return fmt.Errorf("proxy.retry.max_backoff must be >= proxy.retry.base_backoff")
 	}
 
 	return nil

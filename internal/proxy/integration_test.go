@@ -73,10 +73,10 @@ metrics:
 		limiters[name] = l
 	}
 
-	router, err := proxy.NewRouter(cfg.Routes)
+	m := metrics.New()
+	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, m)
 	require.NoError(t, err)
 
-	m := metrics.New()
 	handler := middleware.Chain(router,
 		middleware.CORS(cfg.CORS),
 		middleware.APIKeyAuth(cfg.Auth),

@@ -39,6 +39,71 @@ routes:
 	assert.Equal(t, 10*time.Second, cfg.Server.ReadTimeout.Duration)
 	assert.Equal(t, "memory", cfg.Storage.Backend, "backend should default to memory")
 	assert.Equal(t, "/metrics", cfg.Metrics.Path)
+
+	assert.Equal(t, 5*time.Second, cfg.Proxy.Timeout.Duration, "proxy timeout should default to 5s")
+	assert.Equal(t, 3, cfg.Proxy.Retry.MaxRetries, "max_retries should default to 3")
+	assert.Equal(t, 100*time.Millisecond, cfg.Proxy.Retry.BaseBackoff.Duration)
+	assert.Equal(t, 2*time.Second, cfg.Proxy.Retry.MaxBackoff.Duration)
+}
+
+func TestLoad_ProxyTimeoutAndRetryAreConfigurable(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+proxy:
+  timeout: 2s
+  retry:
+    max_retries: 5
+    base_backoff: 50ms
+    max_backoff: 1s
+`)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2*time.Second, cfg.Proxy.Timeout.Duration)
+	assert.Equal(t, 5, cfg.Proxy.Retry.MaxRetries)
+	assert.Equal(t, 50*time.Millisecond, cfg.Proxy.Retry.BaseBackoff.Duration)
+	assert.Equal(t, time.Second, cfg.Proxy.Retry.MaxBackoff.Duration)
+}
+
+func TestLoad_RejectsMaxBackoffBelowBaseBackoff(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+proxy:
+  retry:
+    base_backoff: 1s
+    max_backoff: 500ms
+`)
+
+	_, err := Load(path)
+	assert.ErrorContains(t, err, "max_backoff")
+}
+
+func TestLoad_RejectsNegativeMaxRetries(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+proxy:
+  retry:
+    max_retries: -1
+`)
+
+	_, err := Load(path)
+	assert.ErrorContains(t, err, "max_retries")
 }
 
 func TestLoad_DurationsParseFromHumanStrings(t *testing.T) {
