@@ -74,7 +74,7 @@ metrics:
 	}
 
 	m := metrics.New()
-	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, m)
+	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, m, nil)
 	require.NoError(t, err)
 
 	handler := middleware.Chain(router,

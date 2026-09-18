@@ -76,11 +76,25 @@ cors:
 
 # Backend services requests are proxied to. Matched by hostname first,
 # then by longest matching path prefix.
+#
+# Each route also gets a GET response cache, stored in the same
+# storage.backend configured above (memory or Redis):
+#   cache.enabled - defaults to true; set to false to opt this route out
+#                   of caching entirely.
+#   cache.ttl     - how long a cached response stays valid (default: 60s).
+# Only GET responses with status 200 and no "Cache-Control: no-store"
+# are cached. Send "X-Bypass-Cache: 1" on a request to skip the cache
+# entirely for debugging. See README.md's "Response caching" section.
 routes:
   - path_prefix: "/api/users"
     target: "http://localhost:9001"
+    cache:
+      enabled: true
+      ttl: 30s
   - path_prefix: "/api/orders"
     target: "http://localhost:9002"
+    cache:
+      enabled: false
   - path_prefix: "/"
     target: "http://localhost:9000"
 

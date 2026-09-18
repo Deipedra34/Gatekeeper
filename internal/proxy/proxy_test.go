@@ -50,7 +50,7 @@ func TestRouter_RoutesByLongestPathPrefix(t *testing.T) {
 		{PathPrefix: "/api/users", Target: users.URL},
 		{PathPrefix: "/api/users/vip", Target: usersVIP.URL},
 		{PathPrefix: "/", Target: catchAll.URL},
-	}, noRetryProxyConfig(), nil)
+	}, noRetryProxyConfig(), nil, nil)
 	require.NoError(t, err)
 
 	cases := []struct {
@@ -79,7 +79,7 @@ func TestRouter_RoutesByHostBeforePathPrefix(t *testing.T) {
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: byPath.URL},
 		{Host: "orders.example.com", Target: byHost.URL},
-	}, noRetryProxyConfig(), nil)
+	}, noRetryProxyConfig(), nil, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/anything", nil)
@@ -93,7 +93,7 @@ func TestRouter_RoutesByHostBeforePathPrefix(t *testing.T) {
 func TestRouter_ReturnsNotFoundWhenNoRouteMatches(t *testing.T) {
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/api", Target: backend(t, "api").URL},
-	}, noRetryProxyConfig(), nil)
+	}, noRetryProxyConfig(), nil, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/unrouted", nil)
@@ -109,7 +109,7 @@ func TestRouter_ReturnsBadGatewayWhenBackendIsDown(t *testing.T) {
 
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: down.URL},
-	}, noRetryProxyConfig(), nil)
+	}, noRetryProxyConfig(), nil, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -129,7 +129,7 @@ func TestRouter_ForwardsRequestBodyAndMethod(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	router, err := NewRouter([]config.Route{{PathPrefix: "/", Target: srv.URL}}, noRetryProxyConfig(), nil)
+	router, err := NewRouter([]config.Route{{PathPrefix: "/", Target: srv.URL}}, noRetryProxyConfig(), nil, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodPost, "/create", strings.NewReader("hello"))
@@ -144,6 +144,6 @@ func TestRouter_ForwardsRequestBodyAndMethod(t *testing.T) {
 func TestNewRouter_RejectsInvalidTargetURL(t *testing.T) {
 	_, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: "://not-a-valid-url"},
-	}, noRetryProxyConfig(), nil)
+	}, noRetryProxyConfig(), nil, nil)
 	assert.Error(t, err)
 }

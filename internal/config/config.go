@@ -119,9 +119,30 @@ type CORSConfig struct {
 // Route maps incoming requests to a backend target, either by path
 // prefix or by hostname. At least one of PathPrefix / Host must be set.
 type Route struct {
-	PathPrefix string `yaml:"path_prefix"`
-	Host       string `yaml:"host"`
-	Target     string `yaml:"target"`
+	PathPrefix string     `yaml:"path_prefix"`
+	Host       string     `yaml:"host"`
+	Target     string     `yaml:"target"`
+	Cache      RouteCache `yaml:"cache"`
+}
+
+// RouteCache controls response caching of GET requests for one route.
+type RouteCache struct {
+	// Enabled toggles caching for this route. Defaults to true when
+	// unset; set it to false explicitly to opt this route out of
+	// caching entirely.
+	Enabled *bool `yaml:"enabled"`
+
+	// TTL is how long a cached response stays valid before the next
+	// request for the same key goes to the backend again. Defaults to
+	// 60s when unset.
+	TTL Duration `yaml:"ttl"`
+}
+
+// IsEnabled reports whether caching is on for this route, applying the
+// "enabled by default" rule for a route built without going through
+// Load/applyDefaults (e.g. constructed directly in tests).
+func (rc RouteCache) IsEnabled() bool {
+	return rc.Enabled == nil || *rc.Enabled
 }
 
 // MetricsConfig controls the Prometheus-compatible metrics endpoint.
@@ -240,6 +261,16 @@ func (c *Config) applyDefaults() {
 	if c.Proxy.Retry.MaxBackoff.Duration == 0 {
 		c.Proxy.Retry.MaxBackoff.Duration = 2 * time.Second
 	}
+
+	for i := range c.Routes {
+		if c.Routes[i].Cache.Enabled == nil {
+			enabled := true
+			c.Routes[i].Cache.Enabled = &enabled
+		}
+		if c.Routes[i].Cache.TTL.Duration == 0 {
+			c.Routes[i].Cache.TTL.Duration = 60 * time.Second
+		}
+	}
 }
 
 func (c *Config) validate() error {
@@ -285,6 +316,9 @@ func (c *Config) validate() error {
 		}
 		if r.Target == "" {
 			return fmt.Errorf("routes[%d]: target is required", i)
+		}
+		if r.Cache.TTL.Duration < 0 {
+			return fmt.Errorf("routes[%d]: cache.ttl must be >= 0", i)
 		}
 	}
 

@@ -203,3 +203,60 @@ func TestLoad_MissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	assert.Error(t, err)
 }
+
+func TestLoad_RouteCacheDefaultsToEnabledWithSixtySecondTTL(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+`)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	require.True(t, cfg.Routes[0].Cache.IsEnabled(), "cache should be enabled by default")
+	assert.Equal(t, 60*time.Second, cfg.Routes[0].Cache.TTL.Duration, "cache ttl should default to 60s")
+}
+
+func TestLoad_RouteCacheCanBeDisabledAndTTLOverridden(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/api"
+    target: "http://localhost:9000"
+    cache:
+      enabled: false
+  - path_prefix: "/"
+    target: "http://localhost:9001"
+    cache:
+      ttl: 30s
+`)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.False(t, cfg.Routes[0].Cache.IsEnabled(), "explicitly disabled route should opt out of caching")
+	assert.True(t, cfg.Routes[1].Cache.IsEnabled())
+	assert.Equal(t, 30*time.Second, cfg.Routes[1].Cache.TTL.Duration)
+}
+
+func TestLoad_RejectsNegativeCacheTTL(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+    cache:
+      ttl: -5s
+`)
+
+	_, err := Load(path)
+	assert.ErrorContains(t, err, "cache.ttl")
+}

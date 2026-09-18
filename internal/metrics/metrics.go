@@ -35,6 +35,13 @@ type Metrics struct {
 	// incremented exactly once per incoming request regardless of how
 	// many backend attempts it took.
 	ProxyOutcomes *prometheus.CounterVec
+
+	// CacheHits and CacheMisses count GET requests served from the
+	// response cache versus forwarded to the backend, by route. Neither
+	// is incremented for a route with caching disabled, a non-GET
+	// request, or a request carrying the cache-bypass header.
+	CacheHits   *prometheus.CounterVec
+	CacheMisses *prometheus.CounterVec
 }
 
 // New creates and registers all of Gatekeeper's collectors.
@@ -68,6 +75,14 @@ func New() *Metrics {
 			Name: "gatekeeper_proxy_request_outcomes_total",
 			Help: "Final outcome of each proxied request after any retries, by route and outcome (success or failure). Counted once per request regardless of attempt count.",
 		}, []string{"route", "outcome"}),
+		CacheHits: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_cache_hits_total",
+			Help: "Total number of GET requests served from the response cache without reaching the backend, by route.",
+		}, []string{"route"}),
+		CacheMisses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_cache_misses_total",
+			Help: "Total number of cache-eligible GET requests that were not found in the response cache and were forwarded to the backend, by route.",
+		}, []string{"route"}),
 	}
 
 	registry.MustRegister(
@@ -77,6 +92,8 @@ func New() *Metrics {
 		m.RequestDuration,
 		m.ProxyRetries,
 		m.ProxyOutcomes,
+		m.CacheHits,
+		m.CacheMisses,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)

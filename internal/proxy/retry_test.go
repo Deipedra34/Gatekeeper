@@ -42,7 +42,7 @@ func TestRetryTransport_SuccessfulRequestNeedsNoRetry(t *testing.T) {
 	m := metrics.New()
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: srv.URL},
-	}, fastRetryProxyConfig(3), m)
+	}, fastRetryProxyConfig(3), m, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/widgets", nil)
@@ -73,7 +73,7 @@ func TestRetryTransport_FailsOnceThenSucceedsOnRetry(t *testing.T) {
 	m := metrics.New()
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: srv.URL},
-	}, fastRetryProxyConfig(3), m)
+	}, fastRetryProxyConfig(3), m, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/widgets", nil)
@@ -100,7 +100,7 @@ func TestRetryTransport_ExhaustsRetriesAndFails(t *testing.T) {
 	maxRetries := 3
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: srv.URL},
-	}, fastRetryProxyConfig(maxRetries), m)
+	}, fastRetryProxyConfig(maxRetries), m, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/widgets", nil)
@@ -126,7 +126,7 @@ func TestRetryTransport_DoesNotRetryOn4xx(t *testing.T) {
 	m := metrics.New()
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: srv.URL},
-	}, fastRetryProxyConfig(3), m)
+	}, fastRetryProxyConfig(3), m, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/widgets", nil)
@@ -146,7 +146,7 @@ func TestRetryTransport_RetriesOnConnectionFailure(t *testing.T) {
 	m := metrics.New()
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: down.URL},
-	}, fastRetryProxyConfig(2), m)
+	}, fastRetryProxyConfig(2), m, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodGet, "/widgets", nil)
@@ -176,7 +176,7 @@ func TestRetryTransport_RequestBodyIsPreservedAcrossRetries(t *testing.T) {
 
 	router, err := NewRouter([]config.Route{
 		{PathPrefix: "/", Target: srv.URL},
-	}, fastRetryProxyConfig(3), nil)
+	}, fastRetryProxyConfig(3), nil, nil)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(http.MethodPost, "/widgets", strings.NewReader("payload"))

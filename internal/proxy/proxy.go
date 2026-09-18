@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"time"
 
+	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
 )
@@ -25,12 +26,18 @@ type route struct {
 	host       string
 	target     *url.URL
 	proxy      *httputil.ReverseProxy
+	label      string
+
+	cacheEnabled bool
+	cacheTTL     time.Duration
 }
 
 // Router dispatches requests to the backend whose route matches, based
 // on hostname first and then longest-matching path prefix.
 type Router struct {
-	routes []route
+	routes  []route
+	cache   *cache.Cache
+	metrics *metrics.Metrics
 }
 
 // NewRouter compiles cfg's routes into a Router. It fails fast on a
@@ -38,11 +45,16 @@ type Router struct {
 // of on whatever request happens to hit it first.
 //
 // proxyCfg controls the per-attempt timeout and retry/backoff policy
-// applied to every backend call. m, if non-nil, receives retry-attempt
-// and outcome metrics; it may be nil in tests that don't care about
-// metrics.
-func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Metrics) (*Router, error) {
-	r := &Router{}
+// applied to every backend call. m, if non-nil, receives retry-attempt,
+// outcome, and cache hit/miss metrics; it may be nil in tests that don't
+// care about metrics.
+//
+// respCache, if non-nil, backs GET response caching for routes whose
+// config enables it (see config.RouteCache); a nil respCache disables
+// caching entirely regardless of per-route config, which is what tests
+// that don't care about caching should pass.
+func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Metrics, respCache *cache.Cache) (*Router, error) {
+	r := &Router{cache: respCache, metrics: m}
 	for _, rt := range routes {
 		target, err := url.Parse(rt.Target)
 		if err != nil {
@@ -54,10 +66,13 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 		proxy.Transport = newRetryTransport(proxyCfg, m, routeLabel(rt))
 
 		r.routes = append(r.routes, route{
-			pathPrefix: rt.PathPrefix,
-			host:       rt.Host,
-			target:     target,
-			proxy:      proxy,
+			pathPrefix:   rt.PathPrefix,
+			host:         rt.Host,
+			target:       target,
+			proxy:        proxy,
+			label:        routeLabel(rt),
+			cacheEnabled: rt.Cache.IsEnabled(),
+			cacheTTL:     rt.Cache.TTL.Duration,
 		})
 	}
 	return r, nil
@@ -80,7 +95,123 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "no backend route configured for this request", http.StatusNotFound)
 		return
 	}
+
+	if r.cacheableRequest(rt, req) {
+		r.serveWithCache(w, req, rt)
+		return
+	}
 	rt.proxy.ServeHTTP(w, req)
+}
+
+// cacheableRequest reports whether req against rt should even consult
+// the cache: a response cache is configured, the route hasn't opted
+// out, only GET is ever cached (a write verb has no business being
+// served stale), and the caller hasn't asked to bypass it.
+func (r *Router) cacheableRequest(rt *route, req *http.Request) bool {
+	return r.cache != nil && rt.cacheEnabled && req.Method == http.MethodGet && !cache.Bypass(req)
+}
+
+// serveWithCache serves req from the cache when possible, falling back
+// to the backend on a miss (or on a cache read failure — a store
+// problem degrades to "always go to the backend", never to a crash) and
+// storing the fresh response for next time, unless the backend marked it
+// Cache-Control: no-store.
+func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, rt *route) {
+	ctx := req.Context()
+	key := cache.Key(rt.label, rt.target.String(), req)
+
+	entry, hit, err := r.cache.Get(ctx, key)
+	if err != nil {
+		log.Printf("cache: read failed for route %s, bypassing cache: %v", rt.label, err)
+	}
+	if hit {
+		r.recordCache(rt.label, true)
+		writeCachedEntry(w, entry)
+		return
+	}
+	r.recordCache(rt.label, false)
+
+	rec := newResponseRecorder()
+	rt.proxy.ServeHTTP(rec, req)
+
+	if rec.statusCode == http.StatusOK && cache.Storable(rec.Header()) {
+		fresh := &cache.Entry{
+			StatusCode: rec.statusCode,
+			Header:     rec.Header().Clone(),
+			Body:       rec.body,
+		}
+		if err := r.cache.Set(ctx, key, fresh, rt.cacheTTL); err != nil {
+			log.Printf("cache: write failed for route %s: %v", rt.label, err)
+		}
+	}
+
+	rec.header.Set("X-Cache", "MISS")
+	rec.flushTo(w)
+}
+
+func (r *Router) recordCache(routeLabel string, hit bool) {
+	if r.metrics == nil {
+		return
+	}
+	if hit {
+		r.metrics.CacheHits.WithLabelValues(routeLabel).Inc()
+	} else {
+		r.metrics.CacheMisses.WithLabelValues(routeLabel).Inc()
+	}
+}
+
+// writeCachedEntry replays a cached entry onto w exactly as captured.
+func writeCachedEntry(w http.ResponseWriter, e *cache.Entry) {
+	dst := w.Header()
+	for k, v := range e.Header {
+		dst[k] = v
+	}
+	dst.Set("X-Cache", "HIT")
+	w.WriteHeader(e.StatusCode)
+	_, _ = w.Write(e.Body)
+}
+
+// responseRecorder buffers a backend response in full so it can be
+// inspected (status, headers, Cache-Control) before deciding whether to
+// cache it and before writing anything to the real client connection.
+type responseRecorder struct {
+	header      http.Header
+	body        []byte
+	statusCode  int
+	wroteHeader bool
+}
+
+func newResponseRecorder() *responseRecorder {
+	return &responseRecorder{header: make(http.Header), statusCode: http.StatusOK}
+}
+
+func (rec *responseRecorder) Header() http.Header { return rec.header }
+
+func (rec *responseRecorder) WriteHeader(statusCode int) {
+	if rec.wroteHeader {
+		return
+	}
+	rec.statusCode = statusCode
+	rec.wroteHeader = true
+}
+
+func (rec *responseRecorder) Write(b []byte) (int, error) {
+	if !rec.wroteHeader {
+		rec.WriteHeader(http.StatusOK)
+	}
+	rec.body = append(rec.body, b...)
+	return len(b), nil
+}
+
+// flushTo writes the buffered response to w, once the caller has
+// decided (and, if applicable, finished acting on) what to do with it.
+func (rec *responseRecorder) flushTo(w http.ResponseWriter) {
+	dst := w.Header()
+	for k, v := range rec.header {
+		dst[k] = v
+	}
+	w.WriteHeader(rec.statusCode)
+	_, _ = w.Write(rec.body)
 }
 
 // match picks the route to use for req. Hostname routes take priority

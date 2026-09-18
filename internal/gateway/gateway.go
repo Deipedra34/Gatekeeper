@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/middleware"
@@ -29,6 +30,7 @@ import (
 // never a mix of the two.
 type Gateway struct {
 	store   store.Store
+	cache   *cache.Cache
 	metrics *metrics.Metrics
 	logger  *log.Logger
 
@@ -50,6 +52,7 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 	}
 	g := &Gateway{
 		store:      st,
+		cache:      cache.New(st),
 		metrics:    m,
 		logger:     logger,
 		configPath: configPath,
@@ -100,7 +103,7 @@ func (g *Gateway) Reload() error {
 // touches nothing on g, so a failure part-way through leaves the active
 // pipeline untouched.
 func (g *Gateway) build(cfg *config.Config) (http.Handler, error) {
-	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics)
+	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache)
 	if err != nil {
 		return nil, err
 	}
