@@ -1,0 +1,42 @@
+# Optional monitoring add-on for the docker-compose stack: a Prometheus
+# instance that scrapes gatekeeper's /metrics endpoint, and a Grafana
+# instance with the Gatekeeper dashboard (grafana/gatekeeper-dashboard.json)
+# already provisioned.
+#
+# This file is layered on top of docker-compose.yml and is never picked
+# up on its own — a plain `docker-compose up` still runs just the core
+# stack.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build
+#
+# Then, from the host:
+#   Grafana:    http://localhost:3000  (admin / admin)
+#   Prometheus: http://localhost:9090
+#
+# See grafana/README.md for more.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    depends_on:
+      - gatekeeper
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./grafana/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/gatekeeper-dashboard.json:/var/lib/grafana/dashboards/gatekeeper-dashboard.json:ro

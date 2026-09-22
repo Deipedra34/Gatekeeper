@@ -1,0 +1,14 @@
+# Grafana dashboard provisioning for docker-compose.monitoring.yml: loads
+# every dashboard JSON mounted into /var/lib/grafana/dashboards, which is
+# where the compose file mounts grafana/gatekeeper-dashboard.json.
+
+apiVersion: 1
+
+providers:
+  - name: gatekeeper
+    folder: Gatekeeper
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

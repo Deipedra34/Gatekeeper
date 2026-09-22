@@ -1,0 +1,13 @@
+# Prometheus config used by docker-compose.monitoring.yml. Scrapes
+# gatekeeper by its compose service name on the port and path set in
+# configs/config.docker.yaml (server.listen_addr and metrics.path).
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: gatekeeper
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gatekeeper:8080"]

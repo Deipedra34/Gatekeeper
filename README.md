@@ -324,6 +324,28 @@ gatekeeper_cache_misses_total{route="/api"} 32
 
 (`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
 
+### Grafana dashboard
+
+[`grafana/gatekeeper-dashboard.json`](grafana/gatekeeper-dashboard.json) is a ready-to-import Grafana dashboard for these metrics. It shows allowed vs rejected requests per client and tier, rate-limit quota remaining, cache hit/miss ratio, latency percentiles and a latency histogram, and backend retry counts and outcomes.
+
+<!-- TODO: Add a screenshot of the imported dashboard here. -->
+![Grafana dashboard](docs/images/grafana-dashboard.png)
+
+> **Screenshot placeholder:** add a screenshot of the imported dashboard at `docs/images/grafana-dashboard.png`.
+
+To use it:
+
+1. Point a Prometheus instance at Gatekeeper's metrics endpoint (`<listen_addr><metrics.path>`, e.g. `localhost:8080/metrics`). The endpoint needs no API key.
+2. In Grafana, go to **Dashboards → New → Import**, upload `grafana/gatekeeper-dashboard.json`, and pick that Prometheus data source from the **Data source** dropdown at the top of the dashboard.
+
+To try it locally, an opt-in compose file runs Prometheus and Grafana next to the existing stack, with the dashboard already provisioned. Grafana is then at <http://localhost:3000> (`admin` / `admin`):
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build
+```
+
+See [`grafana/README.md`](grafana/README.md) for the full walkthrough.
+
 ## Testing
 
 ```bash
