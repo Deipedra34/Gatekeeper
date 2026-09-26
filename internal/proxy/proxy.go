@@ -6,6 +6,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"gatekeeper/internal/cache"
+	"gatekeeper/internal/circuitbreaker"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
 )
@@ -63,7 +65,7 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.ErrorHandler = errorHandler(rt.Target)
-		proxy.Transport = newRetryTransport(proxyCfg, m, routeLabel(rt))
+		proxy.Transport = newRetryTransport(proxyCfg, m, routeLabel(rt), newBreaker(rt, m))
 
 		r.routes = append(r.routes, route{
 			pathPrefix:   rt.PathPrefix,
@@ -85,6 +87,26 @@ func routeLabel(rt config.Route) string {
 		return rt.PathPrefix
 	}
 	return rt.Host
+}
+
+// newBreaker builds the circuit breaker for rt, or nil if circuit
+// breaking shouldn't apply. Besides the route's own opt-out, a zero
+// FailureThreshold also disables it — which is what a config.Route built
+// directly in a test (bypassing config.Load's defaulting) gets by
+// default, so existing tests that don't care about circuit breaking see
+// no behavior change without having to opt out explicitly.
+func newBreaker(rt config.Route, m *metrics.Metrics) *circuitbreaker.CircuitBreaker {
+	cb := rt.CircuitBreaker
+	if !cb.IsEnabled() || cb.FailureThreshold <= 0 {
+		return nil
+	}
+	return circuitbreaker.New(circuitbreaker.Config{
+		FailureThreshold:    cb.FailureThreshold,
+		OpenDuration:        cb.OpenDuration.Duration,
+		HalfOpenMaxRequests: cb.HalfOpenMaxRequests,
+		SuccessesToClose:    cb.HalfOpenSuccessesToClose,
+		FailuresToReopen:    cb.HalfOpenFailuresToReopen,
+	}, m, routeLabel(rt))
 }
 
 // ServeHTTP implements http.Handler, dispatching to the first matching
@@ -248,45 +270,66 @@ func pathHasPrefix(path, prefix string) bool {
 	return path[:len(prefix)] == prefix
 }
 
+// errCircuitOpen is returned by retryTransport.RoundTrip when a route's
+// circuit breaker is Open (or its Half-Open trial slots are full)
+// instead of ever calling the backend, so errorHandler can tell a fail-
+// fast rejection apart from a real backend failure and answer 503
+// instead of 502.
+var errCircuitOpen = errors.New("proxy: circuit breaker open")
+
 // errorHandler returns a ReverseProxy.ErrorHandler that logs the
 // backend failure and answers with 502 instead of ReverseProxy's default
 // bare "connection refused" text — callers get a stable, documented
 // response for a backend outage instead of whatever the transport error
-// happened to say.
+// happened to say. A circuit-open rejection gets its own 503 instead,
+// since the backend was never even contacted.
 func errorHandler(target string) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, req *http.Request, err error) {
+		if errors.Is(err, errCircuitOpen) {
+			http.Error(w, "circuit breaker open: backend temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		log.Printf("proxy: backend %s unreachable for %s %s: %v", target, req.Method, req.URL.Path, err)
 		http.Error(w, "backend service unavailable", http.StatusBadGateway)
 	}
 }
 
-// retryTransport wraps an http.RoundTripper with a per-attempt timeout
-// and retries with exponential backoff and jitter. It retries on
-// transport-level failures (timeouts, connection errors) and 5xx
-// responses; a 4xx response is returned to the caller immediately since
-// no amount of retrying fixes a client error.
+// retryTransport wraps an http.RoundTripper with a per-attempt timeout,
+// retries with exponential backoff and jitter, and (optionally) a
+// circuit breaker. It retries on transport-level failures (timeouts,
+// connection errors) and 5xx responses; a 4xx response is returned to
+// the caller immediately since no amount of retrying fixes a client
+// error. The same failure/success classification feeds the circuit
+// breaker, so a persistently failing backend trips it the same way it
+// would exhaust retries.
 //
 // A single incoming request may cause several backend attempts, but
 // this transport sits below the rate limiter middleware — it is only
-// ever invoked once per admitted request — so retries never cost the
-// client extra rate-limit budget. See ProxyRetries / ProxyOutcomes for
-// how retries and their final result are reflected in /metrics
-// separately from the raw allowed/rejected request counts.
+// ever invoked once per admitted request — so retries (and circuit-open
+// rejections) never cost the client extra rate-limit budget. See
+// ProxyRetries / ProxyOutcomes / CircuitBreakerRejections for how these
+// are reflected in /metrics separately from the raw allowed/rejected
+// request counts.
 type retryTransport struct {
 	base    http.RoundTripper
 	timeout time.Duration
 	retry   config.RetryConfig
 	metrics *metrics.Metrics
 	route   string
+
+	// breaker is nil when circuit breaking is disabled for this route,
+	// in which case every breaker-related check below is skipped.
+	breaker *circuitbreaker.CircuitBreaker
 }
 
-func newRetryTransport(cfg config.ProxyConfig, m *metrics.Metrics, routeLabel string) *retryTransport {
+func newRetryTransport(cfg config.ProxyConfig, m *metrics.Metrics, routeLabel string, breaker *circuitbreaker.CircuitBreaker) *retryTransport {
 	return &retryTransport{
 		base:    http.DefaultTransport,
 		timeout: cfg.Timeout.Duration,
 		retry:   cfg.Retry,
 		metrics: m,
 		route:   routeLabel,
+		breaker: breaker,
 	}
 }
 
@@ -302,9 +345,20 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var rtErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Checked before backoff so a circuit that trips mid-retry (or
+		// is already open) fails this and every remaining attempt fast,
+		// without sleeping first and without ever reaching the backend
+		// again — retrying into an already-open circuit defeats the
+		// point of having one.
+		if t.breaker != nil && !t.breaker.Allow() {
+			t.recordCircuitRejection()
+			return nil, errCircuitOpen
+		}
+
 		if attempt > 1 {
 			t.incRetries()
 			if werr := waitBackoff(req.Context(), t.retry, attempt-1); werr != nil {
+				t.releaseBreaker()
 				t.recordOutcome(false)
 				return nil, werr
 			}
@@ -319,6 +373,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		if rtErr != nil {
 			cancel()
+			t.reportBreaker(false)
 			if last || req.Context().Err() != nil {
 				t.recordOutcome(false)
 				return nil, rtErr
@@ -330,6 +385,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			cancel()
+			t.reportBreaker(false)
 			continue
 		}
 
@@ -338,11 +394,39 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// ReverseProxy reads and closes resp.Body after RoundTrip
 		// returns, so the attempt's context must stay alive until then.
 		resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+		t.reportBreaker(!isRetryableStatus(resp.StatusCode))
 		t.recordOutcome(resp.StatusCode < 500)
 		return resp, nil
 	}
 
 	return resp, rtErr
+}
+
+// reportBreaker records the outcome of an attempt that the breaker's
+// Allow already let through. It's a no-op when circuit breaking is
+// disabled for this route.
+func (t *retryTransport) reportBreaker(success bool) {
+	if t.breaker == nil {
+		return
+	}
+	t.breaker.Report(success)
+}
+
+// releaseBreaker undoes an Allow reservation for an attempt that was
+// abandoned before it ever reached the backend (the request's context
+// was cancelled while waiting out the retry backoff).
+func (t *retryTransport) releaseBreaker() {
+	if t.breaker == nil {
+		return
+	}
+	t.breaker.Release()
+}
+
+func (t *retryTransport) recordCircuitRejection() {
+	if t.metrics == nil {
+		return
+	}
+	t.metrics.CircuitBreakerRejections.WithLabelValues(t.route).Inc()
 }
 
 func (t *retryTransport) incRetries() {

@@ -18,8 +18,9 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Configurable backend timeout and retry.** Every backend attempt is bounded by a per-attempt timeout; a timeout, connection failure, or 5xx response is retried with exponential backoff and jitter, up to a configurable limit. 4xx responses are never retried.
 - **A normal middleware chain.** Rate limiting, request logging, API key auth, and CORS, composed the same way you'd compose any `net/http` middleware.
 - **Per-client tiers.** Limits scoped by API key, source IP, or a custom header, with independent free/premium/whatever tiers defined in config.
-- **A Prometheus-compatible `/metrics` endpoint.** Requests allowed/rejected per client and tier, current limiter state, request latency histograms, cache hits/misses per route.
+- **A Prometheus-compatible `/metrics` endpoint.** Requests allowed/rejected per client and tier, current limiter state, request latency histograms, cache hits/misses per route, circuit breaker state and rejections per route.
 - **Response caching for GET requests.** Backend responses are cached per route in the same storage backend the rate limiter uses (memory or Redis), with a configurable TTL, an opt-out per route, and a header to bypass the cache for debugging.
+- **A circuit breaker around every backend call.** Closed / Open / Half-Open, configurable per route, so a struggling backend gets a break from traffic instead of every request queuing up behind retries and timeouts.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
@@ -43,6 +44,7 @@ flowchart LR
     Store[("Store interface")]
     Mem[("MemoryStore\n(sync-protected map)")]
     Redis[("RedisStore\n(go-redis + Lua scripts)")]
+    CB{{"Circuit breaker\n(per route)"}}
 
     Client -->|HTTP request| CORS
     RL <-->|Increment / Load / CAS| Store
@@ -50,6 +52,8 @@ flowchart LR
     Store -.->|primary| Redis
     Store -.->|fallback on outage| Mem
 
+    Proxy <-->|Allow / Report| CB
+    CB -.->|Open: fail fast, no backend call| Proxy
     Proxy --> BackendA["Backend service A"]
     Proxy --> BackendB["Backend service B"]
 
@@ -66,8 +70,9 @@ internal/gateway/      assembles the request pipeline from config; rebuilds and 
 internal/config/       YAML config loading, defaults, and validation
 internal/ratelimiter/  the three algorithms + the Store abstraction they share
   └─ store/            MemoryStore, RedisStore, and FallbackStore (Redis → memory failover)
-internal/proxy/        the reverse-proxy router (path prefix / hostname matching), backend timeout + retry/backoff, GET response caching
+internal/proxy/        the reverse-proxy router (path prefix / hostname matching), backend timeout + retry/backoff, GET response caching, circuit breaker integration
 internal/cache/        the response cache: key derivation, Cache-Control handling, Store-backed get/set
+internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
 internal/middleware/   logging, CORS, API key auth, rate-limit middleware
 internal/metrics/      Prometheus collectors + /metrics handler
 configs/                example config.yaml
@@ -123,6 +128,44 @@ All four fields are optional; any left unset get the defaults shown above.
 - If every attempt fails, the proxy returns whatever the last attempt produced: the backend's own `5xx` if that's what kept coming back, or a `502 Bad Gateway` if the backend was unreachable.
 
 **Interaction with rate limiting and metrics:** the rate limiter middleware sits in front of the proxy and only ever sees the original incoming request once, so retries against the backend never cost a client extra rate-limit budget — a request that retries twice before succeeding still counts as exactly one allowed request against that client's limit. Retry attempts and final outcomes are tracked as their own metrics, separate from the raw allow/reject counters (see [Metrics](#metrics) below).
+
+## Circuit breaker
+
+Every route's backend calls go through a circuit breaker with three states:
+
+- **Closed** — normal operation. Requests go to the backend as usual; failures are counted.
+- **Open** — the backend has failed too many times in a row. Every request is **failed fast** with `503 Service Unavailable` — the backend is never contacted at all — until the configured cooldown elapses.
+- **Half-Open** — after the cooldown, a limited number of trial requests are let through to check whether the backend has recovered. Everything else still fails fast while a trial is in flight.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: failure_threshold consecutive failures
+    Open --> HalfOpen: open_duration cooldown elapses
+    HalfOpen --> Closed: half_open_successes_to_close trial successes
+    HalfOpen --> Open: half_open_failures_to_reopen trial failures
+```
+
+**What counts as a failure** is the same definition the retry logic uses: a timed-out attempt, a connection error, or a `5xx` response. A `4xx` response counts as a *success* for the breaker's purposes — the backend answered the request correctly, it just didn't like what the client sent, which says nothing about the backend's health. Any success (including a `4xx`) resets the consecutive-failure count while Closed.
+
+**Configuration** — per route, in `configs/config.yaml`:
+
+```yaml
+routes:
+  - path_prefix: "/api/users"
+    target: "http://localhost:9001"
+    circuit_breaker:
+      enabled: true                        # default: true
+      failure_threshold: 5                 # default: 5 consecutive failures
+      open_duration: 30s                   # default: 30s cooldown
+      half_open_max_requests: 1            # default: 1 concurrent trial
+      half_open_successes_to_close: 1      # default: 1 trial success closes it
+      half_open_failures_to_reopen: 1       # default: 1 trial failure reopens it
+```
+
+All fields are optional; omitting `circuit_breaker` entirely gives you the defaults shown above. Set `enabled: false` to exempt a route from circuit breaking altogether — for a backend where you'd always rather wait/retry than ever get a fast-fail 503, for instance.
+
+**Interaction with retries.** The breaker is checked before every attempt a request makes, not just once per incoming request — so if a request's first attempt fails and pushes the breaker from Closed to Open, its *own* second attempt (and any further retries) sees the Open circuit and fails fast immediately: **no retry is made into an already-open circuit**. That fail-fast check happens before the retry's backoff delay too, so a circuit that's already open doesn't even pay the backoff wait before giving up. A circuit-open rejection isn't counted as a retry attempt in `gatekeeper_proxy_retries_total`, and it doesn't consume any of `proxy.retry.max_retries` — it's a distinct outcome from a retried-and-failed backend call, tracked in its own metric (see below). Like retries, this all happens below the rate limiter middleware, so a fast-failed request still counts as exactly one allowed request against the client's rate limit, same as any other outcome.
 
 ## Response caching
 
@@ -316,11 +359,15 @@ gatekeeper_proxy_request_outcomes_total{route="/api",outcome="success"} 108
 gatekeeper_proxy_request_outcomes_total{route="/api",outcome="failure"} 3
 gatekeeper_cache_hits_total{route="/api"} 76
 gatekeeper_cache_misses_total{route="/api"} 32
+gatekeeper_circuit_breaker_state{route="/api"} 0
+gatekeeper_circuit_breaker_rejections_total{route="/api"} 0
 ```
 
 `gatekeeper_proxy_retries_total` counts individual retry attempts against a backend (not the initial attempt), and `gatekeeper_proxy_request_outcomes_total` counts each proxied request exactly once — as `success` or `failure` — after all retries are done. Both are independent of `gatekeeper_requests_allowed_total`/`_rejected_total`, which reflect the rate limiter's decision on the original client request, not what happened while forwarding it.
 
 `gatekeeper_cache_hits_total`/`gatekeeper_cache_misses_total` count cache-eligible `GET` requests per route — a hit was served without touching the backend, a miss reached the backend and (usually) refreshed the cache. Neither counter moves for a route with caching disabled, a non-`GET` request, or a request sent with `X-Bypass-Cache`.
+
+`gatekeeper_circuit_breaker_state` reports each route's current breaker state as a number — `0` (closed), `1` (open), `2` (half-open) — so you can alert on a route sitting at `1` for longer than expected. `gatekeeper_circuit_breaker_rejections_total` counts requests that were failed fast because the breaker was open; these never reach the backend and are separate from `gatekeeper_proxy_request_outcomes_total`. Neither series appears for a route with circuit breaking disabled.
 
 (`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
 
@@ -359,6 +406,7 @@ What's covered:
 - Gateway routing: longest-path-prefix matching, host-based routing, a 404 when nothing matches, a 502 when the backend is dead.
 - Backend timeout/retry: a request that succeeds on the first try, one that fails once then succeeds on retry, one that exhausts all retries and fails, a connection-refused backend being retried, and confirming a `4xx` response is never retried — including that retries never inflate the request's rate-limit cost.
 - Response caching (`internal/cache` and `internal/proxy/cache_test.go`): a miss followed by a hit for the same request, TTL expiration forcing a fresh backend call, a `Cache-Control: no-store` response never being cached, `X-Bypass-Cache` skipping the cache without disturbing the existing entry, a route with caching disabled always reaching the backend, and caching degrading gracefully (fail open, no crash) when its store errors on every call — simulating Redis being down.
+- Circuit breaker (`internal/circuitbreaker` and `internal/proxy/circuitbreaker_test.go`): tripping to Open after `failure_threshold` consecutive failures, requests failing fast (and never reaching the backend) while Open, transitioning to Half-Open once the cooldown elapses, a successful trial closing the breaker, a failed trial re-opening it, Half-Open's concurrent-trial limit, and confirming a request never retries into an already-open circuit.
 - A full end-to-end test (`TestGateway_EndToEnd`) that wires config → storage → limiters → the whole middleware chain → the proxy, then drives it through auth, CORS, per-tier rate limiting, and routing together, not in isolation.
 
 ## Load testing
@@ -451,7 +499,7 @@ storage:     { backend: memory|redis, redis: { addr, password, db, dial_timeout 
 rate_limit:  { algorithm, scope: api_key|ip|header, header_name, tiers: {...}, clients: {...} }
 auth:        { enabled, header, api_keys: [...] }
 cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow_credentials, max_age }
-routes:      [ { path_prefix | host, target, cache: { enabled, ttl } } ]
+routes:      [ { path_prefix | host, target, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen } } ]
 metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
 ```

@@ -42,6 +42,18 @@ type Metrics struct {
 	// request, or a request carrying the cache-bypass header.
 	CacheHits   *prometheus.CounterVec
 	CacheMisses *prometheus.CounterVec
+
+	// CircuitBreakerState reports each route's current circuit breaker
+	// state as a number: 0 (closed), 1 (open), 2 (half-open) — see
+	// circuitbreaker.State. A route with circuit breaking disabled never
+	// gets a series here.
+	CircuitBreakerState *prometheus.GaugeVec
+
+	// CircuitBreakerRejections counts requests that were failed fast
+	// because a route's circuit breaker was open (or its Half-Open trial
+	// slots were full), by route. These never reach the backend and are
+	// not reflected in ProxyOutcomes.
+	CircuitBreakerRejections *prometheus.CounterVec
 }
 
 // New creates and registers all of Gatekeeper's collectors.
@@ -83,6 +95,14 @@ func New() *Metrics {
 			Name: "gatekeeper_cache_misses_total",
 			Help: "Total number of cache-eligible GET requests that were not found in the response cache and were forwarded to the backend, by route.",
 		}, []string{"route"}),
+		CircuitBreakerState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gatekeeper_circuit_breaker_state",
+			Help: "Current circuit breaker state per route: 0=closed, 1=open, 2=half-open.",
+		}, []string{"route"}),
+		CircuitBreakerRejections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_circuit_breaker_rejections_total",
+			Help: "Total number of requests failed fast because a route's circuit breaker was open, by route.",
+		}, []string{"route"}),
 	}
 
 	registry.MustRegister(
@@ -94,6 +114,8 @@ func New() *Metrics {
 		m.ProxyOutcomes,
 		m.CacheHits,
 		m.CacheMisses,
+		m.CircuitBreakerState,
+		m.CircuitBreakerRejections,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)

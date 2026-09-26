@@ -119,10 +119,11 @@ type CORSConfig struct {
 // Route maps incoming requests to a backend target, either by path
 // prefix or by hostname. At least one of PathPrefix / Host must be set.
 type Route struct {
-	PathPrefix string     `yaml:"path_prefix"`
-	Host       string     `yaml:"host"`
-	Target     string     `yaml:"target"`
-	Cache      RouteCache `yaml:"cache"`
+	PathPrefix     string              `yaml:"path_prefix"`
+	Host           string              `yaml:"host"`
+	Target         string              `yaml:"target"`
+	Cache          RouteCache          `yaml:"cache"`
+	CircuitBreaker RouteCircuitBreaker `yaml:"circuit_breaker"`
 }
 
 // RouteCache controls response caching of GET requests for one route.
@@ -142,6 +143,44 @@ type RouteCache struct {
 // "enabled by default" rule for a route built without going through
 // Load/applyDefaults (e.g. constructed directly in tests).
 func (rc RouteCache) IsEnabled() bool {
+	return rc.Enabled == nil || *rc.Enabled
+}
+
+// RouteCircuitBreaker controls the circuit breaker wrapped around
+// backend calls for one route. See the "Circuit breaker" section of
+// README.md for the state machine this configures.
+type RouteCircuitBreaker struct {
+	// Enabled toggles the circuit breaker for this route. Defaults to
+	// true when unset.
+	Enabled *bool `yaml:"enabled"`
+
+	// FailureThreshold is how many consecutive failed backend attempts
+	// (a timeout, connection error, or 5xx — the same definition the
+	// retry logic uses) trip the breaker from Closed to Open. Any
+	// success resets the count. Defaults to 5 when unset.
+	FailureThreshold int `yaml:"failure_threshold"`
+
+	// OpenDuration is the cooldown the breaker spends in Open before
+	// admitting a trial request in Half-Open. Defaults to 30s when unset.
+	OpenDuration Duration `yaml:"open_duration"`
+
+	// HalfOpenMaxRequests caps how many trial requests are let through
+	// concurrently while Half-Open. Defaults to 1 when unset.
+	HalfOpenMaxRequests int `yaml:"half_open_max_requests"`
+
+	// HalfOpenSuccessesToClose is how many Half-Open trial successes
+	// close the breaker again. Defaults to 1 when unset.
+	HalfOpenSuccessesToClose int `yaml:"half_open_successes_to_close"`
+
+	// HalfOpenFailuresToReopen is how many Half-Open trial failures
+	// re-open the breaker. Defaults to 1 when unset.
+	HalfOpenFailuresToReopen int `yaml:"half_open_failures_to_reopen"`
+}
+
+// IsEnabled reports whether the circuit breaker is on for this route,
+// applying the "enabled by default" rule for a route built without going
+// through Load/applyDefaults (e.g. constructed directly in tests).
+func (rc RouteCircuitBreaker) IsEnabled() bool {
 	return rc.Enabled == nil || *rc.Enabled
 }
 
@@ -270,6 +309,27 @@ func (c *Config) applyDefaults() {
 		if c.Routes[i].Cache.TTL.Duration == 0 {
 			c.Routes[i].Cache.TTL.Duration = 60 * time.Second
 		}
+
+		cb := &c.Routes[i].CircuitBreaker
+		if cb.Enabled == nil {
+			enabled := true
+			cb.Enabled = &enabled
+		}
+		if cb.FailureThreshold == 0 {
+			cb.FailureThreshold = 5
+		}
+		if cb.OpenDuration.Duration == 0 {
+			cb.OpenDuration.Duration = 30 * time.Second
+		}
+		if cb.HalfOpenMaxRequests == 0 {
+			cb.HalfOpenMaxRequests = 1
+		}
+		if cb.HalfOpenSuccessesToClose == 0 {
+			cb.HalfOpenSuccessesToClose = 1
+		}
+		if cb.HalfOpenFailuresToReopen == 0 {
+			cb.HalfOpenFailuresToReopen = 1
+		}
 	}
 }
 
@@ -319,6 +379,23 @@ func (c *Config) validate() error {
 		}
 		if r.Cache.TTL.Duration < 0 {
 			return fmt.Errorf("routes[%d]: cache.ttl must be >= 0", i)
+		}
+
+		cb := r.CircuitBreaker
+		if cb.FailureThreshold < 0 {
+			return fmt.Errorf("routes[%d]: circuit_breaker.failure_threshold must be >= 0", i)
+		}
+		if cb.OpenDuration.Duration < 0 {
+			return fmt.Errorf("routes[%d]: circuit_breaker.open_duration must be >= 0", i)
+		}
+		if cb.HalfOpenMaxRequests < 0 {
+			return fmt.Errorf("routes[%d]: circuit_breaker.half_open_max_requests must be >= 0", i)
+		}
+		if cb.HalfOpenSuccessesToClose < 0 {
+			return fmt.Errorf("routes[%d]: circuit_breaker.half_open_successes_to_close must be >= 0", i)
+		}
+		if cb.HalfOpenFailuresToReopen < 0 {
+			return fmt.Errorf("routes[%d]: circuit_breaker.half_open_failures_to_reopen must be >= 0", i)
 		}
 	}
 

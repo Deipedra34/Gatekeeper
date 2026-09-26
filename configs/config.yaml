@@ -85,15 +85,44 @@ cors:
 # Only GET responses with status 200 and no "Cache-Control: no-store"
 # are cached. Send "X-Bypass-Cache: 1" on a request to skip the cache
 # entirely for debugging. See README.md's "Response caching" section.
+#
+# Each route also gets a circuit breaker wrapped around its backend
+# calls (Closed -> Open -> Half-Open -> Closed/Open again):
+#   circuit_breaker.enabled                      - defaults to true.
+#   circuit_breaker.failure_threshold             - consecutive failed
+#                                                    attempts (timeout,
+#                                                    connection error, or
+#                                                    5xx) that trip it to
+#                                                    Open (default: 5).
+#   circuit_breaker.open_duration                 - cooldown before a
+#                                                    trial request is let
+#                                                    through in Half-Open
+#                                                    (default: 30s).
+#   circuit_breaker.half_open_max_requests         - concurrent trial
+#                                                    requests allowed in
+#                                                    Half-Open (default: 1).
+#   circuit_breaker.half_open_successes_to_close   - trial successes
+#                                                    needed to close it
+#                                                    again (default: 1).
+#   circuit_breaker.half_open_failures_to_reopen   - trial failures that
+#                                                    re-open it (default: 1).
+# An Open circuit fails every request immediately with 503, without
+# ever contacting the backend or consuming a retry attempt. See
+# README.md's "Circuit breaker" section.
 routes:
   - path_prefix: "/api/users"
     target: "http://localhost:9001"
     cache:
       enabled: true
       ttl: 30s
+    circuit_breaker:
+      failure_threshold: 5
+      open_duration: 30s
   - path_prefix: "/api/orders"
     target: "http://localhost:9002"
     cache:
+      enabled: false
+    circuit_breaker:
       enabled: false
   - path_prefix: "/"
     target: "http://localhost:9000"

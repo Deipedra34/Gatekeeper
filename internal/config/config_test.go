@@ -260,3 +260,89 @@ routes:
 	_, err := Load(path)
 	assert.ErrorContains(t, err, "cache.ttl")
 }
+
+func TestLoad_RouteCircuitBreakerDefaults(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+`)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	cb := cfg.Routes[0].CircuitBreaker
+	require.True(t, cb.IsEnabled(), "circuit breaker should be enabled by default")
+	assert.Equal(t, 5, cb.FailureThreshold)
+	assert.Equal(t, 30*time.Second, cb.OpenDuration.Duration)
+	assert.Equal(t, 1, cb.HalfOpenMaxRequests)
+	assert.Equal(t, 1, cb.HalfOpenSuccessesToClose)
+	assert.Equal(t, 1, cb.HalfOpenFailuresToReopen)
+}
+
+func TestLoad_RouteCircuitBreakerCanBeDisabledAndTuned(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/api"
+    target: "http://localhost:9000"
+    circuit_breaker:
+      enabled: false
+  - path_prefix: "/"
+    target: "http://localhost:9001"
+    circuit_breaker:
+      failure_threshold: 10
+      open_duration: 15s
+      half_open_max_requests: 3
+      half_open_successes_to_close: 2
+      half_open_failures_to_reopen: 2
+`)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	assert.False(t, cfg.Routes[0].CircuitBreaker.IsEnabled())
+
+	cb := cfg.Routes[1].CircuitBreaker
+	assert.True(t, cb.IsEnabled())
+	assert.Equal(t, 10, cb.FailureThreshold)
+	assert.Equal(t, 15*time.Second, cb.OpenDuration.Duration)
+	assert.Equal(t, 3, cb.HalfOpenMaxRequests)
+	assert.Equal(t, 2, cb.HalfOpenSuccessesToClose)
+	assert.Equal(t, 2, cb.HalfOpenFailuresToReopen)
+}
+
+func TestLoad_RejectsNegativeCircuitBreakerFields(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+	}{
+		{"failure_threshold: -1", "failure_threshold"},
+		{"open_duration: -5s", "open_duration"},
+		{"half_open_max_requests: -1", "half_open_max_requests"},
+		{"half_open_successes_to_close: -1", "half_open_successes_to_close"},
+		{"half_open_failures_to_reopen: -1", "half_open_failures_to_reopen"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+    circuit_breaker:
+      `+tc.name+`
+`)
+			_, err := Load(path)
+			assert.ErrorContains(t, err, tc.field)
+		})
+	}
+}
