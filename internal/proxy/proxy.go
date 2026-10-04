@@ -32,6 +32,8 @@ type route struct {
 
 	cacheEnabled bool
 	cacheTTL     time.Duration
+
+	authMode string
 }
 
 // Router dispatches requests to the backend whose route matches, based
@@ -75,6 +77,7 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			label:        routeLabel(rt),
 			cacheEnabled: rt.Cache.IsEnabled(),
 			cacheTTL:     rt.Cache.TTL.Duration,
+			authMode:     rt.EffectiveAuthMode(),
 		})
 	}
 	return r, nil
@@ -123,6 +126,18 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	rt.proxy.ServeHTTP(w, req)
+}
+
+// AuthModeFor returns the auth mode of the route req will be dispatched
+// to, using the same matching rules as ServeHTTP so the auth middleware
+// and the router can never disagree about which route applies. A request
+// that matches no route gets the default api_key mode; the router will
+// answer it with 404 anyway once it's past auth.
+func (r *Router) AuthModeFor(req *http.Request) string {
+	if rt := r.match(req); rt != nil {
+		return rt.authMode
+	}
+	return config.AuthModeAPIKey
 }
 
 // cacheableRequest reports whether req against rt should even consult

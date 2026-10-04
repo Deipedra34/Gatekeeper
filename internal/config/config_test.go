@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -345,4 +346,98 @@ routes:
 			assert.ErrorContains(t, err, tc.field)
 		})
 	}
+}
+
+func TestLoad_RouteAuthModeDefaultsToAPIKey(t *testing.T) {
+	path := writeConfig(t, `
+auth:
+  enabled: true
+  api_keys: ["k"]
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+`)
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, AuthModeAPIKey, cfg.Routes[0].AuthMode, "existing configs keep API key auth")
+	assert.Equal(t, "sub", cfg.Auth.JWT.ClientIDClaim)
+	assert.Equal(t, AuthModeAPIKey, Route{}.EffectiveAuthMode())
+}
+
+const jwtRouteConfig = `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+    auth_mode: %s
+auth:
+  enabled: true
+%s
+`
+
+func TestLoad_JWTConfigValidation(t *testing.T) {
+	const goodSecret = "0123456789abcdef0123456789abcdef"
+	t.Setenv("GATEKEEPER_TEST_JWT_SECRET", goodSecret)
+
+	cases := []struct {
+		name    string
+		mode    string
+		auth    string
+		wantErr string // "" = valid
+	}{
+		{"hs256 with secret", "jwt", "  jwt: {algorithm: HS256, secret: " + goodSecret + "}", ""},
+		{"hs256 with secret_env", "jwt", "  jwt: {algorithm: HS256, secret_env: GATEKEEPER_TEST_JWT_SECRET}", ""},
+		{"rs256 with key file", "jwt", "  jwt: {algorithm: RS256, public_key_file: key.pem}", ""},
+		{"either without api keys", "either", "  jwt: {algorithm: HS256, secret: " + goodSecret + "}", ""},
+		{"unknown auth mode", "oauth", "  api_keys: [k]", "auth_mode"},
+		{"jwt route without jwt config", "jwt", "", "auth.jwt.algorithm is required"},
+		{"unsupported algorithm", "jwt", "  jwt: {algorithm: none}", "HS256 or RS256"},
+		{"short secret", "jwt", "  jwt: {algorithm: HS256, secret: too-short}", "at least 32 bytes"},
+		{"missing secret", "jwt", "  jwt: {algorithm: HS256}", "secret or secret_env"},
+		{"both secret sources", "jwt", "  jwt: {algorithm: HS256, secret: " + goodSecret + ", secret_env: X}", "only one"},
+		{"unset secret_env", "jwt", "  jwt: {algorithm: HS256, secret_env: GATEKEEPER_TEST_UNSET_VAR}", "GATEKEEPER_TEST_UNSET_VAR"},
+		{"rs256 without key file", "jwt", "  jwt: {algorithm: RS256}", "public_key_file is required"},
+		{"rs256 with secret", "jwt", "  jwt: {algorithm: RS256, public_key_file: k.pem, secret: " + goodSecret + "}", "only used with HS256"},
+		{"hs256 with key file", "jwt", "  jwt: {algorithm: HS256, secret: " + goodSecret + ", public_key_file: k.pem}", "only used with RS256"},
+		{"negative leeway", "jwt", "  jwt: {algorithm: HS256, secret: " + goodSecret + ", leeway: -1s}", "leeway"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, fmt.Sprintf(jwtRouteConfig, tc.mode, tc.auth))
+			_, err := Load(path)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestLoad_SecretNeverAppearsInErrors(t *testing.T) {
+	path := writeConfig(t, fmt.Sprintf(jwtRouteConfig, "jwt", "  jwt: {algorithm: HS256, secret: hunter2-short}"))
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "hunter2")
+}
+
+func TestLoad_JWTRouteAllowedWhenAuthDisabled(t *testing.T) {
+	path := writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+    auth_mode: jwt
+`)
+	_, err := Load(path)
+	assert.NoError(t, err, "auth.enabled is the master switch; with it off no JWT settings are needed")
 }

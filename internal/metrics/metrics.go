@@ -1,7 +1,7 @@
 // Package metrics exposes Gatekeeper's Prometheus-compatible admin
 // endpoint: counts of allowed/rejected requests per client and tier,
-// the rate limiter's current remaining allowance per client, and
-// request latency.
+// the rate limiter's current remaining allowance per client, request
+// latency, and authentication successes/failures by method.
 package metrics
 
 import (
@@ -54,6 +54,14 @@ type Metrics struct {
 	// slots were full), by route. These never reach the backend and are
 	// not reflected in ProxyOutcomes.
 	CircuitBreakerRejections *prometheus.CounterVec
+
+	// AuthRequests counts authentication decisions by method ("api_key"
+	// or "jwt") and result ("success" or "failure"). Each request that
+	// reaches the auth middleware with auth enabled is counted exactly
+	// once. A rejected request is attributed to "jwt" if it carried a
+	// bearer token and to "api_key" otherwise, except on a jwt-only route,
+	// where it's always "jwt".
+	AuthRequests *prometheus.CounterVec
 }
 
 // New creates and registers all of Gatekeeper's collectors.
@@ -103,6 +111,10 @@ func New() *Metrics {
 			Name: "gatekeeper_circuit_breaker_rejections_total",
 			Help: "Total number of requests failed fast because a route's circuit breaker was open, by route.",
 		}, []string{"route"}),
+		AuthRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_auth_requests_total",
+			Help: "Total number of authentication decisions, by method (api_key or jwt) and result (success or failure).",
+		}, []string{"method", "result"}),
 	}
 
 	registry.MustRegister(
@@ -116,6 +128,7 @@ func New() *Metrics {
 		m.CacheMisses,
 		m.CircuitBreakerState,
 		m.CircuitBreakerRejections,
+		m.AuthRequests,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)

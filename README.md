@@ -16,9 +16,10 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Two storage backends.** An in-memory map for single-instance deployments, or Redis when you need limits coordinated across a fleet.
 - **Reverse proxy core.** Routes requests to backend services by path prefix or hostname, using `net/http/httputil.ReverseProxy` under the hood.
 - **Configurable backend timeout and retry.** Every backend attempt is bounded by a per-attempt timeout; a timeout, connection failure, or 5xx response is retried with exponential backoff and jitter, up to a configurable limit. 4xx responses are never retried.
-- **A normal middleware chain.** Rate limiting, request logging, API key auth, and CORS, composed the same way you'd compose any `net/http` middleware.
-- **Per-client tiers.** Limits scoped by API key, source IP, or a custom header, with independent free/premium/whatever tiers defined in config.
-- **A Prometheus-compatible `/metrics` endpoint.** Requests allowed/rejected per client and tier, current limiter state, request latency histograms, cache hits/misses per route, circuit breaker state and rejections per route.
+- **A normal middleware chain.** Rate limiting, request logging, API key / JWT auth, and CORS, composed the same way you'd compose any `net/http` middleware.
+- **API keys and JWTs, per route.** Each route requires an API key, a JWT (HS256 or RS256), or either one. Existing configs keep plain API key auth without any changes.
+- **Per-client tiers.** Limits scoped by API key, source IP, a custom header, or a JWT claim, with independent free/premium/whatever tiers defined in config (or picked by a JWT claim).
+- **A Prometheus-compatible `/metrics` endpoint.** Requests allowed/rejected per client and tier, current limiter state, request latency histograms, cache hits/misses per route, circuit breaker state and rejections per route, auth successes/failures by method.
 - **Response caching for GET requests.** Backend responses are cached per route in the same storage backend the rate limiter uses (memory or Redis), with a configurable TTL, an opt-out per route, and a header to bypass the cache for debugging.
 - **A circuit breaker around every backend call.** Closed / Open / Half-Open, configurable per route, so a struggling backend gets a break from traffic instead of every request queuing up behind retries and timeouts.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
@@ -33,7 +34,7 @@ flowchart LR
     subgraph GW["Gatekeeper"]
         direction TB
         CORS["CORS middleware"]
-        Auth["API key auth"]
+        Auth["Auth\n(API key / JWT, per route)"]
         RL["Rate limiter middleware"]
         Proxy["Reverse proxy router\n(path prefix / host match)"]
         Metrics["/metrics endpoint"]
@@ -60,7 +61,7 @@ flowchart LR
     Client -.->|GET /metrics| Metrics
 ```
 
-Every request runs through the same chain: CORS, then API key auth, then the rate limiter, then the proxy. The limiter and the proxy don't know about each other — the limiter just needs a client key and a `Store`, the proxy just needs a routing table — so you can test, swap, or reason about either one on its own.
+Every request runs through the same chain: CORS, then auth (API key or JWT, depending on the route), then the rate limiter, then the proxy. The limiter and the proxy don't know about each other — the limiter just needs a client key and a `Store`, the proxy just needs a routing table — so you can test, swap, or reason about either one on its own.
 
 ### Package layout
 
@@ -73,7 +74,7 @@ internal/ratelimiter/  the three algorithms + the Store abstraction they share
 internal/proxy/        the reverse-proxy router (path prefix / hostname matching), backend timeout + retry/backoff, GET response caching, circuit breaker integration
 internal/cache/        the response cache: key derivation, Cache-Control handling, Store-backed get/set
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
-internal/middleware/   logging, CORS, API key auth, rate-limit middleware
+internal/middleware/   logging, CORS, API key + JWT auth, rate-limit middleware
 internal/metrics/      Prometheus collectors + /metrics handler
 configs/                example config.yaml
 scripts/loadtest/      goroutine-based load generator (see "Load testing" below)
@@ -193,6 +194,133 @@ Both fields are optional. Omitting `cache` entirely gives you caching enabled wi
 **Storage and graceful degradation.** Cached entries live in the same storage backend configured under `storage:` — the in-memory map, or Redis via the same `FallbackStore` the rate limiter uses. That means a Redis outage degrades caching exactly the way it degrades rate limiting: reads and writes fail open (skip the cache, go to the backend) rather than erroring or crashing the gateway, with a warning logged. A cache hit is served before the request ever reaches the proxy's retry transport, so it never triggers a backend retry and never costs an extra backend call.
 
 **Interaction with rate limiting:** caching sits behind the rate limiter in the middleware chain, so a cached response still consumes the client's rate-limit budget exactly like an uncached one — caching saves the backend a request, not the client their quota.
+
+## JWT authentication
+
+Besides API keys, Gatekeeper can authenticate requests with a JSON Web Token sent as `Authorization: Bearer <token>`. Which credential a route requires is set per route, so API key clients and JWT clients can share one gateway.
+
+### Auth modes
+
+Each route gets an `auth_mode`:
+
+| `auth_mode` | Accepts | On failure |
+|---|---|---|
+| `api_key` (default) | A valid key in `auth.header` (`X-API-Key` by default) | `401`, body `invalid or missing API key`, the same response as before JWT support existed |
+| `jwt` | A valid bearer token | `401` + `WWW-Authenticate: Bearer` challenge, body `unauthorized` |
+| `either` | A valid API key **or** a valid bearer token (the API key is checked first) | `401` + `WWW-Authenticate: Bearer` challenge, body `unauthorized` |
+
+A route without `auth_mode` uses `api_key`, so **existing configs keep working unchanged**. `auth.enabled` is still the master switch: when it's `false`, every route is open whatever its `auth_mode` says. Gatekeeper logs a warning at startup and on reload if any route asks for `jwt` or `either` while auth is off. On an `either` route you can leave `auth.api_keys` empty, and the route then accepts JWTs only.
+
+The auth middleware uses the same route matching as the proxy (host first, then longest path prefix), so a request is always authenticated under the rules of the route it's sent to. A request that matches no route is treated as `api_key` and then gets a `404` from the router.
+
+### Configuration
+
+```yaml
+auth:
+  enabled: true
+  header: "X-API-Key"
+  api_keys: ["demo-free-key", "demo-premium-key"]
+  jwt:
+    algorithm: HS256                 # HS256 or RS256; tokens using any other alg are rejected
+    secret_env: GATEKEEPER_JWT_SECRET  # HS256: env var holding the secret (or `secret:` inline)
+    # public_key_file: "keys/jwt-public.pem"   # RS256: PEM-encoded RSA public key
+    issuer: "https://auth.example.com" # optional: required `iss` value
+    audience: "gatekeeper"             # optional: required `aud` value
+    leeway: 30s                        # optional: clock skew allowed for exp/nbf
+    client_id_claim: sub               # claim that identifies the client (default: sub)
+    tier_claim: tier                   # optional: claim that picks the rate-limit tier
+
+routes:
+  - path_prefix: "/api/users"
+    target: "http://localhost:9001"      # no auth_mode: API key only, as before
+  - path_prefix: "/api/orders"
+    target: "http://localhost:9002"
+    auth_mode: either
+  - path_prefix: "/internal"
+    target: "http://localhost:9003"
+    auth_mode: jwt
+```
+
+| Field | Notes |
+|---|---|
+| `algorithm` | `HS256` (shared secret) or `RS256` (RSA public key). Only this algorithm is accepted, which blocks algorithm-confusion attacks: a token with `alg: none`, or an HS256 token signed with your RS256 public key as its HMAC secret, is rejected before any key is used. |
+| `secret` / `secret_env` | HS256 only. Set exactly one. Prefer `secret_env` so the secret never sits in the config file. The secret must be at least 32 bytes (RFC 7518's minimum for HS256). |
+| `public_key_file` | RS256 only. A PEM `PUBLIC KEY` or `RSA PUBLIC KEY` of at least 2048 bits. A relative path resolves against the gateway's working directory. The file is read at startup and on each `SIGHUP` reload, so a reload picks up a rotated key. A missing or invalid key fails startup, and fails a reload while the old config keeps serving. |
+| `issuer`, `audience` | When set, the token's `iss` must match, and one of its `aud` values must match. When unset, those claims aren't checked. |
+| `leeway` | Clock skew tolerated when checking `exp` and `nbf`. Default `0s`. |
+| `client_id_claim` | Default `sub`. Must be a non-empty string, or the token is rejected. |
+| `tier_claim` | Optional. See below. |
+
+Every token must have an `exp` claim, and tokens without one are rejected. A token with `nbf` in the future is rejected too. Gatekeeper never logs tokens or secrets: the request log records only method, path, status, duration and remote address, and config errors name the setting at fault but not its value.
+
+### Rate limiting and tiers from claims
+
+When a request authenticates with a JWT, the rate limiter identifies the client by the `client_id_claim` value instead of `rate_limit.scope`. The value is prefixed with `jwt:`, so a token with `sub: alice` gets its own `jwt:alice` bucket and appears as `client="jwt:alice"` in `/metrics`. The prefix means a token can never share, or drain, the bucket of an API key, IP or header value that happens to be the same string.
+
+If `tier_claim` is set, that claim's value picks the tier directly, so `"tier": "premium"` gets the `premium` limits from `rate_limit.tiers`. The client falls back to the `default` tier when the claim is missing, isn't a string, or names a tier that isn't configured. A token can't invent its own tier. The `rate_limit.clients` map only applies to API key, IP and header clients, not to JWT clients.
+
+Requests authenticated by API key, including API key requests on an `either` route, are rate-limited exactly as before.
+
+The response cache already includes the `Authorization` header in its key (see [Response caching](#response-caching)), so two JWT holders never get each other's cached responses.
+
+### Error responses
+
+A missing token gets a challenge without an error code, and a bad token gets `error="invalid_token"` (RFC 6750):
+
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer realm="gatekeeper", error="invalid_token"
+
+unauthorized
+```
+
+The body is the same whether the token was expired, badly signed, issued for another audience or malformed, so it gives an attacker nothing to probe with.
+
+### Trying it out
+
+Generate a test HS256 token with nothing but `openssl` (bash, Git Bash or WSL). The secret must match the gateway's:
+
+```bash
+export GATEKEEPER_JWT_SECRET='replace-me-with-a-random-secret-of-32-bytes-or-more'
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+header=$(printf '{"alg":"HS256","typ":"JWT"}' | b64url)
+payload=$(printf '{"sub":"alice","tier":"premium","aud":"gatekeeper","iss":"https://auth.example.com","exp":%d}' \
+  "$(( $(date +%s) + 3600 ))" | b64url)
+sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -hmac "$GATEKEEPER_JWT_SECRET" -binary | b64url)
+TOKEN="$header.$payload.$sig"
+```
+
+Start the gateway in the same shell, so it sees `GATEKEEPER_JWT_SECRET`, with a config like the one above. Then:
+
+```bash
+curl -i http://localhost:8080/api/orders/42 -H "Authorization: Bearer $TOKEN"
+```
+
+```
+HTTP/1.1 200 OK
+X-Ratelimit-Limit: 100
+X-Ratelimit-Remaining: 99
+```
+
+The `premium` limit applies because of the `tier` claim. The same route still takes an API key, because it's an `either` route:
+
+```bash
+curl -i http://localhost:8080/api/orders/42 -H "X-API-Key: demo-free-key"
+```
+
+For RS256, sign with a private key and give the gateway the matching public key:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt-private.pem
+openssl pkey -in jwt-private.pem -pubout -out jwt-public.pem   # -> auth.jwt.public_key_file
+
+header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign jwt-private.pem -binary | b64url)
+TOKEN="$header.$payload.$sig"
+```
+
+In production, tokens come from your identity provider. Keep only the public key on the gateway for RS256, and never commit HS256 secrets or private keys.
 
 ## Setup
 
@@ -361,6 +489,10 @@ gatekeeper_cache_hits_total{route="/api"} 76
 gatekeeper_cache_misses_total{route="/api"} 32
 gatekeeper_circuit_breaker_state{route="/api"} 0
 gatekeeper_circuit_breaker_rejections_total{route="/api"} 0
+gatekeeper_auth_requests_total{method="api_key",result="success"} 213
+gatekeeper_auth_requests_total{method="api_key",result="failure"} 4
+gatekeeper_auth_requests_total{method="jwt",result="success"} 57
+gatekeeper_auth_requests_total{method="jwt",result="failure"} 2
 ```
 
 `gatekeeper_proxy_retries_total` counts individual retry attempts against a backend (not the initial attempt), and `gatekeeper_proxy_request_outcomes_total` counts each proxied request exactly once — as `success` or `failure` — after all retries are done. Both are independent of `gatekeeper_requests_allowed_total`/`_rejected_total`, which reflect the rate limiter's decision on the original client request, not what happened while forwarding it.
@@ -368,6 +500,8 @@ gatekeeper_circuit_breaker_rejections_total{route="/api"} 0
 `gatekeeper_cache_hits_total`/`gatekeeper_cache_misses_total` count cache-eligible `GET` requests per route — a hit was served without touching the backend, a miss reached the backend and (usually) refreshed the cache. Neither counter moves for a route with caching disabled, a non-`GET` request, or a request sent with `X-Bypass-Cache`.
 
 `gatekeeper_circuit_breaker_state` reports each route's current breaker state as a number — `0` (closed), `1` (open), `2` (half-open) — so you can alert on a route sitting at `1` for longer than expected. `gatekeeper_circuit_breaker_rejections_total` counts requests that were failed fast because the breaker was open; these never reach the backend and are separate from `gatekeeper_proxy_request_outcomes_total`. Neither series appears for a route with circuit breaking disabled.
+
+`gatekeeper_auth_requests_total` counts every auth decision once, by `method` (`api_key` or `jwt`) and `result` (`success` or `failure`). A rejected request on an `either` route counts as a `jwt` failure if it carried a bearer token and as an `api_key` failure otherwise. Nothing is counted while `auth.enabled` is false. See [JWT authentication](#jwt-authentication).
 
 (`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
 
@@ -497,9 +631,9 @@ See the fully-commented [`configs/config.yaml`](configs/config.yaml) for every f
 server:      { listen_addr, read_timeout, write_timeout, idle_timeout }
 storage:     { backend: memory|redis, redis: { addr, password, db, dial_timeout } }
 rate_limit:  { algorithm, scope: api_key|ip|header, header_name, tiers: {...}, clients: {...} }
-auth:        { enabled, header, api_keys: [...] }
+auth:        { enabled, header, api_keys: [...], jwt: { algorithm: HS256|RS256, secret | secret_env, public_key_file, issuer, audience, leeway, client_id_claim, tier_claim } }
 cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow_credentials, max_age }
-routes:      [ { path_prefix | host, target, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen } } ]
+routes:      [ { path_prefix | host, target, auth_mode: api_key|jwt|either, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen } } ]
 metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
 ```

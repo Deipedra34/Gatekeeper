@@ -24,6 +24,13 @@ const apiKeyHeader = "X-API-Key"
 // cfg.Clients — unknown clients land in the "default" tier — and asks
 // that tier's Limiter whether the request should go through.
 //
+// A request that authenticated with a JWT is identified differently: by
+// the client id claim the auth middleware extracted (prefixed "jwt:" so
+// it can never share a bucket with an API key, IP, or header value that
+// happens to be the same string), with its tier taken from the tier
+// claim — or "default" if there's no tier claim or it names a tier that
+// isn't configured. Scope and cfg.Clients don't apply to JWT clients.
+//
 // If the limiter itself errors, say because the store is briefly
 // unreachable, the request is let through anyway and a warning gets
 // logged. A storage hiccup should degrade to "unlimited," not "gateway
@@ -33,6 +40,10 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			client := clientKey(cfg, r)
 			tier := clientTier(cfg, client)
+			if id, ok := IdentityFrom(r.Context()); ok && id.Method == config.AuthModeJWT {
+				client = "jwt:" + id.Client
+				tier = jwtTier(id.Tier, limiters)
+			}
 
 			limiter, ok := limiters[tier]
 			if !ok {
@@ -88,6 +99,16 @@ func clientIP(r *http.Request) string {
 func clientTier(cfg config.RateLimitConfig, client string) string {
 	if tier, ok := cfg.Clients[client]; ok {
 		return tier
+	}
+	return "default"
+}
+
+// jwtTier maps a tier claim value onto a configured tier, falling back to
+// "default" when the claim was absent or names a tier that doesn't exist
+// — a token can't invent its own tier.
+func jwtTier(claimed string, limiters map[string]ratelimiter.Limiter) string {
+	if _, ok := limiters[claimed]; ok {
+		return claimed
 	}
 	return "default"
 }

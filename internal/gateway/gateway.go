@@ -113,13 +113,30 @@ func (g *Gateway) build(cfg *config.Config) (http.Handler, error) {
 		return nil, err
 	}
 
+	auth, err := middleware.Auth(cfg.Auth, router.AuthModeFor, g.metrics)
+	if err != nil {
+		return nil, err
+	}
+	if !cfg.Auth.Enabled && routesAcceptJWT(cfg.Routes) {
+		g.logger.Printf("auth: auth.enabled is false, so routes with auth_mode jwt or either are NOT protected")
+	}
+
 	h := middleware.Chain(router,
 		middleware.RequestLogger(g.logger),
 		middleware.CORS(cfg.CORS),
-		middleware.APIKeyAuth(cfg.Auth),
+		auth,
 		middleware.RateLimit(cfg.RateLimit, limiters, g.metrics),
 	)
 	return h, nil
+}
+
+func routesAcceptJWT(routes []config.Route) bool {
+	for _, rt := range routes {
+		if mode := rt.EffectiveAuthMode(); mode == config.AuthModeJWT || mode == config.AuthModeEither {
+			return true
+		}
+	}
+	return false
 }
 
 // buildLimiters creates one Limiter per configured tier, all sharing st

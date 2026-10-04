@@ -99,11 +99,88 @@ type TierLimit struct {
 	Burst             int64   `yaml:"burst"`
 }
 
-// AuthConfig controls the API-key authentication middleware.
+// Auth modes a route can require, set via Route.AuthMode.
+const (
+	// AuthModeAPIKey requires a valid API key in AuthConfig.Header. It is
+	// the default, so configs written before JWT support existed keep
+	// behaving exactly as they did.
+	AuthModeAPIKey = "api_key"
+	// AuthModeJWT requires a valid JWT in "Authorization: Bearer <token>".
+	AuthModeJWT = "jwt"
+	// AuthModeEither accepts a valid API key or a valid JWT.
+	AuthModeEither = "either"
+)
+
+// AuthConfig controls the authentication middleware. Enabled is the
+// master switch: when it's false every request is let through regardless
+// of any route's auth_mode, exactly as before JWT support existed.
 type AuthConfig struct {
-	Enabled bool     `yaml:"enabled"`
-	Header  string   `yaml:"header"`
-	APIKeys []string `yaml:"api_keys"`
+	Enabled bool      `yaml:"enabled"`
+	Header  string    `yaml:"header"`
+	APIKeys []string  `yaml:"api_keys"`
+	JWT     JWTConfig `yaml:"jwt"`
+}
+
+// JWTConfig controls validation of bearer tokens on routes whose
+// auth_mode is "jwt" or "either". It's unused (and may be left out of
+// the config entirely) when no route uses either mode.
+type JWTConfig struct {
+	// Algorithm is the one signing algorithm tokens must use: "HS256"
+	// or "RS256". Tokens signed with anything else — including "none" —
+	// are rejected, which is what prevents algorithm-confusion attacks.
+	Algorithm string `yaml:"algorithm"`
+
+	// Secret is the HS256 shared secret. SecretEnv names an environment
+	// variable to read it from instead, which keeps the secret out of
+	// the config file; set exactly one of the two. Must be at least 32
+	// bytes, the minimum RFC 7518 allows for HS256.
+	Secret    string `yaml:"secret"`
+	SecretEnv string `yaml:"secret_env"`
+
+	// PublicKeyFile is the path to a PEM-encoded RSA public key used to
+	// verify RS256 signatures.
+	PublicKeyFile string `yaml:"public_key_file"`
+
+	// Issuer and Audience, when set, must match the token's iss claim
+	// and one of its aud values respectively. Left empty, those claims
+	// aren't checked.
+	Issuer   string `yaml:"issuer"`
+	Audience string `yaml:"audience"`
+
+	// Leeway is the clock skew tolerated when checking exp and nbf.
+	Leeway Duration `yaml:"leeway"`
+
+	// ClientIDClaim names the claim whose value identifies the client for
+	// rate limiting. Defaults to "sub". A token missing it is rejected.
+	ClientIDClaim string `yaml:"client_id_claim"`
+
+	// TierClaim, when set, names a claim whose value picks the client's
+	// rate-limit tier (e.g. "free" or "premium"). A token without that
+	// claim, or naming a tier that isn't configured, gets the "default"
+	// tier.
+	TierClaim string `yaml:"tier_claim"`
+}
+
+// HMACSecret returns the HS256 secret, read from SecretEnv if that's set
+// and from Secret otherwise. Errors never include the secret itself.
+func (j JWTConfig) HMACSecret() ([]byte, error) {
+	if j.Secret != "" && j.SecretEnv != "" {
+		return nil, fmt.Errorf("auth.jwt: set only one of secret and secret_env")
+	}
+	secret := j.Secret
+	if j.SecretEnv != "" {
+		secret = os.Getenv(j.SecretEnv)
+		if secret == "" {
+			return nil, fmt.Errorf("auth.jwt: environment variable %s named by secret_env is empty or unset", j.SecretEnv)
+		}
+	}
+	if secret == "" {
+		return nil, fmt.Errorf("auth.jwt: secret or secret_env is required for HS256")
+	}
+	if len(secret) < 32 {
+		return nil, fmt.Errorf("auth.jwt: HS256 secret must be at least 32 bytes")
+	}
+	return []byte(secret), nil
 }
 
 // CORSConfig controls the CORS middleware.
@@ -124,6 +201,20 @@ type Route struct {
 	Target         string              `yaml:"target"`
 	Cache          RouteCache          `yaml:"cache"`
 	CircuitBreaker RouteCircuitBreaker `yaml:"circuit_breaker"`
+
+	// AuthMode is the credential this route requires when auth is
+	// enabled: "api_key" (the default), "jwt", or "either".
+	AuthMode string `yaml:"auth_mode"`
+}
+
+// EffectiveAuthMode returns the route's auth mode, applying the
+// "api_key by default" rule for a route built without going through
+// Load/applyDefaults (e.g. constructed directly in tests).
+func (r Route) EffectiveAuthMode() string {
+	if r.AuthMode == "" {
+		return AuthModeAPIKey
+	}
+	return r.AuthMode
 }
 
 // RouteCache controls response caching of GET requests for one route.
@@ -283,6 +374,9 @@ func (c *Config) applyDefaults() {
 	if c.Auth.Header == "" {
 		c.Auth.Header = "X-API-Key"
 	}
+	if c.Auth.JWT.ClientIDClaim == "" {
+		c.Auth.JWT.ClientIDClaim = "sub"
+	}
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -302,6 +396,9 @@ func (c *Config) applyDefaults() {
 	}
 
 	for i := range c.Routes {
+		if c.Routes[i].AuthMode == "" {
+			c.Routes[i].AuthMode = AuthModeAPIKey
+		}
 		if c.Routes[i].Cache.Enabled == nil {
 			enabled := true
 			c.Routes[i].Cache.Enabled = &enabled
@@ -399,8 +496,25 @@ func (c *Config) validate() error {
 		}
 	}
 
-	if c.Auth.Enabled && len(c.Auth.APIKeys) == 0 {
+	usesAPIKey, usesJWT := false, false
+	for i, r := range c.Routes {
+		switch r.EffectiveAuthMode() {
+		case AuthModeAPIKey:
+			usesAPIKey = true
+		case AuthModeJWT, AuthModeEither:
+			usesJWT = true
+		default:
+			return fmt.Errorf("routes[%d]: auth_mode must be one of api_key, jwt, either, got %q", i, r.AuthMode)
+		}
+	}
+
+	// An "either" route with no API keys configured simply behaves like a
+	// "jwt" route, so keys are only mandatory for pure api_key routes.
+	if c.Auth.Enabled && usesAPIKey && len(c.Auth.APIKeys) == 0 {
 		return fmt.Errorf("auth.enabled is true but auth.api_keys is empty")
+	}
+	if err := c.Auth.JWT.validate(c.Auth.Enabled && usesJWT); err != nil {
+		return err
 	}
 
 	if c.Proxy.Timeout.Duration <= 0 {
@@ -416,5 +530,42 @@ func (c *Config) validate() error {
 		return fmt.Errorf("proxy.retry.max_backoff must be >= proxy.retry.base_backoff")
 	}
 
+	return nil
+}
+
+// validate checks the JWT settings. required is true when auth is on and
+// at least one route accepts JWTs; a jwt block that's present but unused
+// is still checked, so a typo surfaces at startup rather than the day a
+// route starts relying on it.
+func (j JWTConfig) validate(required bool) error {
+	if j.Algorithm == "" {
+		if required {
+			return fmt.Errorf("auth.jwt.algorithm is required when a route uses auth_mode jwt or either")
+		}
+		return nil
+	}
+
+	switch j.Algorithm {
+	case "HS256":
+		if j.PublicKeyFile != "" {
+			return fmt.Errorf("auth.jwt.public_key_file is only used with RS256")
+		}
+		if _, err := j.HMACSecret(); err != nil {
+			return err
+		}
+	case "RS256":
+		if j.PublicKeyFile == "" {
+			return fmt.Errorf("auth.jwt.public_key_file is required for RS256")
+		}
+		if j.Secret != "" || j.SecretEnv != "" {
+			return fmt.Errorf("auth.jwt.secret and secret_env are only used with HS256")
+		}
+	default:
+		return fmt.Errorf("auth.jwt.algorithm must be HS256 or RS256, got %q", j.Algorithm)
+	}
+
+	if j.Leeway.Duration < 0 {
+		return fmt.Errorf("auth.jwt.leeway must be >= 0")
+	}
 	return nil
 }

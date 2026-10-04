@@ -59,12 +59,38 @@ rate_limit:
     "demo-free-key": free
     "demo-premium-key": premium
 
+# Authentication. `enabled` is the master switch: when false, every
+# route is open regardless of its auth_mode (see `routes` below).
 auth:
   enabled: true
   header: "X-API-Key"
   api_keys:
     - "demo-free-key"
     - "demo-premium-key"
+
+  # JWT validation for routes with auth_mode "jwt" or "either". Only
+  # needed if some route uses one of those modes. See README.md's "JWT
+  # authentication" section.
+  #
+  # jwt:
+  #   # HS256 (shared secret) or RS256 (RSA public key). Tokens signed
+  #   # with any other algorithm, including "none", are rejected.
+  #   algorithm: HS256
+  #   # HS256: name of an env var holding the secret (>= 32 bytes), or
+  #   # use `secret:` to put it inline. Set exactly one of the two.
+  #   secret_env: GATEKEEPER_JWT_SECRET
+  #   # RS256: PEM-encoded RSA public key (>= 2048 bits).
+  #   # public_key_file: "keys/jwt-public.pem"
+  #   # Optional: required iss / aud values. Unset = not checked.
+  #   issuer: "https://auth.example.com"
+  #   audience: "gatekeeper"
+  #   # Clock skew allowed when checking exp / nbf (default: 0s).
+  #   leeway: 30s
+  #   # Claim identifying the client for rate limiting (default: sub).
+  #   client_id_claim: sub
+  #   # Optional claim naming the rate-limit tier (e.g. "premium").
+  #   # Missing or unknown tier -> "default".
+  #   tier_claim: tier
 
 cors:
   enabled: true
@@ -109,6 +135,12 @@ cors:
 # An Open circuit fails every request immediately with 503, without
 # ever contacting the backend or consuming a retry attempt. See
 # README.md's "Circuit breaker" section.
+#
+# Each route also picks which credential it requires (when auth is on):
+#   auth_mode: api_key  - an API key in auth.header (the default).
+#   auth_mode: jwt      - a JWT in "Authorization: Bearer <token>";
+#                          requires the auth.jwt block above.
+#   auth_mode: either   - a valid API key or a valid JWT.
 routes:
   - path_prefix: "/api/users"
     target: "http://localhost:9001"
