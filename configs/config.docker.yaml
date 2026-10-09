@@ -60,6 +60,13 @@ cors:
 # Everything proxies to the mock-backend service, reachable by its
 # compose service name on the port it listens on (see mockbackend/).
 routes:
+  # WebSocket echo endpoint on the mock backend (/ws/echo). Try it with
+  # `websocat -H "X-API-Key: demo-free-key" ws://localhost:8080/ws/echo`.
+  - path_prefix: "/ws"
+    target: "http://mock-backend:9000"
+    ws_idle_timeout: 5m
+    ws_max_connections: 1000
+    ws_max_connections_per_client: 10
   - path_prefix: "/api/users"
     target: "http://mock-backend:9000"
   - path_prefix: "/api/orders"

@@ -7,6 +7,7 @@ import (
 
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
+	"gatekeeper/internal/websocket"
 )
 
 // APIKeyAuth rejects requests that don't present a valid API key in
@@ -70,7 +71,9 @@ func withIdentity(r *http.Request, id Identity) *http.Request {
 // generic body and a WWW-Authenticate: Bearer challenge.
 //
 // m, if non-nil, receives one success or failure count per request; see
-// metrics.Metrics.AuthRequests for how failures are attributed.
+// metrics.Metrics.AuthRequests for how failures are attributed. A
+// rejected WebSocket handshake is additionally counted as a handshake
+// rejection with reason "auth".
 func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.Metrics) (Middleware, error) {
 	valid := keySet(cfg.APIKeys)
 
@@ -122,6 +125,7 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 				id, presented, ok := tryJWT(r)
 				if !ok {
 					record(config.AuthModeJWT, false)
+					websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
 					writeBearerChallenge(w, presented)
 					return
 				}
@@ -145,11 +149,13 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 				} else {
 					record(config.AuthModeAPIKey, false)
 				}
+				websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
 				writeBearerChallenge(w, presented)
 
 			default: // config.AuthModeAPIKey
 				if !validAPIKey(valid, r.Header.Get(cfg.Header)) {
 					record(config.AuthModeAPIKey, false)
+					websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
 					http.Error(w, "invalid or missing API key", http.StatusUnauthorized)
 					return
 				}

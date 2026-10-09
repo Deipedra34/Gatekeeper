@@ -141,7 +141,32 @@ cors:
 #   auth_mode: jwt      - a JWT in "Authorization: Bearer <token>";
 #                          requires the auth.jwt block above.
 #   auth_mode: either   - a valid API key or a valid JWT.
+#
+# WebSocket upgrade requests (Upgrade: websocket) are proxied on every
+# route by default, after passing CORS, auth, and the rate limiter (one
+# token per connection attempt; frames are never rate limited):
+#   websocket                      - defaults to true; set false to refuse
+#                                    upgrades on this route with 403.
+#   ws_idle_timeout                - close a connection after this long
+#                                    with no frames in either direction
+#                                    (default: 5m).
+#   ws_max_connections             - max concurrent connections on this
+#                                    route; extras get 503 (default: 0,
+#                                    unlimited).
+#   ws_max_connections_per_client  - max concurrent connections per client
+#                                    (identified like the rate limiter
+#                                    does); extras get 429 (default: 0,
+#                                    unlimited).
+#   ws_allowed_origins             - if set, upgrades whose Origin header
+#                                    isn't listed get 403 ("*" = any).
+# See README.md's "WebSocket proxying" section.
 routes:
+  - path_prefix: "/ws"
+    target: "http://localhost:9000"
+    ws_idle_timeout: 5m
+    ws_max_connections: 1000
+    ws_max_connections_per_client: 10
+    # ws_allowed_origins: ["https://app.example.com"]
   - path_prefix: "/api/users"
     target: "http://localhost:9001"
     cache:

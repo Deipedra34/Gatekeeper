@@ -1,7 +1,8 @@
 // Package metrics exposes Gatekeeper's Prometheus-compatible admin
 // endpoint: counts of allowed/rejected requests per client and tier,
 // the rate limiter's current remaining allowance per client, request
-// latency, and authentication successes/failures by method.
+// latency, authentication successes/failures by method, and WebSocket
+// connection activity per route.
 package metrics
 
 import (
@@ -62,6 +63,29 @@ type Metrics struct {
 	// bearer token and to "api_key" otherwise, except on a jwt-only route,
 	// where it's always "jwt".
 	AuthRequests *prometheus.CounterVec
+
+	// WebSocketActive is the number of currently open proxied WebSocket
+	// connections, by route.
+	WebSocketActive *prometheus.GaugeVec
+
+	// WebSocketOpened and WebSocketClosed count proxied WebSocket
+	// connections that completed the upgrade handshake, and those that
+	// have since closed, by route. WebSocketClosed is further split by
+	// reason: "client" or "backend" (that side closed or disconnected),
+	// "idle_timeout", or "shutdown".
+	WebSocketOpened *prometheus.CounterVec
+	WebSocketClosed *prometheus.CounterVec
+
+	// WebSocketRejections counts upgrade requests refused before a
+	// connection was established, by route and reason: "auth",
+	// "rate_limit", "origin", "max_connections", "disabled",
+	// "circuit_open", "shutting_down", or "backend" (the backend was
+	// unreachable or answered something other than 101).
+	WebSocketRejections *prometheus.CounterVec
+
+	// WebSocketDuration is how long each proxied WebSocket connection
+	// stayed open, from the 101 response to teardown, by route.
+	WebSocketDuration *prometheus.HistogramVec
 }
 
 // New creates and registers all of Gatekeeper's collectors.
@@ -115,6 +139,27 @@ func New() *Metrics {
 			Name: "gatekeeper_auth_requests_total",
 			Help: "Total number of authentication decisions, by method (api_key or jwt) and result (success or failure).",
 		}, []string{"method", "result"}),
+		WebSocketActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gatekeeper_websocket_active_connections",
+			Help: "Number of currently open proxied WebSocket connections, by route.",
+		}, []string{"route"}),
+		WebSocketOpened: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_websocket_connections_opened_total",
+			Help: "Total number of WebSocket connections that completed the upgrade handshake, by route.",
+		}, []string{"route"}),
+		WebSocketClosed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_websocket_connections_closed_total",
+			Help: "Total number of proxied WebSocket connections that have closed, by route and reason (client, backend, idle_timeout, shutdown).",
+		}, []string{"route", "reason"}),
+		WebSocketRejections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_websocket_handshake_rejections_total",
+			Help: "Total number of WebSocket upgrade requests refused before a connection was established, by route and reason.",
+		}, []string{"route", "reason"}),
+		WebSocketDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gatekeeper_websocket_connection_duration_seconds",
+			Help:    "How long proxied WebSocket connections stayed open, by route.",
+			Buckets: []float64{0.1, 1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200, 14400},
+		}, []string{"route"}),
 	}
 
 	registry.MustRegister(
@@ -129,6 +174,11 @@ func New() *Metrics {
 		m.CircuitBreakerState,
 		m.CircuitBreakerRejections,
 		m.AuthRequests,
+		m.WebSocketActive,
+		m.WebSocketOpened,
+		m.WebSocketClosed,
+		m.WebSocketRejections,
+		m.WebSocketDuration,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)

@@ -22,6 +22,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **A Prometheus-compatible `/metrics` endpoint.** Requests allowed/rejected per client and tier, current limiter state, request latency histograms, cache hits/misses per route, circuit breaker state and rejections per route, auth successes/failures by method.
 - **Response caching for GET requests.** Backend responses are cached per route in the same storage backend the rate limiter uses (memory or Redis), with a configurable TTL, an opt-out per route, and a header to bypass the cache for debugging.
 - **A circuit breaker around every backend call.** Closed / Open / Half-Open, configurable per route, so a struggling backend gets a break from traffic instead of every request queuing up behind retries and timeouts.
+- **WebSocket proxying.** `Upgrade: websocket` requests are routed like any other request and pass through CORS, auth, and the rate limiter (one token per connection attempt). After that, frames are relayed transparently in both directions. Per-route idle timeouts, connection caps per route and per client, `Origin` allow-lists, metrics, and graceful close on shutdown are all included.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
@@ -74,10 +75,13 @@ internal/ratelimiter/  the three algorithms + the Store abstraction they share
 internal/proxy/        the reverse-proxy router (path prefix / hostname matching), backend timeout + retry/backoff, GET response caching, circuit breaker integration
 internal/cache/        the response cache: key derivation, Cache-Control handling, Store-backed get/set
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
+internal/websocket/    WebSocket upgrade detection, the frame relay, and the hub tracking open connections (limits, idle timeout, shutdown)
+  └─ wstest/           a minimal WebSocket client/server used by tests and scripts/wsclient
 internal/middleware/   logging, CORS, API key + JWT auth, rate-limit middleware
 internal/metrics/      Prometheus collectors + /metrics handler
 configs/                example config.yaml
 scripts/loadtest/      goroutine-based load generator (see "Load testing" below)
+scripts/wsclient/      tiny WebSocket client for trying out WebSocket proxying
 ```
 
 ## Rate-limiting algorithms: trade-offs
@@ -194,6 +198,99 @@ Both fields are optional. Omitting `cache` entirely gives you caching enabled wi
 **Storage and graceful degradation.** Cached entries live in the same storage backend configured under `storage:` — the in-memory map, or Redis via the same `FallbackStore` the rate limiter uses. That means a Redis outage degrades caching exactly the way it degrades rate limiting: reads and writes fail open (skip the cache, go to the backend) rather than erroring or crashing the gateway, with a warning logged. A cache hit is served before the request ever reaches the proxy's retry transport, so it never triggers a backend retry and never costs an extra backend call.
 
 **Interaction with rate limiting:** caching sits behind the rate limiter in the middleware chain, so a cached response still consumes the client's rate-limit budget exactly like an uncached one — caching saves the backend a request, not the client their quota.
+
+## WebSocket proxying
+
+Every route proxies WebSocket connections as well as plain HTTP. A request carrying `Connection: Upgrade` and `Upgrade: websocket` is matched to a route with the same hostname / path-prefix rules as any other request, runs through the same middleware chain, and, once the backend accepts the upgrade, gets a two-way tunnel to that backend. Existing configs pick this up with no changes, because `websocket` defaults to `true`.
+
+**Request flow.**
+
+1. **The middleware chain runs first.** CORS, API key / JWT auth (per the route's `auth_mode`), and the rate limiter all see the upgrade request before anything is upgraded. A failed check answers with the usual `401` / `429`, and the backend is never contacted.
+2. **Route policy.** The router then checks `websocket`, `ws_allowed_origins`, `ws_max_connections`, and `ws_max_connections_per_client`, and the route's circuit breaker.
+3. **Backend handshake.** The handshake is forwarded to the backend unchanged (`Sec-WebSocket-*`, `Origin`, credentials, and so on), with the incoming `Host` kept and the client's address appended to `X-Forwarded-For`, the same as for HTTP routes. If the backend answers `101 Switching Protocols`, the client gets that `101` with the backend's handshake headers, plus the `X-RateLimit-*` and CORS headers the chain added. If the backend answers anything else, that response is passed to the client as-is.
+4. **Relay.** Frames are relayed in both directions, byte for byte. Masking, extensions such as `permessage-deflate`, fragmentation, and ping/pong all pass through untouched. The relay reads frame boundaries but never changes frame contents. Knowing the boundaries lets the gateway send its own Close frame between frames when it needs to, without ever splitting a frame.
+
+**How it interacts with the rest of the gateway.**
+
+| Feature | Behaviour for WebSocket |
+|---|---|
+| Rate limiting | Each connection attempt (handshake) costs one token. Frames never touch the limiter, so a client can send as many messages as it likes over a connection it already has. |
+| `proxy.timeout` | Bounds the backend handshake only: dial, upgrade request, and `101` response. It never applies to an established connection. |
+| `server.read_timeout` / `write_timeout` | Cleared as soon as the connection is upgraded. A long-lived WebSocket is not killed by the server's HTTP timeouts. |
+| Retries | Never. An upgrade request is sent once. A failed handshake goes straight back to the client (`502` if the backend is unreachable, otherwise the backend's own response). |
+| Response caching | Never. Upgrade requests skip the cache entirely: no read, no write. |
+| Circuit breaker | Counts **handshakes** only. A dial failure, timeout, or `5xx` handshake response is a failure, and a `101` is a success. How long a connection then stays open, and how it ends, is never reported. An open circuit fails new handshakes fast with `503`. Connections that are already open are not affected. |
+| Config reload (`SIGHUP`) | Open connections keep running on the settings they were opened with, and still count toward their route's connection limits. New handshakes use the new config. |
+
+**Configuration.** Per route, in `configs/config.yaml`. Every field is optional:
+
+```yaml
+routes:
+  - path_prefix: "/ws"
+    target: "http://localhost:9000"     # http:// or ws:// (https:// or wss:// for TLS backends)
+    websocket: true                     # default: true. false = refuse upgrades with 403
+    ws_idle_timeout: 5m                 # default: 5m. Close after this long with no frames either way
+    ws_max_connections: 1000            # default: 0 (unlimited). Extras get 503
+    ws_max_connections_per_client: 10   # default: 0 (unlimited). Extras get 429
+    ws_allowed_origins:                 # default: [] (any origin). Others get 403
+      - "https://app.example.com"
+```
+
+- **`ws_idle_timeout`.** Any frame in either direction counts as activity, including pings and pongs. When a connection goes idle, the gateway sends both sides a Close frame (`1001`, `"idle timeout"`), waits briefly for the closing handshake, then drops the connection. Clients that need longer quiet periods should send pings.
+- **`ws_max_connections_per_client`** identifies clients the same way the rate limiter does: by the JWT client claim for JWT-authenticated requests, otherwise by `rate_limit.scope` (API key, IP, or header). Both limits count connections that are currently open, and a slot frees up as soon as a connection closes.
+- **`ws_allowed_origins`** is matched case-insensitively against the `Origin` header, and `"*"` allows any origin. A handshake *without* an `Origin` header is allowed: browsers always send one, so a missing `Origin` means a non-browser client, which could send any `Origin` value it wanted anyway. This check protects browser users against cross-site WebSocket hijacking. It is not a substitute for auth.
+
+**Handshake rejections.**
+
+| Status | Cause | `reason` label |
+|---|---|---|
+| `401` | Missing or invalid API key / JWT | `auth` |
+| `429` | Rate limit exceeded | `rate_limit` |
+| `403` | `Origin` not in `ws_allowed_origins` | `origin` |
+| `403` | `websocket: false` on the route | `disabled` |
+| `429` | Client already at `ws_max_connections_per_client` | `max_connections` |
+| `503` | Route already at `ws_max_connections` | `max_connections` |
+| `503` | Route's circuit breaker is open | `circuit_open` |
+| `503` | Gateway is shutting down | `shutting_down` |
+| `502` / backend's status | Backend unreachable, or it refused the upgrade | `backend` |
+
+**Closing.** When either side closes normally, the Close frames are relayed and the connection is torn down. When one side disappears *without* a closing handshake, the other side still gets a Close frame instead of a bare TCP reset. A client whose backend vanished gets `1014` (bad gateway). A backend whose client vanished gets `1001` (going away).
+
+**Graceful shutdown.** Once a connection is upgraded, `http.Server.Shutdown` no longer tracks it. On `SIGINT` / `SIGTERM`, Gatekeeper therefore also closes every WebSocket itself:
+
+1. New handshakes are refused with `503`.
+2. Every open connection gets a Close frame (`1001`, `"server shutting down"`) on both sides.
+3. Connections have until the end of the 10s shutdown window to finish the closing handshake. Anything still open after that is dropped.
+
+**Trying it out.** The mock backend in [`mockbackend/`](mockbackend/) serves a WebSocket echo endpoint at `/ws/echo`, and [`configs/config.docker.yaml`](configs/config.docker.yaml) routes `/ws` to it. Start the stack with `docker-compose up --build`, then use [`websocat`](https://github.com/vi/websocat):
+
+```bash
+websocat -H "X-API-Key: demo-free-key" ws://localhost:8080/ws/echo
+```
+
+Each line you type is echoed back through the gateway. Without the header, the handshake is refused:
+
+```bash
+websocat ws://localhost:8080/ws/echo
+# fails: the gateway answers the handshake with 401 Unauthorized
+```
+
+If you don't have `websocat`, the repo includes a small Go client, [`scripts/wsclient`](scripts/wsclient/main.go):
+
+```bash
+go run ./scripts/wsclient -url ws://localhost:8080/ws/echo -api-key demo-free-key -message hello -message world
+```
+
+```
+connected (101 Switching Protocols, X-RateLimit-Remaining: 9)
+< hello
+< world
+closed cleanly (1000)
+```
+
+You can do the same without Docker: run the mock backend with `cd mockbackend && go run .` (it listens on `:9000`), then run the gateway with the default `configs/config.yaml`, which also routes `/ws` to `localhost:9000`.
+
+> **Browser clients:** the browser `WebSocket` API can't set custom headers, so it can't send `X-API-Key` or `Authorization`. Browser apps on an authenticated route need to get their credential onto the handshake some other way, for example with a same-origin cookie checked by a JWT-issuing proxy in front of Gatekeeper. Alternatively, use a non-browser client.
 
 ## JWT authentication
 
@@ -362,7 +459,8 @@ kill -HUP <pid>
 On reload Gatekeeper re-parses and validates the file, builds a fresh
 routing table and set of per-tier limiters, and swaps them in atomically.
 A request in flight during the swap finishes on the config it started
-with; the next request uses the new one. Rate-limit counter state is kept
+with; the next request uses the new one. An open WebSocket connection
+keeps running on the route settings it was opened with. Rate-limit counter state is kept
 across the reload rather than reset.
 
 If the new config is missing, malformed, or fails validation, the reload
@@ -412,7 +510,7 @@ The image exposes port `8080`, matching the default `server.listen_addr` in [`co
 
 - **`gatekeeper`** — built from the [`Dockerfile`](Dockerfile), same as above.
 - **`redis`** (`redis:alpine`) — backs the rate limiter's shared counters.
-- **`mock-backend`** — a tiny standalone HTTP server in [`mockbackend/`](mockbackend/) that echoes back the request it received as JSON, standing in for a real upstream so requests have somewhere to be proxied to.
+- **`mock-backend`** — a tiny standalone HTTP server in [`mockbackend/`](mockbackend/) that echoes back the request it received as JSON, standing in for a real upstream so requests have somewhere to be proxied to. It also serves a WebSocket echo endpoint at `/ws/echo` (see [WebSocket proxying](#websocket-proxying)).
 
 Gatekeeper runs against [`configs/config.docker.yaml`](configs/config.docker.yaml) inside the stack (mounted over the image's baked-in config), not `configs/config.yaml`. It's identical except `storage.redis.addr` points at `redis:6379` and every route's `target` points at `http://mock-backend:9000` — both reached by their compose service name rather than `localhost`, since each service is its own container on the compose network.
 
@@ -493,6 +591,13 @@ gatekeeper_auth_requests_total{method="api_key",result="success"} 213
 gatekeeper_auth_requests_total{method="api_key",result="failure"} 4
 gatekeeper_auth_requests_total{method="jwt",result="success"} 57
 gatekeeper_auth_requests_total{method="jwt",result="failure"} 2
+gatekeeper_websocket_active_connections{route="/ws"} 12
+gatekeeper_websocket_connections_opened_total{route="/ws"} 40
+gatekeeper_websocket_connections_closed_total{route="/ws",reason="client"} 25
+gatekeeper_websocket_connections_closed_total{route="/ws",reason="idle_timeout"} 3
+gatekeeper_websocket_handshake_rejections_total{route="/ws",reason="auth"} 2
+gatekeeper_websocket_handshake_rejections_total{route="/ws",reason="max_connections"} 1
+gatekeeper_websocket_connection_duration_seconds_count{route="/ws"} 28
 ```
 
 `gatekeeper_proxy_retries_total` counts individual retry attempts against a backend (not the initial attempt), and `gatekeeper_proxy_request_outcomes_total` counts each proxied request exactly once — as `success` or `failure` — after all retries are done. Both are independent of `gatekeeper_requests_allowed_total`/`_rejected_total`, which reflect the rate limiter's decision on the original client request, not what happened while forwarding it.
@@ -502,6 +607,8 @@ gatekeeper_auth_requests_total{method="jwt",result="failure"} 2
 `gatekeeper_circuit_breaker_state` reports each route's current breaker state as a number — `0` (closed), `1` (open), `2` (half-open) — so you can alert on a route sitting at `1` for longer than expected. `gatekeeper_circuit_breaker_rejections_total` counts requests that were failed fast because the breaker was open; these never reach the backend and are separate from `gatekeeper_proxy_request_outcomes_total`. Neither series appears for a route with circuit breaking disabled.
 
 `gatekeeper_auth_requests_total` counts every auth decision once, by `method` (`api_key` or `jwt`) and `result` (`success` or `failure`). A rejected request on an `either` route counts as a `jwt` failure if it carried a bearer token and as an `api_key` failure otherwise. Nothing is counted while `auth.enabled` is false. See [JWT authentication](#jwt-authentication).
+
+`gatekeeper_websocket_active_connections` is the number of WebSocket connections open right now on each route. `gatekeeper_websocket_connections_opened_total` counts connections that completed the upgrade. `gatekeeper_websocket_connections_closed_total` counts connections that have ended, split by `reason`: `client` or `backend` (that side closed or disconnected), `idle_timeout`, or `shutdown`. `gatekeeper_websocket_handshake_rejections_total` counts upgrade requests refused before a connection was established, by `reason` (`auth`, `rate_limit`, `origin`, `max_connections`, `disabled`, `circuit_open`, `shutting_down`, `backend`). See the rejection table in [WebSocket proxying](#websocket-proxying). `gatekeeper_websocket_connection_duration_seconds` is a histogram of how long connections stayed open, with buckets from 100ms to 4h. A handshake's backend outcome is also counted once in `gatekeeper_proxy_request_outcomes_total`.
 
 (`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
 
@@ -541,6 +648,7 @@ What's covered:
 - Backend timeout/retry: a request that succeeds on the first try, one that fails once then succeeds on retry, one that exhausts all retries and fails, a connection-refused backend being retried, and confirming a `4xx` response is never retried — including that retries never inflate the request's rate-limit cost.
 - Response caching (`internal/cache` and `internal/proxy/cache_test.go`): a miss followed by a hit for the same request, TTL expiration forcing a fresh backend call, a `Cache-Control: no-store` response never being cached, `X-Bypass-Cache` skipping the cache without disturbing the existing entry, a route with caching disabled always reaching the backend, and caching degrading gracefully (fail open, no crash) when its store errors on every call — simulating Redis being down.
 - Circuit breaker (`internal/circuitbreaker` and `internal/proxy/circuitbreaker_test.go`): tripping to Open after `failure_threshold` consecutive failures, requests failing fast (and never reaching the backend) while Open, transitioning to Half-Open once the cooldown elapses, a successful trial closing the breaker, a failed trial re-opening it, Half-Open's concurrent-trial limit, and confirming a request never retries into an already-open circuit.
+- WebSocket proxying (`internal/proxy/websocket_test.go`, `internal/gateway/websocket_test.go`, `internal/websocket`): messages relayed in both directions, including large frames, with handshake headers passed through. The handshake is blocked by a missing or invalid API key or JWT and rate limited per attempt, while frames are not limited. Also covered: origin rejection, per-route and per-client connection caps, the idle timeout closing a quiet connection, a backend or client disconnect closing the other side with a Close frame, upgrades never being retried or cached, connections outliving `proxy.timeout` and the server's read/write timeouts, the circuit breaker counting failed handshakes but not long-lived connections, graceful shutdown (including forced close at the deadline), connections surviving a config reload, and plain HTTP on a WebSocket-enabled route behaving exactly as before.
 - A full end-to-end test (`TestGateway_EndToEnd`) that wires config → storage → limiters → the whole middleware chain → the proxy, then drives it through auth, CORS, per-tier rate limiting, and routing together, not in isolation.
 
 ## Load testing
@@ -633,7 +741,7 @@ storage:     { backend: memory|redis, redis: { addr, password, db, dial_timeout 
 rate_limit:  { algorithm, scope: api_key|ip|header, header_name, tiers: {...}, clients: {...} }
 auth:        { enabled, header, api_keys: [...], jwt: { algorithm: HS256|RS256, secret | secret_env, public_key_file, issuer, audience, leeway, client_id_claim, tier_claim } }
 cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow_credentials, max_age }
-routes:      [ { path_prefix | host, target, auth_mode: api_key|jwt|either, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen } } ]
+routes:      [ { path_prefix | host, target, auth_mode: api_key|jwt|either, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen }, websocket, ws_idle_timeout, ws_max_connections, ws_max_connections_per_client, ws_allowed_origins: [...] } ]
 metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
 ```

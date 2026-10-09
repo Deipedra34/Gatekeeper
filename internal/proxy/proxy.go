@@ -1,6 +1,8 @@
 // Package proxy implements Gatekeeper's reverse-proxy core: routing
 // incoming requests to configured backend services by path prefix or
-// hostname and forwarding them with net/http/httputil.ReverseProxy.
+// hostname and forwarding them with net/http/httputil.ReverseProxy, or —
+// for WebSocket upgrade requests — through a frame relay (see
+// websocket.go).
 package proxy
 
 import (
@@ -20,6 +22,7 @@ import (
 	"gatekeeper/internal/circuitbreaker"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
+	"gatekeeper/internal/websocket"
 )
 
 // route is a config.Route compiled into a ready-to-use reverse proxy.
@@ -34,6 +37,17 @@ type route struct {
 	cacheTTL     time.Duration
 
 	authMode string
+
+	// breaker is shared by the HTTP retry transport and the WebSocket
+	// handshake path; nil when circuit breaking is disabled.
+	breaker *circuitbreaker.CircuitBreaker
+
+	// handshakeTimeout bounds the WebSocket handshake with the backend
+	// (dial + upgrade request + 101 response): proxy.timeout, applied
+	// once, since an upgrade is never retried.
+	handshakeTimeout time.Duration
+
+	ws wsSettings
 }
 
 // Router dispatches requests to the backend whose route matches, based
@@ -42,6 +56,18 @@ type Router struct {
 	routes  []route
 	cache   *cache.Cache
 	metrics *metrics.Metrics
+	hub     *websocket.Hub
+}
+
+// Option customises a Router built by NewRouter.
+type Option func(*Router)
+
+// WithWebSocketHub makes the router track its WebSocket connections in
+// hub instead of a private one. The gateway passes one long-lived hub to
+// every router it builds, so connection limits and graceful shutdown
+// span config reloads.
+func WithWebSocketHub(hub *websocket.Hub) Option {
+	return func(r *Router) { r.hub = hub }
 }
 
 // NewRouter compiles cfg's routes into a Router. It fails fast on a
@@ -57,27 +83,40 @@ type Router struct {
 // config enables it (see config.RouteCache); a nil respCache disables
 // caching entirely regardless of per-route config, which is what tests
 // that don't care about caching should pass.
-func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Metrics, respCache *cache.Cache) (*Router, error) {
+//
+// WebSocket upgrade requests are proxied too (see websocket.go); without
+// WithWebSocketHub, the router tracks them in a hub of its own.
+func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Metrics, respCache *cache.Cache, opts ...Option) (*Router, error) {
 	r := &Router{cache: respCache, metrics: m}
+	for _, opt := range opts {
+		opt(r)
+	}
+	if r.hub == nil {
+		r.hub = websocket.NewHub(m)
+	}
 	for _, rt := range routes {
 		target, err := url.Parse(rt.Target)
 		if err != nil {
 			return nil, fmt.Errorf("proxy: invalid target %q: %w", rt.Target, err)
 		}
 
+		breaker := newBreaker(rt, m)
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.ErrorHandler = errorHandler(rt.Target)
-		proxy.Transport = newRetryTransport(proxyCfg, m, routeLabel(rt), newBreaker(rt, m))
+		proxy.Transport = newRetryTransport(proxyCfg, m, routeLabel(rt), breaker)
 
 		r.routes = append(r.routes, route{
-			pathPrefix:   rt.PathPrefix,
-			host:         rt.Host,
-			target:       target,
-			proxy:        proxy,
-			label:        routeLabel(rt),
-			cacheEnabled: rt.Cache.IsEnabled(),
-			cacheTTL:     rt.Cache.TTL.Duration,
-			authMode:     rt.EffectiveAuthMode(),
+			pathPrefix:       rt.PathPrefix,
+			host:             rt.Host,
+			target:           target,
+			proxy:            proxy,
+			label:            routeLabel(rt),
+			cacheEnabled:     rt.Cache.IsEnabled(),
+			cacheTTL:         rt.Cache.TTL.Duration,
+			authMode:         rt.EffectiveAuthMode(),
+			breaker:          breaker,
+			handshakeTimeout: proxyCfg.Timeout.Duration,
+			ws:               newWSSettings(rt),
 		})
 	}
 	return r, nil
@@ -121,6 +160,13 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Checked before caching and before the retry transport: an upgrade
+	// is never served from (or stored in) the cache and never retried.
+	if websocket.IsUpgrade(req) {
+		r.serveWebSocket(w, req, rt)
+		return
+	}
+
 	if r.cacheableRequest(rt, req) {
 		r.serveWithCache(w, req, rt)
 		return
@@ -138,6 +184,16 @@ func (r *Router) AuthModeFor(req *http.Request) string {
 		return rt.authMode
 	}
 	return config.AuthModeAPIKey
+}
+
+// RouteLabelFor returns the metrics label of the route req will be
+// dispatched to, using the same matching rules as ServeHTTP. ok is false
+// if no route matches.
+func (r *Router) RouteLabelFor(req *http.Request) (label string, ok bool) {
+	if rt := r.match(req); rt != nil {
+		return rt.label, true
+	}
+	return "", false
 }
 
 // cacheableRequest reports whether req against rt should even consult

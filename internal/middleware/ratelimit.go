@@ -10,6 +10,7 @@ import (
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/ratelimiter"
+	"gatekeeper/internal/websocket"
 )
 
 // apiKeyHeader is the header checked when RateLimitConfig.Scope is
@@ -35,6 +36,12 @@ const apiKeyHeader = "X-API-Key"
 // unreachable, the request is let through anyway and a warning gets
 // logged. A storage hiccup should degrade to "unlimited," not "gateway
 // down."
+//
+// A WebSocket upgrade request costs exactly one token, like any other
+// request; frames exchanged once the connection is established never
+// pass through here. The client identity resolved for a handshake is
+// recorded on it (see websocket.Handshake) so per-client connection
+// limits key on the same identity.
 func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limiter, m *metrics.Metrics) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +55,9 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 			limiter, ok := limiters[tier]
 			if !ok {
 				limiter = limiters["default"]
+			}
+			if hs, ok := websocket.HandshakeFrom(r.Context()); ok {
+				hs.SetClient(client)
 			}
 
 			result, err := limiter.Allow(r.Context(), client)
@@ -64,6 +74,7 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 			if !result.Allowed {
 				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(result.RetryAfter.Seconds()))))
 				m.RequestsRejected.WithLabelValues(client, tier).Inc()
+				websocket.RecordRejectionFor(r, m, websocket.RejectRateLimit)
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}

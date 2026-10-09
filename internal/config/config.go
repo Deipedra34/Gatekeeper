@@ -205,6 +205,53 @@ type Route struct {
 	// AuthMode is the credential this route requires when auth is
 	// enabled: "api_key" (the default), "jwt", or "either".
 	AuthMode string `yaml:"auth_mode"`
+
+	// WebSocket toggles proxying of WebSocket upgrade requests on this
+	// route. Defaults to true when unset; set it to false to refuse
+	// upgrades with 403 while still proxying plain HTTP.
+	WebSocket *bool `yaml:"websocket"`
+
+	// WSIdleTimeout closes a proxied WebSocket connection once no frame
+	// has crossed it in either direction for this long. Defaults to
+	// DefaultWSIdleTimeout when unset.
+	WSIdleTimeout Duration `yaml:"ws_idle_timeout"`
+
+	// WSMaxConnections caps concurrent WebSocket connections on this
+	// route; extra upgrade requests get 503. 0 (the default) means no cap.
+	WSMaxConnections int `yaml:"ws_max_connections"`
+
+	// WSMaxConnectionsPerClient caps concurrent WebSocket connections on
+	// this route per client — identified the same way the rate limiter
+	// identifies clients. Extra upgrade requests get 429. 0 (the default)
+	// means no cap.
+	WSMaxConnectionsPerClient int `yaml:"ws_max_connections_per_client"`
+
+	// WSAllowedOrigins, when non-empty, restricts which Origin header
+	// values may open a WebSocket on this route; others get 403. "*"
+	// allows any origin. A request without an Origin header (a non-browser
+	// client) is not affected.
+	WSAllowedOrigins []string `yaml:"ws_allowed_origins"`
+}
+
+// DefaultWSIdleTimeout is the WebSocket idle timeout applied to a route
+// that doesn't set ws_idle_timeout.
+const DefaultWSIdleTimeout = 5 * time.Minute
+
+// WebSocketEnabled reports whether WebSocket upgrades are proxied on this
+// route, applying the "enabled by default" rule for a route built without
+// going through Load/applyDefaults (e.g. constructed directly in tests).
+func (r Route) WebSocketEnabled() bool {
+	return r.WebSocket == nil || *r.WebSocket
+}
+
+// EffectiveWSIdleTimeout returns the route's WebSocket idle timeout,
+// applying DefaultWSIdleTimeout for a route built without going through
+// Load/applyDefaults.
+func (r Route) EffectiveWSIdleTimeout() time.Duration {
+	if r.WSIdleTimeout.Duration <= 0 {
+		return DefaultWSIdleTimeout
+	}
+	return r.WSIdleTimeout.Duration
 }
 
 // EffectiveAuthMode returns the route's auth mode, applying the
@@ -406,6 +453,13 @@ func (c *Config) applyDefaults() {
 		if c.Routes[i].Cache.TTL.Duration == 0 {
 			c.Routes[i].Cache.TTL.Duration = 60 * time.Second
 		}
+		if c.Routes[i].WebSocket == nil {
+			enabled := true
+			c.Routes[i].WebSocket = &enabled
+		}
+		if c.Routes[i].WSIdleTimeout.Duration == 0 {
+			c.Routes[i].WSIdleTimeout.Duration = DefaultWSIdleTimeout
+		}
 
 		cb := &c.Routes[i].CircuitBreaker
 		if cb.Enabled == nil {
@@ -476,6 +530,20 @@ func (c *Config) validate() error {
 		}
 		if r.Cache.TTL.Duration < 0 {
 			return fmt.Errorf("routes[%d]: cache.ttl must be >= 0", i)
+		}
+		if r.WSIdleTimeout.Duration < 0 {
+			return fmt.Errorf("routes[%d]: ws_idle_timeout must be >= 0", i)
+		}
+		if r.WSMaxConnections < 0 {
+			return fmt.Errorf("routes[%d]: ws_max_connections must be >= 0", i)
+		}
+		if r.WSMaxConnectionsPerClient < 0 {
+			return fmt.Errorf("routes[%d]: ws_max_connections_per_client must be >= 0", i)
+		}
+		for j, o := range r.WSAllowedOrigins {
+			if o == "" {
+				return fmt.Errorf("routes[%d]: ws_allowed_origins[%d] must not be empty", i, j)
+			}
 		}
 
 		cb := r.CircuitBreaker

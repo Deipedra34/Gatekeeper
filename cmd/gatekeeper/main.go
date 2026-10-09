@@ -8,6 +8,10 @@
 // settings into the running gateway without dropping in-flight requests.
 // An invalid new config is logged and ignored; the gateway keeps running
 // on the previous one.
+//
+// On SIGINT/SIGTERM the server stops accepting connections, finishes
+// in-flight requests, and closes proxied WebSocket connections with a
+// Close frame, all within a 10s shutdown window.
 package main
 
 import (
@@ -101,8 +105,18 @@ func main() {
 	log.Println("gatekeeper: shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// Upgraded WebSocket connections are hijacked, so srv.Shutdown
+	// neither waits for nor closes them; the gateway does that itself,
+	// alongside draining ordinary requests.
+	wsDone := make(chan error, 1)
+	go func() { wsDone <- gw.ShutdownWebSockets(shutdownCtx) }()
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("gatekeeper: shutdown error: %v", err)
+	}
+	if err := <-wsDone; err != nil {
+		log.Printf("gatekeeper: websocket connections did not close in time and were dropped: %v", err)
 	}
 }
 

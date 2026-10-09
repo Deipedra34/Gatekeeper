@@ -441,3 +441,73 @@ routes:
 	_, err := Load(path)
 	assert.NoError(t, err, "auth.enabled is the master switch; with it off no JWT settings are needed")
 }
+
+func TestLoad_RouteWebSocketDefaults(t *testing.T) {
+	path := writeConfig(t, `
+routes:
+  - path_prefix: "/api"
+    target: "http://localhost:9000"
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	rt := cfg.Routes[0]
+	assert.True(t, rt.WebSocketEnabled(), "existing routes accept WebSocket upgrades without config changes")
+	assert.Equal(t, DefaultWSIdleTimeout, rt.WSIdleTimeout.Duration)
+	assert.Zero(t, rt.WSMaxConnections, "no route cap by default")
+	assert.Zero(t, rt.WSMaxConnectionsPerClient, "no per-client cap by default")
+	assert.Empty(t, rt.WSAllowedOrigins, "any origin by default")
+}
+
+func TestLoad_RouteWebSocketSettings(t *testing.T) {
+	path := writeConfig(t, `
+routes:
+  - path_prefix: "/ws"
+    target: "http://localhost:9000"
+    websocket: true
+    ws_idle_timeout: 90s
+    ws_max_connections: 500
+    ws_max_connections_per_client: 5
+    ws_allowed_origins: ["https://app.example.com"]
+  - path_prefix: "/api"
+    target: "http://localhost:9000"
+    websocket: false
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	ws := cfg.Routes[0]
+	assert.True(t, ws.WebSocketEnabled())
+	assert.Equal(t, 90*time.Second, ws.EffectiveWSIdleTimeout())
+	assert.Equal(t, 500, ws.WSMaxConnections)
+	assert.Equal(t, 5, ws.WSMaxConnectionsPerClient)
+	assert.Equal(t, []string{"https://app.example.com"}, ws.WSAllowedOrigins)
+	assert.False(t, cfg.Routes[1].WebSocketEnabled())
+}
+
+func TestLoad_RejectsInvalidWebSocketSettings(t *testing.T) {
+	for field, value := range map[string]string{
+		"ws_idle_timeout":               "-1s",
+		"ws_max_connections":            "-1",
+		"ws_max_connections_per_client": "-1",
+		"ws_allowed_origins":            `[""]`,
+	} {
+		t.Run(field, func(t *testing.T) {
+			path := writeConfig(t, fmt.Sprintf(`
+routes:
+  - path_prefix: "/ws"
+    target: "http://localhost:9000"
+    %s: %s
+`, field, value))
+			_, err := Load(path)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), field)
+		})
+	}
+}
+
+func TestRoute_WebSocketHelpersWithoutLoad(t *testing.T) {
+	var rt Route // built directly, as tests do, bypassing applyDefaults
+	assert.True(t, rt.WebSocketEnabled())
+	assert.Equal(t, DefaultWSIdleTimeout, rt.EffectiveWSIdleTimeout())
+}

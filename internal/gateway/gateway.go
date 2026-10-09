@@ -7,6 +7,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"gatekeeper/internal/proxy"
 	"gatekeeper/internal/ratelimiter"
 	"gatekeeper/internal/ratelimiter/store"
+	"gatekeeper/internal/websocket"
 )
 
 // Gateway is an http.Handler whose behaviour is derived from a
@@ -33,6 +35,12 @@ type Gateway struct {
 	cache   *cache.Cache
 	metrics *metrics.Metrics
 	logger  *log.Logger
+
+	// wsHub tracks proxied WebSocket connections. Like the store, it
+	// outlives every reload: a connection opened under one config keeps
+	// counting toward its route's limits after the next, and Shutdown
+	// reaches it either way.
+	wsHub *websocket.Hub
 
 	configPath string
 
@@ -56,6 +64,7 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		metrics:    m,
 		logger:     logger,
 		configPath: configPath,
+		wsHub:      websocket.NewHub(m),
 	}
 	h, err := g.build(cfg)
 	if err != nil {
@@ -75,6 +84,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // returned value must not be mutated.
 func (g *Gateway) Config() *config.Config {
 	return g.current.Load()
+}
+
+// ShutdownWebSockets closes every proxied WebSocket connection
+// gracefully — a Close frame to both sides, then up to ctx's deadline for
+// the closing handshake — and refuses new ones from then on.
+// http.Server.Shutdown doesn't cover these: once upgraded, a connection
+// is hijacked and no longer tracked by the server. Connections still open
+// when ctx is done are dropped, and ctx's error is returned.
+func (g *Gateway) ShutdownWebSockets(ctx context.Context) error {
+	return g.wsHub.Shutdown(ctx)
 }
 
 // Reload re-reads and validates the config file the gateway was started
@@ -103,7 +122,7 @@ func (g *Gateway) Reload() error {
 // touches nothing on g, so a failure part-way through leaves the active
 // pipeline untouched.
 func (g *Gateway) build(cfg *config.Config) (http.Handler, error) {
-	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache)
+	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache, proxy.WithWebSocketHub(g.wsHub))
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +142,7 @@ func (g *Gateway) build(cfg *config.Config) (http.Handler, error) {
 
 	h := middleware.Chain(router,
 		middleware.RequestLogger(g.logger),
+		middleware.WebSocketHandshake(router.RouteLabelFor),
 		middleware.CORS(cfg.CORS),
 		auth,
 		middleware.RateLimit(cfg.RateLimit, limiters, g.metrics),
