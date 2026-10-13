@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -510,4 +511,144 @@ func TestRoute_WebSocketHelpersWithoutLoad(t *testing.T) {
 	var rt Route // built directly, as tests do, bypassing applyDefaults
 	assert.True(t, rt.WebSocketEnabled())
 	assert.Equal(t, DefaultWSIdleTimeout, rt.EffectiveWSIdleTimeout())
+}
+
+func TestLoad_ShippedConfigsAreValid(t *testing.T) {
+	paths, err := filepath.Glob("../../configs/*.yaml")
+	require.NoError(t, err)
+	require.NotEmpty(t, paths)
+	for _, p := range paths {
+		t.Run(filepath.Base(p), func(t *testing.T) {
+			_, err := Load(p)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestLoad_TLSDisabledByDefault(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+`))
+	require.NoError(t, err)
+	assert.False(t, cfg.TLS.Enabled)
+	assert.Equal(t, ClientAuthNone, cfg.TLS.ClientAuth)
+	assert.Equal(t, "1.2", cfg.TLS.MinVersion)
+	assert.Equal(t, IdentityFieldCN, cfg.Auth.MTLS.IdentityField)
+	assert.False(t, cfg.Routes[0].BackendTLS.Enabled)
+}
+
+func TestLoad_TLSSettings(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+    premium: {requests_per_second: 10, burst: 10}
+auth:
+  enabled: true
+  mtls:
+    identity_field: san_dns
+    tiers:
+      premium: {ou: ["gold"], cn: ["acme"]}
+routes:
+  - path_prefix: "/"
+    target: "https://backend.internal:9443"
+    auth_mode: mtls
+    backend_tls:
+      enabled: true
+      ca_file: ca.pem
+      client_cert_file: c.pem
+      client_key_file: k.pem
+      server_name: backend.internal
+tls:
+  enabled: true
+  cert_file: server.pem
+  key_file: server-key.pem
+  min_version: "1.2"
+  cipher_suites: ["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"]
+  client_auth: require_and_verify
+  client_ca_file: ca.pem
+  redirect_http_port: 8081
+  hsts: {enabled: true, include_subdomains: true}
+`))
+	require.NoError(t, err)
+	assert.Equal(t, uint16(tls.VersionTLS12), cfg.TLS.MinTLSVersion())
+	ids, err := cfg.TLS.CipherSuiteIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}, ids)
+	assert.Equal(t, tls.RequireAndVerifyClientCert, cfg.TLS.ClientAuthType())
+	assert.True(t, cfg.TLS.VerifiesClientCerts())
+	assert.Equal(t, "max-age=31536000; includeSubDomains", cfg.TLS.HSTS.HeaderValue())
+	assert.Equal(t, 30*time.Second, cfg.TLS.ReloadInterval.Duration)
+	assert.Equal(t, "san_dns", cfg.Auth.MTLS.IdentityField)
+}
+
+func TestLoad_RejectsContradictoryTLSConfig(t *testing.T) {
+	const base = `
+rate_limit:
+  tiers:
+    default: {requests_per_second: 1, burst: 1}
+auth:
+  enabled: true
+  api_keys: [k]
+%s
+routes:
+  - path_prefix: "/"
+    target: "%s"
+%s
+tls:
+%s
+`
+	tlsOn := "  enabled: true\n  cert_file: s.pem\n  key_file: s-key.pem\n"
+	cases := []struct {
+		name, auth, target, route, tls, wantErr string
+	}{
+		{"enabled without cert", "", "http://b", "", "  enabled: true", "cert_file and tls.key_file"},
+		{"enabled without key", "", "http://b", "", "  enabled: true\n  cert_file: s.pem", "cert_file and tls.key_file"},
+		{"tls 1.1", "", "http://b", "", tlsOn + "  min_version: \"1.1\"", "min_version"},
+		{"unknown cipher", "", "http://b", "", tlsOn + "  cipher_suites: [NOPE]", "unknown cipher suite"},
+		{"insecure cipher", "", "http://b", "", tlsOn + "  cipher_suites: [TLS_RSA_WITH_RC4_128_SHA]", "insecure"},
+		{"tls13 cipher", "", "http://b", "", tlsOn + "  cipher_suites: [TLS_AES_128_GCM_SHA256]", "TLS 1.3 suite"},
+		{"ciphers with tls13 min", "", "http://b", "", tlsOn + "  min_version: \"1.3\"\n  cipher_suites: [TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256]", "no effect"},
+		{"ciphers without http2 suite", "", "http://b", "", tlsOn + "  cipher_suites: [TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256]", "HTTP/2 requires"},
+		{"unknown client_auth", "", "http://b", "", tlsOn + "  client_auth: sometimes", "tls.client_auth must be"},
+		{"verify without CA", "", "http://b", "", tlsOn + "  client_auth: require_and_verify", "client_ca_file"},
+		{"client_auth without tls", "", "http://b", "", "  client_auth: require", "tls.enabled is false"},
+		{"redirect without tls", "", "http://b", "", "  redirect_http_port: 8081", "tls.enabled is false"},
+		{"hsts without tls", "", "http://b", "", "  hsts: {enabled: true}", "tls.enabled is false"},
+		{"redirect on listen port", "", "http://b", "", tlsOn + "  redirect_http_port: 8080", "same port"},
+		{"mtls route without tls", "", "http://b", "    auth_mode: mtls", "  enabled: false", "auth_mode mtls"},
+		{"mtls route without verification", "", "http://b", "    auth_mode: mtls", tlsOn + "  client_auth: require", "auth_mode mtls"},
+		{"bad identity field", "  mtls: {identity_field: email}", "http://b", "", "  enabled: false", "identity_field"},
+		{"unknown mtls tier", "  mtls: {tiers: {gold: {cn: [x]}}}", "http://b", "", "  enabled: false", "no such tier"},
+		{"backend_tls on http target", "", "http://b", "    backend_tls: {enabled: true}", "  enabled: false", "https://"},
+		{"backend_tls half client cert", "", "https://b", "    backend_tls: {enabled: true, client_cert_file: c.pem}", "  enabled: false", "set together"},
+		{"backend_tls settings while disabled", "", "https://b", "    backend_tls: {ca_file: ca.pem}", "  enabled: false", "enabled is false"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, fmt.Sprintf(base, tc.auth, tc.target, tc.route, tc.tls)))
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestLoad_EitherRouteSatisfiedByMTLSWithoutJWT(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+auth:
+  enabled: true
+routes:
+  - path_prefix: "/"
+    target: "http://b"
+    auth_mode: either
+tls:
+  enabled: true
+  cert_file: s.pem
+  key_file: s-key.pem
+  client_auth: verify_if_given
+  client_ca_file: ca.pem
+`))
+	require.NoError(t, err, "either needs no JWT config when verified client certificates can satisfy it")
 }

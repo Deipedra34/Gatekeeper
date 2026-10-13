@@ -23,6 +23,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Response caching for GET requests.** Backend responses are cached per route in the same storage backend the rate limiter uses (memory or Redis), with a configurable TTL, an opt-out per route, and a header to bypass the cache for debugging.
 - **A circuit breaker around every backend call.** Closed / Open / Half-Open, configurable per route, so a struggling backend gets a break from traffic instead of every request queuing up behind retries and timeouts.
 - **WebSocket proxying.** `Upgrade: websocket` requests are routed like any other request and pass through CORS, auth, and the rate limiter (one token per connection attempt). After that, frames are relayed transparently in both directions. Per-route idle timeouts, connection caps per route and per client, `Origin` allow-lists, metrics, and graceful close on shutdown are all included.
+- **TLS and mTLS.** An optional HTTPS listener with TLS 1.2+ by default, hot-reloaded certificates (on `SIGHUP` or file change), client certificate verification, an `mtls` route auth mode with certificate-based client identity and tiers, HSTS, an HTTP→HTTPS redirect, and TLS / mTLS to backends.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
@@ -75,6 +76,8 @@ internal/ratelimiter/  the three algorithms + the Store abstraction they share
 internal/proxy/        the reverse-proxy router (path prefix / hostname matching), backend timeout + retry/backoff, GET response caching, circuit breaker integration
 internal/cache/        the response cache: key derivation, Cache-Control handling, Store-backed get/set
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
+internal/server/       the listeners: plain HTTP or HTTPS (mTLS, certificate hot reload, HSTS), plus the HTTP→HTTPS redirect
+internal/certgen/      throwaway CA / server / client certificate generation for tests and scripts/gencerts
 internal/websocket/    WebSocket upgrade detection, the frame relay, and the hub tracking open connections (limits, idle timeout, shutdown)
   └─ wstest/           a minimal WebSocket client/server used by tests and scripts/wsclient
 internal/middleware/   logging, CORS, API key + JWT auth, rate-limit middleware
@@ -82,6 +85,7 @@ internal/metrics/      Prometheus collectors + /metrics handler
 configs/                example config.yaml
 scripts/loadtest/      goroutine-based load generator (see "Load testing" below)
 scripts/wsclient/      tiny WebSocket client for trying out WebSocket proxying
+scripts/gencerts/      writes a development CA plus server and client certificates (see "TLS and mTLS")
 ```
 
 ## Rate-limiting algorithms: trade-offs
@@ -292,6 +296,193 @@ You can do the same without Docker: run the mock backend with `cd mockbackend &&
 
 > **Browser clients:** the browser `WebSocket` API can't set custom headers, so it can't send `X-API-Key` or `Authorization`. Browser apps on an authenticated route need to get their credential onto the handshake some other way, for example with a same-origin cookie checked by a JWT-issuing proxy in front of Gatekeeper. Alternatively, use a non-browser client.
 
+## TLS and mTLS
+
+Gatekeeper can serve HTTPS itself, verify client certificates (mutual TLS), authenticate and rate-limit clients by certificate, and talk TLS (including mTLS) to its backends. All of it is off by default. With `tls.enabled: false`, the gateway serves plain HTTP exactly as before, and existing configs need no changes.
+
+### HTTPS listener
+
+```yaml
+tls:
+  enabled: true
+  cert_file: "certs/server.pem"       # PEM certificate, followed by any intermediates
+  key_file: "certs/server-key.pem"
+  min_version: "1.2"                  # default "1.2"; "1.3" for TLS 1.3 only
+  # cipher_suites:                    # optional TLS 1.2 allow-list; default is Go's secure set
+  #   - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+  #   - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+  redirect_http_port: 8080            # optional plain-HTTP listener that 308-redirects to HTTPS
+  hsts:
+    enabled: true                     # adds Strict-Transport-Security to HTTPS responses
+    max_age: 31536000                 # seconds (default: one year)
+    include_subdomains: false
+    preload: false
+```
+
+`server.listen_addr` becomes the HTTPS address. Everything behind the listener works over TLS unchanged: routes, auth, rate limiting, caching, WebSockets (`wss://`), and `/metrics`. HTTP/2 is negotiated automatically for clients that support it.
+
+**Secure defaults.**
+- The minimum version is TLS 1.2, and TLS 1.0/1.1 are refused.
+- Cipher suites default to Go's secure list. `cipher_suites` only accepts suites from that list, never the insecure ones. It must include one of the two `AES_128_GCM_SHA256` ECDHE suites, because HTTP/2 requires them.
+- TLS 1.3 suites aren't configurable, so `cipher_suites` together with `min_version: "1.3"` is rejected.
+- Go picks the cipher suite order itself, taking the hardware into account. The old "prefer server cipher order" option is ignored by Go, so there's nothing to set.
+
+**Contradictory config fails at startup** with a clear error. For example:
+- `tls.enabled` without both `cert_file` and `key_file`.
+- `client_auth`, `redirect_http_port`, or `hsts` while TLS is off.
+- A verifying `client_auth` mode without `client_ca_file`.
+- An `mtls` route without client certificate verification.
+- A redirect port equal to the HTTPS port.
+
+The certificate, key, and client CA bundle are loaded at startup. A missing, mismatched, expired, or malformed file stops the gateway with an error naming the file. Key and certificate contents are never logged.
+
+**`tls.*` is read at startup only**, like `server.*`, with one exception: the certificate itself.
+
+### Certificate hot reload
+
+The server certificate is served through `tls.Config.GetCertificate`, so it can be replaced without a restart:
+
+- **On `SIGHUP`**, together with the normal config reload. If the reloaded config changes `cert_file` / `key_file`, the new paths are used.
+- **When the files change on disk.** Their modification time and size are checked every `tls.reload_interval` (default `30s`). That covers certificate renewers such as cert-manager or certbot hooks.
+
+New handshakes get the new certificate, and connections that are already open keep theirs, so nothing in flight is dropped. A reload that fails keeps the previous certificate in use and logs why. Failures include unreadable files, a key that doesn't match, an expired certificate, or a half-written pair. A half-written pair (new certificate, old key) is retried as soon as the second file changes.
+
+### Client certificates (mTLS)
+
+```yaml
+tls:
+  client_auth: require_and_verify     # none | request | require | verify_if_given | require_and_verify
+  client_ca_file: "certs/ca.pem"      # PEM bundle of CAs client certificates must chain to
+```
+
+| `client_auth` | Certificate required? | Verified against `client_ca_file`? | Usable for auth? |
+|---|---|---|---|
+| `none` (default) | no, and not requested | — | no |
+| `request` | no | no | no |
+| `require` | yes | no | no |
+| `verify_if_given` | no | yes, if one is sent | yes |
+| `require_and_verify` | yes | yes | yes |
+
+With `require_and_verify`, a client without a valid certificate never completes the handshake. That covers a client with no certificate, one from an untrusted CA, and one that has expired. `verify_if_given` is the flexible option: clients without a certificate still connect and authenticate some other way, such as an API key, while certificate holders can use `mtls` routes. Only a certificate that `crypto/tls` actually **verified** is ever trusted. A certificate that was merely presented under `request` / `require` never authenticates anyone.
+
+### Auth modes and certificate identity
+
+Routes gain a fourth `auth_mode`, and `either` now accepts certificates too:
+
+| `auth_mode` | Accepts |
+|---|---|
+| `api_key` (default) | a valid API key, as before |
+| `jwt` | a valid JWT, as before |
+| `mtls` | a verified client certificate (needs `client_auth: verify_if_given` or `require_and_verify`) |
+| `either` | a valid API key, else a valid JWT, else a verified client certificate, in that order |
+
+Routes without an `auth_mode` behave exactly as before. A route without a JWT block can now be `either`, as long as client certificates are verified.
+
+For rate limiting, a certificate-authenticated client is identified by one field of its certificate and mapped to a tier, the same way a JWT client is identified by its claims:
+
+```yaml
+auth:
+  mtls:
+    identity_field: cn                # cn (default) | san_dns (first DNS SAN) | serial (hex)
+    tiers:                            # optional; unmatched certificates get "default"
+      premium:
+        cn: ["acme-billing"]          # exact CN matches...
+        ou: ["premium-customers"]     # ...or any of the certificate's OUs
+      free:
+        ou: ["trial"]
+```
+
+The rate-limit key is `mtls:<identity>`. It never collides with an API key, IP, or JWT client. A CN match beats an OU match. Tiers must exist under `rate_limit.tiers`, and a CN or OU can't be listed under two tiers. A certificate that lacks the configured identity field (for example, no DNS SAN with `san_dns`) is rejected with `401`. `auth.mtls` reloads on `SIGHUP` like the rest of `auth`.
+
+Whatever a route's mode, a verified client certificate's identity is attached to the request for later middleware, even on `api_key` routes and even with `auth.enabled: false`. It only *authenticates* on `mtls` / `either` routes.
+
+### Backend TLS
+
+A route whose `target` is `https://` already works with publicly trusted backends, as before. `backend_tls` adds private CAs, mutual TLS to the backend, and name overrides:
+
+```yaml
+routes:
+  - path_prefix: "/api/orders"
+    target: "https://orders.internal:9443"
+    backend_tls:
+      enabled: true
+      ca_file: "certs/backend-ca.pem"               # trust this CA (replaces the system trust store for this backend)
+      client_cert_file: "certs/gateway-client.pem"  # present a client certificate (mTLS to the backend)
+      client_key_file: "certs/gateway-client-key.pem"
+      server_name: "orders.internal"                # name to verify / send as SNI (default: target host)
+      insecure_skip_verify: false                   # never in production; logs a loud warning when true
+```
+
+- **Composes with the rest of the proxy.** Only the innermost HTTP transport changes. Retries, timeouts, the circuit breaker, and response caching wrap a TLS backend exactly as they wrap a plain one. WebSocket upgrades on the route go to the backend as `wss://`, with the same CA, client certificate, and server name.
+- **Files are checked when the router is built.** The CA and client certificate are loaded at startup or reload, so a bad path fails there rather than on the first request.
+- **`backend_tls.enabled` requires an `https://` target.**
+
+### TLS metrics
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gatekeeper_tls_handshakes_total` | `version` (`TLS 1.2`, `TLS 1.3`) | Completed handshakes by protocol version |
+| `gatekeeper_tls_handshake_errors_total` | `reason` (`protocol_version`, `cipher_suite`, `client_certificate`, `other`) | Failed handshakes |
+| `gatekeeper_mtls_verifications_total` | `result`, `reason` (`verified`; `no_certificate`, `unknown_authority`, `expired`, `invalid`) | Client certificate verification outcomes |
+| `gatekeeper_tls_certificate_expiry_seconds` | — | Seconds until the server certificate in use expires; alert well before it reaches 0 |
+| `gatekeeper_tls_certificate_reloads_total` | `result` (`success`, `failure`) | Certificate loads, including the initial one |
+
+`gatekeeper_auth_requests_total` also gains `method="mtls"`. Handshake failures are classified from the errors `crypto/tls` reports to `net/http`. A failure Go doesn't describe specifically is counted as `other` / `invalid`.
+
+With `client_auth: require_and_verify`, `/metrics` is behind client certificates too, so give your Prometheus scraper a client certificate (`tls_config` in its scrape config).
+
+### Trying it out
+
+[`scripts/gencerts`](scripts/gencerts/main.go) writes a throwaway development PKI. It's a plain Go program, so it works the same on Linux, macOS, and Windows (PowerShell or Git Bash), with no `openssl` needed:
+
+```bash
+go run ./scripts/gencerts
+# certs/ca.pem, certs/server.pem + server-key.pem (localhost, 127.0.0.1, ::1, gatekeeper),
+# certs/client.pem + client-key.pem (CN=dev-client)
+```
+
+`certs/` and `*-key.pem` are git-ignored. Never commit them, and never use them outside development. The program refuses to overwrite an existing CA unless you pass `-force`. Use `-client-cn` and `-client-ou` to try out tier mapping, and `-hosts` to change the server names.
+
+Point `configs/config.yaml` at them:
+
+```yaml
+server:
+  listen_addr: ":8443"
+tls:
+  enabled: true
+  cert_file: "certs/server.pem"
+  key_file: "certs/server-key.pem"
+  client_auth: verify_if_given
+  client_ca_file: "certs/ca.pem"
+```
+
+Then:
+
+```bash
+# HTTPS with an API key (no client certificate needed under verify_if_given):
+curl --cacert certs/ca.pem https://localhost:8443/api/ping -H "X-API-Key: demo-free-key"
+
+# mTLS: present the client certificate (on an mtls or either route):
+curl --cacert certs/ca.pem --cert certs/client.pem --key certs/client-key.pem https://localhost:8443/api/secure/ping
+
+# TLS 1.1 is refused:
+curl --cacert certs/ca.pem --tlsv1.1 --tls-max 1.1 https://localhost:8443/
+```
+
+> **Windows `curl`:** the `curl.exe` that ships with Windows (and Git for Windows) uses Schannel rather than OpenSSL. It needs two adjustments:
+> - Add `--ssl-no-revoke`, because a local dev CA has no revocation endpoint.
+> - Schannel can't read PEM client certificates. Use a curl built with OpenSSL (for example from WSL or MSYS2) for the `--cert` / `--key` examples, or bundle the client certificate into a `.pfx` with `openssl pkcs12 -export`.
+
+**With Docker Compose.** [`docker-compose.tls.yml`](docker-compose.tls.yml) is an opt-in override that runs the stack with [`configs/config.docker.tls.yaml`](configs/config.docker.tls.yaml). That config serves HTTPS on `8443` and redirects plain HTTP on `8080` to it. It verifies client certificates when they're given, has an `mtls`-only route at `/api/secure`, and makes `/` an `either` route. The base `docker-compose.yml` is untouched and still serves plain HTTP.
+
+```bash
+go run ./scripts/gencerts            # on Linux add: -key-mode 0644 (the container's non-root user must read the keys)
+docker-compose -f docker-compose.yml -f docker-compose.tls.yml up --build
+
+curl --cacert certs/ca.pem --cert certs/client.pem --key certs/client-key.pem https://localhost:8443/api/secure/ping
+curl -i http://localhost:8080/api/ping     # 308 Permanent Redirect -> https://localhost:8443/api/ping
+```
+
 ## JWT authentication
 
 Besides API keys, Gatekeeper can authenticate requests with a JSON Web Token sent as `Authorization: Bearer <token>`. Which credential a route requires is set per route, so API key clients and JWT clients can share one gateway.
@@ -472,9 +663,11 @@ gatekeeper: SIGHUP received, reloading config
 gatekeeper: config reload failed, keeping previous config: config: invalid: rate_limit.tiers.free.burst must be > 0
 ```
 
-`server.*`, `storage.*`, and `metrics.*` are read only at startup —
-changing the listen address, the storage backend, or the metrics path
-still requires a restart.
+`server.*`, `storage.*`, `metrics.*`, and `tls.*` are read only at
+startup — changing the listen address, the storage backend, the metrics
+path, or TLS settings still requires a restart. The one exception is the
+TLS certificate itself: `SIGHUP` also reloads the server certificate and
+key (see [Certificate hot reload](#certificate-hot-reload)).
 
 ## Run with Docker
 
@@ -519,6 +712,8 @@ Start everything with:
 ```bash
 docker-compose up --build
 ```
+
+To run the same stack over HTTPS with mTLS, add the opt-in [`docker-compose.tls.yml`](docker-compose.tls.yml) override; see [TLS and mTLS](#tls-and-mtls).
 
 Only `gatekeeper` publishes a port to the host — `8080`, matching `server.listen_addr`. `redis` and `mock-backend` are reachable from `gatekeeper` on the compose network but not from the host.
 
@@ -598,6 +793,12 @@ gatekeeper_websocket_connections_closed_total{route="/ws",reason="idle_timeout"}
 gatekeeper_websocket_handshake_rejections_total{route="/ws",reason="auth"} 2
 gatekeeper_websocket_handshake_rejections_total{route="/ws",reason="max_connections"} 1
 gatekeeper_websocket_connection_duration_seconds_count{route="/ws"} 28
+gatekeeper_tls_handshakes_total{version="TLS 1.3"} 512
+gatekeeper_tls_handshake_errors_total{reason="client_certificate"} 3
+gatekeeper_mtls_verifications_total{result="success",reason="verified"} 120
+gatekeeper_mtls_verifications_total{result="failure",reason="unknown_authority"} 2
+gatekeeper_tls_certificate_expiry_seconds 7.7e+06
+gatekeeper_tls_certificate_reloads_total{result="success"} 2
 ```
 
 `gatekeeper_proxy_retries_total` counts individual retry attempts against a backend (not the initial attempt), and `gatekeeper_proxy_request_outcomes_total` counts each proxied request exactly once — as `success` or `failure` — after all retries are done. Both are independent of `gatekeeper_requests_allowed_total`/`_rejected_total`, which reflect the rate limiter's decision on the original client request, not what happened while forwarding it.
@@ -609,6 +810,8 @@ gatekeeper_websocket_connection_duration_seconds_count{route="/ws"} 28
 `gatekeeper_auth_requests_total` counts every auth decision once, by `method` (`api_key` or `jwt`) and `result` (`success` or `failure`). A rejected request on an `either` route counts as a `jwt` failure if it carried a bearer token and as an `api_key` failure otherwise. Nothing is counted while `auth.enabled` is false. See [JWT authentication](#jwt-authentication).
 
 `gatekeeper_websocket_active_connections` is the number of WebSocket connections open right now on each route. `gatekeeper_websocket_connections_opened_total` counts connections that completed the upgrade. `gatekeeper_websocket_connections_closed_total` counts connections that have ended, split by `reason`: `client` or `backend` (that side closed or disconnected), `idle_timeout`, or `shutdown`. `gatekeeper_websocket_handshake_rejections_total` counts upgrade requests refused before a connection was established, by `reason` (`auth`, `rate_limit`, `origin`, `max_connections`, `disabled`, `circuit_open`, `shutting_down`, `backend`). See the rejection table in [WebSocket proxying](#websocket-proxying). `gatekeeper_websocket_connection_duration_seconds` is a histogram of how long connections stayed open, with buckets from 100ms to 4h. A handshake's backend outcome is also counted once in `gatekeeper_proxy_request_outcomes_total`.
+
+The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
 (`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
 
@@ -649,6 +852,16 @@ What's covered:
 - Response caching (`internal/cache` and `internal/proxy/cache_test.go`): a miss followed by a hit for the same request, TTL expiration forcing a fresh backend call, a `Cache-Control: no-store` response never being cached, `X-Bypass-Cache` skipping the cache without disturbing the existing entry, a route with caching disabled always reaching the backend, and caching degrading gracefully (fail open, no crash) when its store errors on every call — simulating Redis being down.
 - Circuit breaker (`internal/circuitbreaker` and `internal/proxy/circuitbreaker_test.go`): tripping to Open after `failure_threshold` consecutive failures, requests failing fast (and never reaching the backend) while Open, transitioning to Half-Open once the cooldown elapses, a successful trial closing the breaker, a failed trial re-opening it, Half-Open's concurrent-trial limit, and confirming a request never retries into an already-open circuit.
 - WebSocket proxying (`internal/proxy/websocket_test.go`, `internal/gateway/websocket_test.go`, `internal/websocket`): messages relayed in both directions, including large frames, with handshake headers passed through. The handshake is blocked by a missing or invalid API key or JWT and rate limited per attempt, while frames are not limited. Also covered: origin rejection, per-route and per-client connection caps, the idle timeout closing a quiet connection, a backend or client disconnect closing the other side with a Close frame, upgrades never being retried or cached, connections outliving `proxy.timeout` and the server's read/write timeouts, the circuit breaker counting failed handshakes but not long-lived connections, graceful shutdown (including forced close at the deadline), connections surviving a config reload, and plain HTTP on a WebSocket-enabled route behaving exactly as before.
+- TLS and mTLS (`internal/server`, `internal/middleware/mtls_test.go`, `internal/proxy/backendtls_test.go`, `internal/config`):
+  - HTTPS serving with a generated certificate, and plain HTTP unchanged when TLS is off.
+  - TLS 1.1 refused, `min_version: "1.3"` refusing TLS 1.2, and the cipher-suite allow-list enforced.
+  - `require_and_verify` rejecting a client with no certificate, one from an untrusted CA, and an expired one, while accepting a valid one; each failure counted by reason.
+  - Startup failing on missing or invalid certificate, key, or CA files.
+  - Certificate hot reload through the file watcher and `SIGHUP`, with open connections surviving it, and invalid reloads keeping the old certificate.
+  - The HTTP→HTTPS redirect and HSTS.
+  - The `mtls` and `either` auth modes, with unverified certificates never trusted, and `cn` / `san_dns` / `serial` identity extraction with CN/OU tier mapping driving rate limits, end to end through the real gateway.
+  - Backend TLS: a custom CA, a `server_name` override, mTLS to the backend, `insecure_skip_verify`, retries over TLS, and `wss` with backend mTLS.
+  - Contradictory TLS config rejected, and every shipped config file loading cleanly.
 - A full end-to-end test (`TestGateway_EndToEnd`) that wires config → storage → limiters → the whole middleware chain → the proxy, then drives it through auth, CORS, per-tier rate limiting, and routing together, not in isolation.
 
 ## Load testing
@@ -739,11 +952,12 @@ See the fully-commented [`configs/config.yaml`](configs/config.yaml) for every f
 server:      { listen_addr, read_timeout, write_timeout, idle_timeout }
 storage:     { backend: memory|redis, redis: { addr, password, db, dial_timeout } }
 rate_limit:  { algorithm, scope: api_key|ip|header, header_name, tiers: {...}, clients: {...} }
-auth:        { enabled, header, api_keys: [...], jwt: { algorithm: HS256|RS256, secret | secret_env, public_key_file, issuer, audience, leeway, client_id_claim, tier_claim } }
+auth:        { enabled, header, api_keys: [...], jwt: { algorithm: HS256|RS256, secret | secret_env, public_key_file, issuer, audience, leeway, client_id_claim, tier_claim }, mtls: { identity_field: cn|san_dns|serial, tiers: { <tier>: { cn: [...], ou: [...] } } } }
 cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow_credentials, max_age }
-routes:      [ { path_prefix | host, target, auth_mode: api_key|jwt|either, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen }, websocket, ws_idle_timeout, ws_max_connections, ws_max_connections_per_client, ws_allowed_origins: [...] } ]
+routes:      [ { path_prefix | host, target, auth_mode: api_key|jwt|mtls|either, backend_tls: { enabled, ca_file, client_cert_file, client_key_file, server_name, insecure_skip_verify }, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen }, websocket, ws_idle_timeout, ws_max_connections, ws_max_connections_per_client, ws_allowed_origins: [...] } ]
 metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
+tls:         { enabled, cert_file, key_file, min_version: "1.2"|"1.3", cipher_suites: [...], client_auth: none|request|require|verify_if_given|require_and_verify, client_ca_file, reload_interval, redirect_http_port, hsts: { enabled, max_age, include_subdomains, preload } }
 ```
 
 ---

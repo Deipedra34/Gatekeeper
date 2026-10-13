@@ -1,0 +1,24 @@
+# Opt-in override that runs the docker-compose stack with HTTPS and mTLS.
+# The base docker-compose.yml is unchanged and still serves plain HTTP.
+#
+# Usage:
+#   go run ./scripts/gencerts            # writes ./certs (git-ignored);
+#                                        # on Linux add: -key-mode 0644
+#   docker-compose -f docker-compose.yml -f docker-compose.tls.yml up --build
+#
+# Then, from the host:
+#   curl --cacert certs/ca.pem https://localhost:8443/api/ping -H "X-API-Key: demo-free-key"
+#   curl --cacert certs/ca.pem --cert certs/client.pem --key certs/client-key.pem https://localhost:8443/api/secure/ping
+#   curl -i http://localhost:8080/api/ping     # 308 redirect to https://localhost:8443/api/ping
+#
+# See README.md's "TLS and mTLS" section.
+
+services:
+  gatekeeper:
+    ports:
+      # HTTPS. The base file's 8080 mapping now serves the HTTP->HTTPS
+      # redirect listener (tls.redirect_http_port).
+      - "8443:8443"
+    volumes:
+      - ./configs/config.docker.tls.yaml:/app/configs/config.yaml:ro
+      - ./certs:/app/certs:ro

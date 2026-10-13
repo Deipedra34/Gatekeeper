@@ -92,6 +92,21 @@ auth:
   #   # Missing or unknown tier -> "default".
   #   tier_claim: tier
 
+  # Client certificate (mTLS) identity, for routes with auth_mode "mtls"
+  # or "either". Needs tls.client_auth verify_if_given or
+  # require_and_verify below. See README.md's "TLS and mTLS" section.
+  #
+  # mtls:
+  #   # Certificate field identifying the client for rate limiting:
+  #   # cn (default), san_dns, or serial.
+  #   identity_field: cn
+  #   # Optional: map certificates to rate-limit tiers by CN or OU.
+  #   # Unmatched certificates get the "default" tier.
+  #   tiers:
+  #     premium:
+  #       ou: ["premium-customers"]
+  #       cn: ["acme-billing"]
+
 cors:
   enabled: true
   allowed_origins: ["*"]
@@ -140,7 +155,21 @@ cors:
 #   auth_mode: api_key  - an API key in auth.header (the default).
 #   auth_mode: jwt      - a JWT in "Authorization: Bearer <token>";
 #                          requires the auth.jwt block above.
-#   auth_mode: either   - a valid API key or a valid JWT.
+#   auth_mode: either   - a valid API key, a valid JWT, or a verified
+#                          client certificate.
+#   auth_mode: mtls     - a client certificate verified during the TLS
+#                          handshake (needs tls.client_auth
+#                          verify_if_given or require_and_verify).
+#
+# A route with an https:// target can trust a private CA, present a
+# client certificate (mTLS to the backend), or override the server name:
+#   backend_tls:
+#     enabled: true
+#     ca_file: "certs/backend-ca.pem"
+#     client_cert_file: "certs/gateway-client.pem"
+#     client_key_file: "certs/gateway-client-key.pem"
+#     server_name: "orders.internal"
+#     insecure_skip_verify: false   # development only; logs a warning
 #
 # WebSocket upgrade requests (Upgrade: websocket) are proxied on every
 # route by default, after passing CORS, auth, and the rate limiter (one
@@ -202,3 +231,31 @@ proxy:
     # Upper bound on the backoff delay, no matter how many retries have
     # happened (default: 2s).
     max_backoff: 2s
+
+# HTTPS on Gatekeeper's own listener. Off by default; with it off the
+# gateway serves plain HTTP exactly as before. Read at startup only —
+# except the certificate and key, which are reloaded on SIGHUP and
+# whenever the files change. Generate development certificates with
+# `go run ./scripts/gencerts`. See README.md's "TLS and mTLS" section.
+tls:
+  enabled: false
+  # cert_file: "certs/server.pem"
+  # key_file: "certs/server-key.pem"
+  # Oldest accepted version: "1.2" (default) or "1.3".
+  # min_version: "1.2"
+  # Optional TLS 1.2 cipher suite allow-list (default: Go's secure set).
+  # cipher_suites: ["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]
+  # Client certificates: none (default), request, require,
+  # verify_if_given, require_and_verify. The verifying modes need
+  # client_ca_file.
+  # client_auth: none
+  # client_ca_file: "certs/ca.pem"
+  # How often to check the certificate files for changes (default: 30s).
+  # reload_interval: 30s
+  # Optional plain-HTTP listener redirecting everything to HTTPS.
+  # redirect_http_port: 8080
+  # hsts:
+  #   enabled: false
+  #   max_age: 31536000       # seconds (default: one year)
+  #   include_subdomains: false
+  #   preload: false

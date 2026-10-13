@@ -41,6 +41,7 @@ type Config struct {
 	Routes    []Route         `yaml:"routes"`
 	Metrics   MetricsConfig   `yaml:"metrics"`
 	Proxy     ProxyConfig     `yaml:"proxy"`
+	TLS       TLSConfig       `yaml:"tls"`
 }
 
 // ServerConfig controls the HTTP listener Gatekeeper itself exposes.
@@ -107,8 +108,12 @@ const (
 	AuthModeAPIKey = "api_key"
 	// AuthModeJWT requires a valid JWT in "Authorization: Bearer <token>".
 	AuthModeJWT = "jwt"
-	// AuthModeEither accepts a valid API key or a valid JWT.
+	// AuthModeEither accepts a valid API key, a valid JWT, or a verified
+	// client certificate.
 	AuthModeEither = "either"
+	// AuthModeMTLS requires a client certificate verified against
+	// tls.client_ca_file during the TLS handshake.
+	AuthModeMTLS = "mtls"
 )
 
 // AuthConfig controls the authentication middleware. Enabled is the
@@ -117,8 +122,9 @@ const (
 type AuthConfig struct {
 	Enabled bool      `yaml:"enabled"`
 	Header  string    `yaml:"header"`
-	APIKeys []string  `yaml:"api_keys"`
-	JWT     JWTConfig `yaml:"jwt"`
+	APIKeys []string   `yaml:"api_keys"`
+	JWT     JWTConfig  `yaml:"jwt"`
+	MTLS    MTLSConfig `yaml:"mtls"`
 }
 
 // JWTConfig controls validation of bearer tokens on routes whose
@@ -203,8 +209,11 @@ type Route struct {
 	CircuitBreaker RouteCircuitBreaker `yaml:"circuit_breaker"`
 
 	// AuthMode is the credential this route requires when auth is
-	// enabled: "api_key" (the default), "jwt", or "either".
+	// enabled: "api_key" (the default), "jwt", "mtls", or "either".
 	AuthMode string `yaml:"auth_mode"`
+
+	// BackendTLS configures TLS from Gatekeeper to this route's backend.
+	BackendTLS BackendTLSConfig `yaml:"backend_tls"`
 
 	// WebSocket toggles proxying of WebSocket upgrade requests on this
 	// route. Defaults to true when unset; set it to false to refuse
@@ -424,6 +433,8 @@ func (c *Config) applyDefaults() {
 	if c.Auth.JWT.ClientIDClaim == "" {
 		c.Auth.JWT.ClientIDClaim = "sub"
 	}
+	c.Auth.MTLS.applyDefaults()
+	c.TLS.applyDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -531,6 +542,9 @@ func (c *Config) validate() error {
 		if r.Cache.TTL.Duration < 0 {
 			return fmt.Errorf("routes[%d]: cache.ttl must be >= 0", i)
 		}
+		if err := r.BackendTLS.validate(r.Target); err != nil {
+			return fmt.Errorf("routes[%d]: %w", i, err)
+		}
 		if r.WSIdleTimeout.Duration < 0 {
 			return fmt.Errorf("routes[%d]: ws_idle_timeout must be >= 0", i)
 		}
@@ -564,15 +578,23 @@ func (c *Config) validate() error {
 		}
 	}
 
-	usesAPIKey, usesJWT := false, false
+	if err := c.TLS.validate(c.Server.ListenAddr); err != nil {
+		return err
+	}
+
+	usesAPIKey, usesJWT, usesEither, usesMTLS := false, false, false, false
 	for i, r := range c.Routes {
 		switch r.EffectiveAuthMode() {
 		case AuthModeAPIKey:
 			usesAPIKey = true
-		case AuthModeJWT, AuthModeEither:
+		case AuthModeJWT:
 			usesJWT = true
+		case AuthModeEither:
+			usesEither = true
+		case AuthModeMTLS:
+			usesMTLS = true
 		default:
-			return fmt.Errorf("routes[%d]: auth_mode must be one of api_key, jwt, either, got %q", i, r.AuthMode)
+			return fmt.Errorf("routes[%d]: auth_mode must be one of api_key, jwt, mtls, either, got %q", i, r.AuthMode)
 		}
 	}
 
@@ -581,7 +603,16 @@ func (c *Config) validate() error {
 	if c.Auth.Enabled && usesAPIKey && len(c.Auth.APIKeys) == 0 {
 		return fmt.Errorf("auth.enabled is true but auth.api_keys is empty")
 	}
-	if err := c.Auth.JWT.validate(c.Auth.Enabled && usesJWT); err != nil {
+	// "either" needs JWT config unless verified client certificates can
+	// satisfy it instead.
+	jwtRequired := usesJWT || (usesEither && !c.TLS.VerifiesClientCerts())
+	if err := c.Auth.JWT.validate(c.Auth.Enabled && jwtRequired); err != nil {
+		return err
+	}
+	if c.Auth.Enabled && usesMTLS && !c.TLS.VerifiesClientCerts() {
+		return fmt.Errorf("a route uses auth_mode mtls, which needs tls.enabled: true and tls.client_auth verify_if_given or require_and_verify (with tls.client_ca_file)")
+	}
+	if err := c.Auth.MTLS.validate(c.RateLimit.Tiers); err != nil {
 		return err
 	}
 

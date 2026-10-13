@@ -1,12 +1,14 @@
 // Package metrics exposes Gatekeeper's Prometheus-compatible admin
 // endpoint: counts of allowed/rejected requests per client and tier,
 // the rate limiter's current remaining allowance per client, request
-// latency, authentication successes/failures by method, and WebSocket
-// connection activity per route.
+// latency, authentication successes/failures by method, WebSocket
+// connection activity per route, and TLS handshake/certificate state.
 package metrics
 
 import (
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -86,6 +88,56 @@ type Metrics struct {
 	// WebSocketDuration is how long each proxied WebSocket connection
 	// stayed open, from the 101 response to teardown, by route.
 	WebSocketDuration *prometheus.HistogramVec
+
+	// TLSHandshakes counts completed TLS handshakes on the gateway's
+	// listener, by negotiated protocol version ("TLS 1.2", "TLS 1.3").
+	TLSHandshakes *prometheus.CounterVec
+
+	// TLSHandshakeErrors counts failed TLS handshakes, by reason:
+	// "protocol_version", "cipher_suite", "client_certificate", or "other".
+	TLSHandshakeErrors *prometheus.CounterVec
+
+	// MTLSVerifications counts client certificate verification outcomes
+	// during the handshake, by result ("success" or "failure") and reason
+	// ("verified" on success; "no_certificate", "unknown_authority",
+	// "expired", or "invalid" on failure).
+	MTLSVerifications *prometheus.CounterVec
+
+	// TLSCertificateReloads counts attempts to (re)load the server
+	// certificate, by result ("success" or "failure").
+	TLSCertificateReloads *prometheus.CounterVec
+
+	certExpiry *certExpiryCollector
+}
+
+// certExpiryCollector reports seconds until the server certificate
+// expires, computed at scrape time so it keeps counting down between
+// reloads. It reports nothing until a certificate has been loaded.
+type certExpiryCollector struct {
+	desc     *prometheus.Desc
+	notAfter atomic.Int64 // unix nanoseconds; 0 = no certificate loaded
+}
+
+func (c *certExpiryCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c *certExpiryCollector) Collect(ch chan<- prometheus.Metric) {
+	na := c.notAfter.Load()
+	if na == 0 {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, time.Until(time.Unix(0, na)).Seconds())
+}
+
+// SetServerCertificateExpiry records the NotAfter time of the server
+// certificate currently in use.
+func (m *Metrics) SetServerCertificateExpiry(notAfter time.Time) {
+	m.certExpiry.notAfter.Store(notAfter.UnixNano())
+}
+
+// ServerCertificateExpiry is the collector behind
+// gatekeeper_tls_certificate_expiry_seconds, exposed for tests.
+func (m *Metrics) ServerCertificateExpiry() prometheus.Collector {
+	return m.certExpiry
 }
 
 // New creates and registers all of Gatekeeper's collectors.
@@ -160,6 +212,26 @@ func New() *Metrics {
 			Help:    "How long proxied WebSocket connections stayed open, by route.",
 			Buckets: []float64{0.1, 1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200, 14400},
 		}, []string{"route"}),
+		TLSHandshakes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_tls_handshakes_total",
+			Help: "Total number of completed TLS handshakes on the gateway listener, by protocol version.",
+		}, []string{"version"}),
+		TLSHandshakeErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_tls_handshake_errors_total",
+			Help: "Total number of failed TLS handshakes on the gateway listener, by reason.",
+		}, []string{"reason"}),
+		MTLSVerifications: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_mtls_verifications_total",
+			Help: "Total number of client certificate verifications during the TLS handshake, by result and reason.",
+		}, []string{"result", "reason"}),
+		TLSCertificateReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_tls_certificate_reloads_total",
+			Help: "Total number of server certificate load attempts, by result (success or failure).",
+		}, []string{"result"}),
+		certExpiry: &certExpiryCollector{
+			desc: prometheus.NewDesc("gatekeeper_tls_certificate_expiry_seconds",
+				"Seconds until the server certificate currently in use expires (negative once expired).", nil, nil),
+		},
 	}
 
 	registry.MustRegister(
@@ -179,6 +251,11 @@ func New() *Metrics {
 		m.WebSocketClosed,
 		m.WebSocketRejections,
 		m.WebSocketDuration,
+		m.TLSHandshakes,
+		m.TLSHandshakeErrors,
+		m.MTLSVerifications,
+		m.TLSCertificateReloads,
+		m.certExpiry,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)

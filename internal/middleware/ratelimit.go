@@ -31,6 +31,8 @@ const apiKeyHeader = "X-API-Key"
 // happens to be the same string), with its tier taken from the tier
 // claim — or "default" if there's no tier claim or it names a tier that
 // isn't configured. Scope and cfg.Clients don't apply to JWT clients.
+// A request authenticated by client certificate works the same way,
+// keyed "mtls:<identity>" with the tier its CN/OU maps to.
 //
 // If the limiter itself errors, say because the store is briefly
 // unreachable, the request is let through anyway and a warning gets
@@ -47,9 +49,9 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			client := clientKey(cfg, r)
 			tier := clientTier(cfg, client)
-			if id, ok := IdentityFrom(r.Context()); ok && id.Method == config.AuthModeJWT {
-				client = "jwt:" + id.Client
-				tier = jwtTier(id.Tier, limiters)
+			if id, ok := IdentityFrom(r.Context()); ok && (id.Method == config.AuthModeJWT || id.Method == config.AuthModeMTLS) {
+				client = id.Method + ":" + id.Client
+				tier = claimedTier(id.Tier, limiters)
 			}
 
 			limiter, ok := limiters[tier]
@@ -114,10 +116,10 @@ func clientTier(cfg config.RateLimitConfig, client string) string {
 	return "default"
 }
 
-// jwtTier maps a tier claim value onto a configured tier, falling back to
-// "default" when the claim was absent or names a tier that doesn't exist
-// — a token can't invent its own tier.
-func jwtTier(claimed string, limiters map[string]ratelimiter.Limiter) string {
+// claimedTier maps a tier from a JWT claim or a certificate mapping onto
+// a configured tier, falling back to "default" when it's absent or names
+// a tier that doesn't exist — a credential can't invent its own tier.
+func claimedTier(claimed string, limiters map[string]ratelimiter.Limiter) string {
 	if _, ok := limiters[claimed]; ok {
 		return claimed
 	}

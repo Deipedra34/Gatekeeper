@@ -8,6 +8,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,10 @@ type route struct {
 	handshakeTimeout time.Duration
 
 	ws wsSettings
+
+	// backendTLS is the route's backend_tls client config, shared by the
+	// HTTP transport and the WebSocket dialer; nil means Go's defaults.
+	backendTLS *tls.Config
 }
 
 // Router dispatches requests to the backend whose route matches, based
@@ -100,10 +105,21 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			return nil, fmt.Errorf("proxy: invalid target %q: %w", rt.Target, err)
 		}
 
+		backendTLS, err := newBackendTLSConfig(rt)
+		if err != nil {
+			return nil, err
+		}
+
 		breaker := newBreaker(rt, m)
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.ErrorHandler = errorHandler(rt.Target)
-		proxy.Transport = newRetryTransport(proxyCfg, m, routeLabel(rt), breaker)
+		transport := newRetryTransport(proxyCfg, m, routeLabel(rt), breaker)
+		if backendTLS != nil {
+			// Only the innermost transport changes, so retries, timeouts,
+			// and the circuit breaker wrap TLS backends exactly as before.
+			transport.base = newBackendTransport(backendTLS)
+		}
+		proxy.Transport = transport
 
 		r.routes = append(r.routes, route{
 			pathPrefix:       rt.PathPrefix,
@@ -117,6 +133,7 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			breaker:          breaker,
 			handshakeTimeout: proxyCfg.Timeout.Duration,
 			ws:               newWSSettings(rt),
+			backendTLS:       backendTLS,
 		})
 	}
 	return r, nil

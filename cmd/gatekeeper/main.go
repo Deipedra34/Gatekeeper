@@ -9,6 +9,10 @@
 // An invalid new config is logged and ignored; the gateway keeps running
 // on the previous one.
 //
+// With tls.enabled the gateway serves HTTPS (optionally verifying client
+// certificates), and SIGHUP also reloads the server certificate and key;
+// they're additionally reloaded whenever their files change on disk.
+//
 // On SIGINT/SIGTERM the server stops accepting connections, finishes
 // in-flight requests, and closes proxied WebSocket connections with a
 // Close frame, all within a 10s shutdown window.
@@ -17,6 +21,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -29,6 +34,7 @@ import (
 	"gatekeeper/internal/gateway"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/ratelimiter/store"
+	"gatekeeper/internal/server"
 )
 
 // redisHealthCheckInterval controls how often FallbackStore re-probes a
@@ -65,36 +71,48 @@ func main() {
 		log.Printf("gatekeeper: dashboard enabled at /_dashboard")
 	}
 
-	srv := &http.Server{
-		Addr:         cfg.Server.ListenAddr,
-		Handler:      mux,
-		ReadTimeout:  cfg.Server.ReadTimeout.Duration,
-		WriteTimeout: cfg.Server.WriteTimeout.Duration,
-		IdleTimeout:  cfg.Server.IdleTimeout.Duration,
+	srv, err := server.New(cfg, mux, m, log.Default())
+	if err != nil {
+		log.Fatalf("gatekeeper: %v", err)
 	}
 
 	go func() {
-		log.Printf("gatekeeper: listening on %s (algorithm=%s scope=%s backend=%s)",
-			cfg.Server.ListenAddr, cfg.RateLimit.Algorithm, cfg.RateLimit.Scope, cfg.Storage.Backend)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		scheme := "http"
+		if srv.TLSEnabled() {
+			scheme = fmt.Sprintf("https, min TLS %s, client_auth=%s", cfg.TLS.MinVersion, cfg.TLS.ClientAuth)
+		}
+		log.Printf("gatekeeper: listening on %s (%s; algorithm=%s scope=%s backend=%s)",
+			cfg.Server.ListenAddr, scheme, cfg.RateLimit.Algorithm, cfg.RateLimit.Scope, cfg.Storage.Backend)
+		if cfg.TLS.Enabled && cfg.TLS.RedirectHTTPPort != 0 {
+			log.Printf("gatekeeper: redirecting plain HTTP on port %d to HTTPS", cfg.TLS.RedirectHTTPPort)
+		}
+		if err := srv.ListenAndServe(); err != nil {
 			log.Fatalf("gatekeeper: server error: %v", err)
 		}
 	}()
 
-	// SIGHUP triggers an in-place config reload. server.*, storage.*, and
-	// metrics.* are read only at startup; everything else swaps live.
+	// SIGHUP triggers an in-place config reload, plus a reload of the TLS
+	// certificate. server.*, storage.*, metrics.*, and tls.* (other than
+	// the certificate itself) are read only at startup; everything else
+	// swaps live.
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
 			log.Println("gatekeeper: SIGHUP received, reloading config")
+			certFile, keyFile := "", ""
 			if err := gw.Reload(); err != nil {
 				log.Printf("gatekeeper: config reload failed, keeping previous config: %v", err)
-				continue
+			} else {
+				c := gw.Config()
+				log.Printf("gatekeeper: config reloaded (algorithm=%s scope=%s routes=%d)",
+					c.RateLimit.Algorithm, c.RateLimit.Scope, len(c.Routes))
+				if c.TLS.Enabled {
+					certFile, keyFile = c.TLS.CertFile, c.TLS.KeyFile
+				}
 			}
-			c := gw.Config()
-			log.Printf("gatekeeper: config reloaded (algorithm=%s scope=%s routes=%d)",
-				c.RateLimit.Algorithm, c.RateLimit.Scope, len(c.Routes))
+			// Logged by the reloader; a failure keeps the old certificate.
+			_ = srv.ReloadCertificates(certFile, keyFile)
 		}
 	}()
 

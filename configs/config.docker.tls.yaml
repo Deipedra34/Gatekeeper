@@ -1,0 +1,101 @@
+# Gatekeeper configuration for the docker-compose stack with HTTPS and
+# mTLS enabled. Used by docker-compose.tls.yml, which mounts it over
+# /app/configs/config.yaml and mounts ./certs at /app/certs. Generate
+# those certificates first with `go run ./scripts/gencerts` (on Linux,
+# add `-key-mode 0644` so the container's non-root user can read the
+# keys). See README.md's "TLS and mTLS" section.
+#
+# Same as configs/config.docker.yaml, plus:
+#   - HTTPS on :8443, with plain HTTP on :8080 redirecting to it.
+#   - Client certificates verified if presented (verify_if_given), so
+#     API key routes keep working without one.
+#   - /api/secure requires a client certificate (auth_mode mtls), and "/"
+#     accepts an API key, a JWT, or a client certificate (either).
+
+server:
+  listen_addr: ":8443"
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 60s
+
+storage:
+  backend: redis
+  redis:
+    addr: "redis:6379"
+    password: ""
+    db: 0
+    dial_timeout: 2s
+
+rate_limit:
+  algorithm: token_bucket
+  scope: api_key
+  header_name: "X-Client-ID"
+
+  tiers:
+    default:
+      requests_per_second: 2
+      burst: 5
+    free:
+      requests_per_second: 5
+      burst: 10
+    premium:
+      requests_per_second: 50
+      burst: 100
+
+  clients:
+    "demo-free-key": free
+    "demo-premium-key": premium
+
+auth:
+  enabled: true
+  header: "X-API-Key"
+  api_keys:
+    - "demo-free-key"
+    - "demo-premium-key"
+  mtls:
+    identity_field: cn
+    tiers:
+      premium:
+        cn: ["dev-client"]
+
+cors:
+  enabled: true
+  allowed_origins: ["*"]
+  allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+  allowed_headers: ["Content-Type", "Authorization", "X-API-Key"]
+  allow_credentials: false
+  max_age: 300
+
+routes:
+  - path_prefix: "/ws"
+    target: "http://mock-backend:9000"
+    ws_idle_timeout: 5m
+    ws_max_connections: 1000
+    ws_max_connections_per_client: 10
+  - path_prefix: "/api/secure"
+    target: "http://mock-backend:9000"
+    auth_mode: mtls
+  - path_prefix: "/api/users"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/api/orders"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/"
+    target: "http://mock-backend:9000"
+    auth_mode: either
+
+metrics:
+  enabled: true
+  path: "/metrics"
+
+tls:
+  enabled: true
+  cert_file: "certs/server.pem"
+  key_file: "certs/server-key.pem"
+  min_version: "1.2"
+  client_auth: verify_if_given
+  client_ca_file: "certs/ca.pem"
+  reload_interval: 30s
+  redirect_http_port: 8080
+  hsts:
+    enabled: true
+    max_age: 31536000

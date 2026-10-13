@@ -204,7 +204,7 @@ func dialBackendWebSocket(req *http.Request, rt *route) (net.Conn, *bufio.Reader
 		defer cancel()
 	}
 
-	conn, err := dialTarget(ctx, rt.target)
+	conn, err := dialTarget(ctx, rt.target, rt.backendTLS)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -236,8 +236,10 @@ func dialBackendWebSocket(req *http.Request, rt *route) (net.Conn, *bufio.Reader
 }
 
 // dialTarget opens a TCP (or, for an https/wss target, TLS) connection
-// to target's host.
-func dialTarget(ctx context.Context, target *url.URL) (net.Conn, error) {
+// to target's host. backendTLS, if non-nil, is the route's backend_tls
+// config (custom CA, client certificate, server name); otherwise TLS
+// uses Go's defaults, verifying against the system trust store.
+func dialTarget(ctx context.Context, target *url.URL, backendTLS *tls.Config) (net.Conn, error) {
 	useTLS := target.Scheme == "https" || target.Scheme == "wss"
 	addr := target.Host
 	if target.Port() == "" {
@@ -248,7 +250,16 @@ func dialTarget(ctx context.Context, target *url.URL) (net.Conn, error) {
 		addr = net.JoinHostPort(target.Hostname(), port)
 	}
 	if useTLS {
-		d := &tls.Dialer{Config: &tls.Config{ServerName: target.Hostname()}}
+		tc := &tls.Config{MinVersion: tls.VersionTLS12}
+		if backendTLS != nil {
+			tc = backendTLS.Clone()
+		}
+		if tc.ServerName == "" {
+			tc.ServerName = target.Hostname()
+		}
+		// The upgrade is an HTTP/1.1 exchange; never negotiate h2.
+		tc.NextProtos = []string{"http/1.1"}
+		d := &tls.Dialer{Config: tc}
 		return d.DialContext(ctx, "tcp", addr)
 	}
 	var d net.Dialer

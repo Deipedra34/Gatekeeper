@@ -18,3 +18,8 @@ Thumbs.db
 # Local overrides / secrets
 .env
 *.local.yaml
+
+# Development TLS material from scripts/gencerts — never commit keys
+/certs/
+*-key.pem
+*.key

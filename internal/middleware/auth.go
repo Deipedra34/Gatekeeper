@@ -40,12 +40,15 @@ func APIKeyAuth(cfg config.AuthConfig) Middleware {
 // Identity records how a request authenticated, for middleware further
 // down the chain (the rate limiter) to read back via IdentityFrom.
 type Identity struct {
-	// Method is config.AuthModeAPIKey or config.AuthModeJWT.
+	// Method is config.AuthModeAPIKey, config.AuthModeJWT, or
+	// config.AuthModeMTLS.
 	Method string
-	// Client is the value of the configured client id claim. JWT only.
+	// Client is the value of the configured client id claim (JWT) or
+	// certificate field (mTLS). Unset for API keys.
 	Client string
-	// Tier is the value of the configured tier claim, or "" if there's no
-	// tier claim configured or the token doesn't carry it. JWT only.
+	// Tier is the value of the configured tier claim (JWT) or the tier
+	// the certificate's CN/OU maps to (mTLS), or "" for none — the
+	// default tier. Unset for API keys.
 	Tier string
 }
 
@@ -62,13 +65,20 @@ func withIdentity(r *http.Request, id Identity) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), identityKey{}, id))
 }
 
-// Auth enforces each route's auth mode — api_key, jwt, or either — as
-// resolved by modeFor (normally the router's AuthModeFor; nil means
+// Auth enforces each route's auth mode — api_key, jwt, mtls, or either —
+// as resolved by modeFor (normally the router's AuthModeFor; nil means
 // every request is api_key). It's a no-op when auth is disabled.
 //
 // On an api_key route the behaviour, including the 401 response body, is
 // identical to APIKeyAuth. Routes that accept JWTs answer failures with a
 // generic body and a WWW-Authenticate: Bearer challenge.
+//
+// An mtls route requires a client certificate that crypto/tls verified
+// against tls.client_ca_file during the handshake; an either route
+// accepts, in order, a valid API key, a valid JWT, or such a certificate.
+// Whatever the route's mode — and even with auth disabled — a verified
+// client certificate's identity is attached to the request for later
+// middleware (see ClientCertificateFrom).
 //
 // m, if non-nil, receives one success or failure count per request; see
 // metrics.Metrics.AuthRequests for how failures are attributed. A
@@ -85,6 +95,8 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 		}
 		verifier = v
 	}
+
+	certs := newCertIdentifier(cfg.MTLS)
 
 	record := func(method string, success bool) {
 		if m == nil {
@@ -108,8 +120,22 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 		return id, true, err == nil
 	}
 
+	// tryMTLS reports whether a verified client certificate was presented,
+	// and its identity if one could be derived from it.
+	tryMTLS := func(r *http.Request) (id Identity, presented, ok bool) {
+		cert := verifiedClientCert(r)
+		if cert == nil {
+			return Identity{}, false, false
+		}
+		id, err := certs.identify(cert)
+		return id, true, err == nil
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if id, _, ok := tryMTLS(r); ok {
+				r = withClientCertificate(r, id)
+			}
 			if !cfg.Enabled {
 				next.ServeHTTP(w, r)
 				return
@@ -132,6 +158,17 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 				record(config.AuthModeJWT, true)
 				next.ServeHTTP(w, withIdentity(r, id))
 
+			case config.AuthModeMTLS:
+				id, _, ok := tryMTLS(r)
+				if !ok {
+					record(config.AuthModeMTLS, false)
+					websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
+					http.Error(w, "valid client certificate required", http.StatusUnauthorized)
+					return
+				}
+				record(config.AuthModeMTLS, true)
+				next.ServeHTTP(w, withIdentity(r, id))
+
 			case config.AuthModeEither:
 				if validAPIKey(valid, r.Header.Get(cfg.Header)) {
 					record(config.AuthModeAPIKey, true)
@@ -144,9 +181,18 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 					next.ServeHTTP(w, withIdentity(r, id))
 					return
 				}
-				if presented {
+				certID, certPresented, certOK := tryMTLS(r)
+				if certOK {
+					record(config.AuthModeMTLS, true)
+					next.ServeHTTP(w, withIdentity(r, certID))
+					return
+				}
+				switch {
+				case presented:
 					record(config.AuthModeJWT, false)
-				} else {
+				case certPresented:
+					record(config.AuthModeMTLS, false)
+				default:
 					record(config.AuthModeAPIKey, false)
 				}
 				websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
