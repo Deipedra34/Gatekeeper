@@ -1,0 +1,46 @@
+# Optional tracing add-on for the docker-compose stack: an OpenTelemetry
+# Collector that receives Gatekeeper's spans over OTLP, and Jaeger to
+# store and browse them.
+#
+# Layered on top of docker-compose.yml (and combinable with
+# docker-compose.monitoring.yml); a plain `docker-compose up` still runs
+# just the core stack, with tracing off.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.tracing.yml up --build
+#
+# Then:
+#   curl http://localhost:8080/api/ping -H "X-API-Key: demo-free-key" -i   # note X-Trace-Id
+#   open http://localhost:16686 (Jaeger UI), service "gatekeeper"
+#
+# See README.md's "Distributed tracing" section.
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    expose:
+      - "4317"
+      - "4318"
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/jaeger:2.10.0
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # Jaeger UI
+    expose:
+      - "4317"          # OTLP gRPC, fed by the collector
+
+  gatekeeper:
+    depends_on:
+      otel-collector:
+        condition: service_started
+    volumes:
+      # Same as configs/config.docker.yaml, plus a tracing section that
+      # sends spans to the collector above.
+      - ./configs/config.docker.tracing.yaml:/app/configs/config.yaml:ro

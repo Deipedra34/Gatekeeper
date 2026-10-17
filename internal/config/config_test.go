@@ -652,3 +652,55 @@ tls:
 `))
 	require.NoError(t, err, "either needs no JWT config when verified client certificates can satisfy it")
 }
+
+func TestLoad_TracingDefaultsAndValidation(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+`))
+	require.NoError(t, err)
+	assert.False(t, cfg.Tracing.Enabled, "tracing is off by default")
+	assert.Equal(t, TraceExporterOTLPGRPC, cfg.Tracing.Exporter)
+	assert.Equal(t, "gatekeeper", cfg.Tracing.ServiceName)
+	assert.Equal(t, 1.0, cfg.Tracing.EffectiveSampleRatio())
+
+	cfg, err = Load(writeConfig(t, `
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+tracing:
+  enabled: true
+  exporter: otlp_http
+  endpoint: "http://collector:4318"
+  insecure: true
+  service_name: edge
+  sample_ratio: 0
+  resource_attributes: {deployment.environment: staging}
+  response_header: X-Trace-Id
+`))
+	require.NoError(t, err)
+	assert.Equal(t, 0.0, cfg.Tracing.EffectiveSampleRatio(), "an explicit 0 is kept, not defaulted")
+	assert.Equal(t, "staging", cfg.Tracing.ResourceAttributes["deployment.environment"])
+
+	for name, block := range map[string]string{
+		"bad exporter":    "exporter: jaeger_thrift",
+		"ratio above one": "sample_ratio: 1.5",
+		"negative ratio":  "sample_ratio: -0.1",
+		"bad header name": `response_header: "X Trace"`,
+		"empty attr key":  `resource_attributes: {"": x}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, `
+routes:
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+tracing:
+  enabled: true
+  `+block+`
+`))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "tracing.")
+		})
+	}
+}

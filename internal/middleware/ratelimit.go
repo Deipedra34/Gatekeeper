@@ -9,7 +9,10 @@ import (
 
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
+	"go.opentelemetry.io/otel/trace"
+
 	"gatekeeper/internal/ratelimiter"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/websocket"
 )
 
@@ -44,7 +47,15 @@ const apiKeyHeader = "X-API-Key"
 // pass through here. The client identity resolved for a handshake is
 // recorded on it (see websocket.Handshake) so per-client connection
 // limits key on the same identity.
-func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limiter, m *metrics.Metrics) Middleware {
+//
+// When tracing is on, each check gets a rate_limit span recording the
+// decision, algorithm, store, tier, and a keyed hash of the client
+// identity — never the identity itself, which may be an API key.
+func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limiter, m *metrics.Metrics, opts ...RateLimitOption) Middleware {
+	var o rateLimitOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			client := clientKey(cfg, r)
@@ -62,12 +73,30 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 				hs.SetClient(client)
 			}
 
-			result, err := limiter.Allow(r.Context(), client)
+			ctx, span := tracing.Start(r.Context(), tracing.SpanRateLimit, trace.WithAttributes(
+				tracing.AttrRateLimitAlgorithm.String(cfg.Algorithm),
+				tracing.AttrRateLimitStore.String(o.store),
+				tracing.AttrClientTier.String(tier),
+				tracing.AttrClientIDHash.String(tracing.HashClientID(client)),
+			))
+			result, err := limiter.Allow(ctx, client)
 			if err != nil {
+				// Fail open, as before; the span says so.
+				span.SetAttributes(tracing.AttrRateLimitAllowed.Bool(true), tracing.AttrRateLimitError.Bool(true))
+				span.End()
 				log.Printf("ratelimiter: allow check failed for client %q, allowing request through: %v", client, err)
 				next.ServeHTTP(w, r)
 				return
 			}
+			span.SetAttributes(
+				tracing.AttrRateLimitAllowed.Bool(result.Allowed),
+				tracing.AttrRateLimitLimit.Int64(result.Limit),
+				tracing.AttrRateLimitRemaining.Int64(result.Remaining),
+			)
+			if !result.Allowed {
+				tracing.Fail(span, "rate limit exceeded")
+			}
+			span.End()
 
 			w.Header().Set("X-RateLimit-Limit", strconv.FormatInt(result.Limit, 10))
 			w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(result.Remaining, 10))
@@ -85,6 +114,19 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// RateLimitOption customises RateLimit.
+type RateLimitOption func(*rateLimitOptions)
+
+type rateLimitOptions struct {
+	store string
+}
+
+// WithStoreType names the storage backend ("memory" or "redis") in
+// rate_limit spans.
+func WithStoreType(store string) RateLimitOption {
+	return func(o *rateLimitOptions) { o.store = store }
 }
 
 func clientKey(cfg config.RateLimitConfig, r *http.Request) string {

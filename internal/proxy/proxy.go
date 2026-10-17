@@ -17,12 +17,17 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/circuitbreaker"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/websocket"
 )
 
@@ -230,10 +235,15 @@ func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, rt *ro
 	ctx := req.Context()
 	key := cache.Key(rt.label, rt.target.String(), req)
 
+	_, span := tracing.Start(ctx, tracing.SpanCacheLookup, trace.WithAttributes(tracing.AttrHTTPRoute.String(rt.label)))
 	entry, hit, err := r.cache.Get(ctx, key)
+	span.SetAttributes(tracing.AttrCacheHit.Bool(hit))
 	if err != nil {
+		span.SetAttributes(tracing.AttrErrorType.String("store_error"))
+		tracing.Fail(span, "cache read failed")
 		log.Printf("cache: read failed for route %s, bypassing cache: %v", rt.label, err)
 	}
+	span.End()
 	if hit {
 		r.recordCache(rt.label, true)
 		writeCachedEntry(w, entry)
@@ -438,7 +448,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// without sleeping first and without ever reaching the backend
 		// again — retrying into an already-open circuit defeats the
 		// point of having one.
-		if t.breaker != nil && !t.breaker.Allow() {
+		if t.breaker != nil && !t.checkBreaker(req.Context(), attempt) {
 			t.recordCircuitRejection()
 			return nil, errCircuitOpen
 		}
@@ -454,12 +464,22 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		attemptReq := cloneRequestWithBody(req, bodyBytes)
 		ctx, cancel := context.WithTimeout(req.Context(), t.timeout)
+		// One client span per attempt, so retries show up in the trace;
+		// the backend gets this attempt's span as its parent.
+		ctx, span := tracing.Start(ctx, tracing.SpanBackendAttempt,
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(t.attemptAttributes(req, attempt)...))
 		attemptReq = attemptReq.WithContext(ctx)
+		tracing.Inject(ctx, attemptReq.Header)
 
 		resp, rtErr = t.base.RoundTrip(attemptReq)
 		last := attempt == maxAttempts
 
 		if rtErr != nil {
+			errType := tracing.ErrorType(rtErr)
+			span.SetAttributes(tracing.AttrErrorType.String(errType))
+			tracing.Fail(span, errType)
+			span.End()
 			cancel()
 			t.reportBreaker(false)
 			if last || req.Context().Err() != nil {
@@ -469,9 +489,16 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			continue
 		}
 
+		span.SetAttributes(tracing.AttrHTTPStatus.Int(resp.StatusCode))
+		if isRetryableStatus(resp.StatusCode) {
+			span.SetAttributes(tracing.AttrErrorType.String(strconv.Itoa(resp.StatusCode)))
+			tracing.Fail(span, http.StatusText(resp.StatusCode))
+		}
+
 		if isRetryableStatus(resp.StatusCode) && !last {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
+			span.End()
 			cancel()
 			t.reportBreaker(false)
 			continue
@@ -480,8 +507,9 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// This is the response we're returning to the caller (success,
 		// a 4xx we never retry, or a 5xx after exhausting retries).
 		// ReverseProxy reads and closes resp.Body after RoundTrip
-		// returns, so the attempt's context must stay alive until then.
-		resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
+		// returns, so the attempt's context — and its span — must stay
+		// alive until then.
+		resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel, span: span}
 		t.reportBreaker(!isRetryableStatus(resp.StatusCode))
 		t.recordOutcome(resp.StatusCode < 500)
 		return resp, nil
@@ -628,10 +656,51 @@ func backoffDelay(cfg config.RetryConfig, retryNum int) time.Duration {
 type cancelOnCloseBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc
+	span   trace.Span
 }
 
 func (b *cancelOnCloseBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.cancel()
+	b.span.End()
 	return err
+}
+
+// checkBreaker asks the circuit breaker whether attempt may proceed,
+// recording the decision in a circuit_breaker.check span.
+func (t *retryTransport) checkBreaker(ctx context.Context, attempt int) bool {
+	_, span := tracing.Start(ctx, tracing.SpanCircuitBreaker, trace.WithAttributes(
+		tracing.AttrHTTPRoute.String(t.route),
+		tracing.AttrAttempt.Int(attempt),
+	))
+	defer span.End()
+	allowed, state := t.breaker.AllowState()
+	span.SetAttributes(tracing.AttrBreakerState.String(state.String()), tracing.AttrBreakerAllowed.Bool(allowed))
+	if !allowed {
+		tracing.Fail(span, "circuit open")
+	}
+	return allowed
+}
+
+// attemptAttributes are the backend.attempt span's attributes: where the
+// attempt goes (scheme, host, port — never the path or query) and which
+// attempt it is.
+func (t *retryTransport) attemptAttributes(req *http.Request, attempt int) []attribute.KeyValue {
+	port := req.URL.Port()
+	if port == "" {
+		port = "80"
+		if req.URL.Scheme == "https" {
+			port = "443"
+		}
+	}
+	portNum, _ := strconv.Atoi(port)
+	return []attribute.KeyValue{
+		tracing.AttrHTTPRoute.String(t.route),
+		tracing.AttrHTTPMethod.String(tracing.Method(req.Method)),
+		tracing.AttrURLScheme.String(req.URL.Scheme),
+		tracing.AttrServerAddress.String(req.URL.Hostname()),
+		tracing.AttrServerPort.Int(portNum),
+		tracing.AttrAttempt.Int(attempt),
+		tracing.AttrRetry.Bool(attempt > 1),
+	}
 }

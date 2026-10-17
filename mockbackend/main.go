@@ -42,22 +42,33 @@ func main() {
 
 // handle echoes back the request it received as JSON, so callers can see
 // that Gatekeeper actually reached this service (method, path, and the
-// headers Gatekeeper forwarded).
+// headers Gatekeeper forwarded). The W3C trace context Gatekeeper
+// propagated is also pulled out into its own fields and logged, so it's
+// easy to match a request to its trace.
 func handle(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
-		Message   string      `json:"message"`
-		Method    string      `json:"method"`
-		Path      string      `json:"path"`
-		Host      string      `json:"host"`
-		Headers   http.Header `json:"headers"`
-		Timestamp string      `json:"timestamp"`
+		Message     string      `json:"message"`
+		Method      string      `json:"method"`
+		Path        string      `json:"path"`
+		Host        string      `json:"host"`
+		Traceparent string      `json:"traceparent,omitempty"`
+		Tracestate  string      `json:"tracestate,omitempty"`
+		Baggage     string      `json:"baggage,omitempty"`
+		Headers     http.Header `json:"headers"`
+		Timestamp   string      `json:"timestamp"`
 	}{
-		Message:   "hello from mock-backend",
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Host:      r.Host,
-		Headers:   r.Header,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Message:     "hello from mock-backend",
+		Method:      r.Method,
+		Path:        r.URL.Path,
+		Host:        r.Host,
+		Traceparent: r.Header.Get("Traceparent"),
+		Tracestate:  r.Header.Get("Tracestate"),
+		Baggage:     r.Header.Get("Baggage"),
+		Headers:     r.Header,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if resp.Traceparent != "" {
+		log.Printf("mock-backend: %s %s traceparent=%s", r.Method, r.URL.Path, resp.Traceparent)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

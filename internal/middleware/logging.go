@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // statusRecorder wraps a ResponseWriter to capture the status code
@@ -32,9 +34,10 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // RequestLogger logs one line per request: method, path, status,
-// duration, and remote address. A proxied WebSocket connection is logged
-// once it closes, as status 101 with the connection's whole lifetime as
-// its duration.
+// duration, and remote address — plus trace_id=<id> when the request is
+// being traced, so a log line leads straight to its trace. A proxied
+// WebSocket connection is logged once it closes, as status 101 with the
+// connection's whole lifetime as its duration.
 func RequestLogger(logger *log.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -43,6 +46,11 @@ func RequestLogger(logger *log.Logger) Middleware {
 
 			next.ServeHTTP(rec, r)
 
+			if sc := trace.SpanContextFromContext(r.Context()); sc.HasTraceID() {
+				logger.Printf("%s %s %d %s %s trace_id=%s",
+					r.Method, r.URL.Path, rec.status, time.Since(start), r.RemoteAddr, sc.TraceID())
+				return
+			}
 			logger.Printf("%s %s %d %s %s",
 				r.Method, r.URL.Path, rec.status, time.Since(start), r.RemoteAddr)
 		})

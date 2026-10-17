@@ -8,11 +8,14 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"reflect"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
@@ -21,6 +24,7 @@ import (
 	"gatekeeper/internal/proxy"
 	"gatekeeper/internal/ratelimiter"
 	"gatekeeper/internal/ratelimiter/store"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/websocket"
 )
 
@@ -47,14 +51,36 @@ type Gateway struct {
 	reloadMu sync.Mutex // serialises Reload against itself
 	pipeline atomic.Pointer[http.Handler]
 	current  atomic.Pointer[config.Config]
+
+	// tracer is the tracing pipeline the current request pipeline uses.
+	// It's rebuilt on Reload only when the tracing section changed.
+	tracer      atomic.Pointer[tracing.Provider]
+	tracingOpts []tracing.Option
+
+	retiringMu sync.Mutex
+	retiring   map[*tracing.Provider]*time.Timer
 }
+
+// Option customises a Gateway.
+type Option func(*Gateway)
+
+// WithTracingOptions passes options to every tracing provider the
+// gateway builds — used by tests to attach an in-memory span recorder.
+func WithTracingOptions(opts ...tracing.Option) Option {
+	return func(g *Gateway) { g.tracingOpts = append(g.tracingOpts, opts...) }
+}
+
+// retireDelay is how long a tracing provider replaced by a reload keeps
+// running, so requests already in flight on the old pipeline can still
+// finish and export their spans.
+const retireDelay = 15 * time.Second
 
 // New builds a Gateway serving cfg, which must already have been loaded
 // (and validated) from configPath. The store and metrics collectors are
 // created once by the caller and reused across every reload — only the
 // config-derived pieces (router, limiters, middleware chain) are rebuilt
 // when Reload runs.
-func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metrics, logger *log.Logger) (*Gateway, error) {
+func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metrics, logger *log.Logger, opts ...Option) (*Gateway, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
@@ -65,13 +91,23 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		logger:     logger,
 		configPath: configPath,
 		wsHub:      websocket.NewHub(m),
+		retiring:   map[*tracing.Provider]*time.Timer{},
 	}
-	h, err := g.build(cfg)
+	for _, opt := range opts {
+		opt(g)
+	}
+	tp, err := g.newTracer(cfg)
 	if err != nil {
+		return nil, err
+	}
+	h, err := g.build(cfg, tp)
+	if err != nil {
+		_ = tp.Shutdown(context.Background())
 		return nil, err
 	}
 	g.pipeline.Store(&h)
 	g.current.Store(cfg)
+	g.tracer.Store(tp)
 	return g, nil
 }
 
@@ -109,19 +145,83 @@ func (g *Gateway) Reload() error {
 	if err != nil {
 		return err
 	}
-	h, err := g.build(cfg)
+
+	old := g.tracer.Load()
+	tp := old
+	if !reflect.DeepEqual(cfg.Tracing, old.Config()) {
+		if tp, err = g.newTracer(cfg); err != nil {
+			return err
+		}
+	}
+	h, err := g.build(cfg, tp)
 	if err != nil {
+		if tp != old {
+			_ = tp.Shutdown(context.Background())
+		}
 		return err
 	}
 	g.pipeline.Store(&h)
 	g.current.Store(cfg)
+	g.tracer.Store(tp)
+	if tp != old {
+		g.retire(old)
+	}
 	return nil
+}
+
+// ShutdownTracing flushes buffered spans and stops every tracing
+// provider (including any a reload replaced and is about to retire),
+// waiting at most until ctx is done. Call it after the HTTP server has
+// drained, so the last requests' spans are exported too.
+func (g *Gateway) ShutdownTracing(ctx context.Context) error {
+	g.retiringMu.Lock()
+	providers := []*tracing.Provider{g.tracer.Load()}
+	for p, timer := range g.retiring {
+		timer.Stop()
+		providers = append(providers, p)
+	}
+	g.retiring = map[*tracing.Provider]*time.Timer{}
+	g.retiringMu.Unlock()
+
+	var errs []error
+	for _, p := range providers {
+		errs = append(errs, p.Shutdown(ctx))
+	}
+	return errors.Join(errs...)
+}
+
+func (g *Gateway) newTracer(cfg *config.Config) (*tracing.Provider, error) {
+	tp, err := tracing.New(context.Background(), cfg.Tracing, g.logger, g.tracingOpts...)
+	if err != nil {
+		return nil, err
+	}
+	if tp.Enabled() {
+		g.logger.Printf("tracing: enabled (%s)", tp.Description())
+	}
+	return tp, nil
+}
+
+// retire shuts p down after retireDelay.
+func (g *Gateway) retire(p *tracing.Provider) {
+	if !p.Enabled() {
+		return
+	}
+	g.retiringMu.Lock()
+	defer g.retiringMu.Unlock()
+	g.retiring[p] = time.AfterFunc(retireDelay, func() {
+		g.retiringMu.Lock()
+		delete(g.retiring, p)
+		g.retiringMu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	})
 }
 
 // build assembles the reverse proxy and middleware chain for cfg. It
 // touches nothing on g, so a failure part-way through leaves the active
 // pipeline untouched.
-func (g *Gateway) build(cfg *config.Config) (http.Handler, error) {
+func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider) (http.Handler, error) {
 	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache, proxy.WithWebSocketHub(g.wsHub))
 	if err != nil {
 		return nil, err
@@ -145,8 +245,11 @@ func (g *Gateway) build(cfg *config.Config) (http.Handler, error) {
 		middleware.WebSocketHandshake(router.RouteLabelFor),
 		middleware.CORS(cfg.CORS),
 		auth,
-		middleware.RateLimit(cfg.RateLimit, limiters, g.metrics),
+		middleware.RateLimit(cfg.RateLimit, limiters, g.metrics, middleware.WithStoreType(cfg.Storage.Backend)),
 	)
+	// Outermost, so the server span covers the whole request and every
+	// stage below can start its span from it. A no-op when disabled.
+	h = tp.Handler(h, router.RouteLabelFor)
 	return h, nil
 }
 

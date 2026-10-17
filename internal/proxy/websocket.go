@@ -15,7 +15,10 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/websocket"
 )
 
@@ -71,9 +74,26 @@ func (s wsSettings) originAllowed(origin string) bool {
 // handshake outcome only (a dial failure, timeout, or 5xx counts as a
 // failure); how long the connection then lives, and how it ends, never
 // reaches it.
+//
+// With tracing on, the upgrade gets a websocket.handshake span (policy
+// checks, backend dial, and the 101) and, once established, a
+// websocket.connection span lasting until the tunnel closes.
 func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *route) {
+	hsCtx, hsSpan := tracing.Start(req.Context(), tracing.SpanWebSocketHandshake,
+		trace.WithAttributes(tracing.AttrHTTPRoute.String(rt.label)))
+	hsEnded := false
+	endHandshake := func() {
+		if !hsEnded {
+			hsSpan.End()
+			hsEnded = true
+		}
+	}
+	defer endHandshake()
+
 	reject := func(reason string, status int, msg string) {
 		websocket.RecordRejection(r.metrics, rt.label, reason)
+		hsSpan.SetAttributes(tracing.AttrWSRejectReason.String(reason), tracing.AttrHTTPStatus.Int(status))
+		tracing.Fail(hsSpan, "websocket handshake rejected: "+reason)
 		http.Error(w, msg, status)
 	}
 
@@ -109,7 +129,7 @@ func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *ro
 		return
 	}
 
-	backendConn, backendReader, resp, err := dialBackendWebSocket(req, rt)
+	backendConn, backendReader, resp, err := dialBackendWebSocket(hsCtx, req, rt)
 	if err != nil {
 		r.recordHandshake(rt, false)
 		log.Printf("proxy: websocket backend %s unreachable for %s: %v", rt.target, req.URL.Path, err)
@@ -122,6 +142,8 @@ func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *ro
 		// a 5xx says anything about the backend's health.
 		r.recordHandshake(rt, resp.StatusCode < 500)
 		websocket.RecordRejection(r.metrics, rt.label, websocket.RejectBackend)
+		hsSpan.SetAttributes(tracing.AttrWSRejectReason.String(websocket.RejectBackend), tracing.AttrHTTPStatus.Int(resp.StatusCode))
+		tracing.Fail(hsSpan, "backend refused the upgrade")
 		forwardResponse(w, resp)
 		_ = backendConn.Close()
 		return
@@ -139,6 +161,7 @@ func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *ro
 	if err != nil {
 		_ = backendConn.Close()
 		log.Printf("proxy: websocket upgrade for %s: cannot hijack client connection: %v", req.URL.Path, err)
+		tracing.Fail(hsSpan, "cannot hijack client connection")
 		http.Error(w, "websocket upgrade not supported", http.StatusInternalServerError)
 		return
 	}
@@ -147,16 +170,23 @@ func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *ro
 	_ = clientConn.SetDeadline(time.Time{})
 
 	if err := writeSwitchingProtocols(clientBuf.Writer, w.Header(), resp.Header); err != nil {
+		tracing.Fail(hsSpan, "writing 101 to client failed")
 		_ = clientConn.Close()
 		_ = backendConn.Close()
 		return
 	}
+	hsSpan.SetAttributes(tracing.AttrHTTPStatus.Int(http.StatusSwitchingProtocols))
+	endHandshake()
 
-	r.hub.Serve(slot,
+	_, connSpan := tracing.Start(req.Context(), tracing.SpanWebSocketConnection,
+		trace.WithAttributes(tracing.AttrHTTPRoute.String(rt.label)))
+	reason := r.hub.Serve(slot,
 		websocket.Endpoint{Conn: clientConn, Reader: clientBuf.Reader},
 		websocket.Endpoint{Conn: backendConn, Reader: backendReader},
 		rt.ws.idleTimeout,
 	)
+	connSpan.SetAttributes(tracing.AttrWSCloseReason.String(reason))
+	connSpan.End()
 }
 
 // recordHandshake reports a backend handshake outcome to the circuit
@@ -196,8 +226,10 @@ func wsClientKey(req *http.Request) string {
 // frame bytes sent right after the 101, and the backend's response.
 // For a 101 the connection's deadlines are cleared; for anything else
 // the handshake deadline is left in place to bound reading the body.
-func dialBackendWebSocket(req *http.Request, rt *route) (net.Conn, *bufio.Reader, *http.Response, error) {
-	ctx := req.Context()
+//
+// ctx carries the handshake span, whose trace context is sent to the
+// backend in the upgrade request.
+func dialBackendWebSocket(ctx context.Context, req *http.Request, rt *route) (net.Conn, *bufio.Reader, *http.Response, error) {
 	if rt.handshakeTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, rt.handshakeTimeout)
@@ -215,6 +247,7 @@ func dialBackendWebSocket(req *http.Request, rt *route) (net.Conn, *bufio.Reader
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
 
 	out := outgoingUpgradeRequest(req, rt.target)
+	tracing.Inject(ctx, out.Header)
 	if err := out.Write(conn); err != nil {
 		stop()
 		_ = conn.Close()

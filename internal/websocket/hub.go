@@ -110,9 +110,9 @@ func (s *Slot) Release() {
 
 // Serve relays frames between client and backend until the connection
 // closes, then releases slot and closes both connections. It blocks for
-// the lifetime of the connection. idleTimeout <= 0 disables the idle
-// timeout.
-func (h *Hub) Serve(slot *Slot, client, backend Endpoint, idleTimeout time.Duration) {
+// the lifetime of the connection and returns why it closed (one of the
+// CloseReason* values). idleTimeout <= 0 disables the idle timeout.
+func (h *Hub) Serve(slot *Slot, client, backend Endpoint, idleTimeout time.Duration) string {
 	defer slot.Release()
 
 	t := newTunnel(slot.route, client, backend, idleTimeout)
@@ -150,6 +150,7 @@ func (h *Hub) Serve(slot *Slot, client, backend Endpoint, idleTimeout time.Durat
 		h.drainedOnce.Do(func() { close(h.drained) })
 	}
 	h.mu.Unlock()
+	return reason
 }
 
 // Active returns the number of currently open connections.

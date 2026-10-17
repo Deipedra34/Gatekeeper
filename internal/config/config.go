@@ -42,6 +42,7 @@ type Config struct {
 	Metrics   MetricsConfig   `yaml:"metrics"`
 	Proxy     ProxyConfig     `yaml:"proxy"`
 	TLS       TLSConfig       `yaml:"tls"`
+	Tracing   TracingConfig   `yaml:"tracing"`
 }
 
 // ServerConfig controls the HTTP listener Gatekeeper itself exposes.
@@ -435,6 +436,7 @@ func (c *Config) applyDefaults() {
 	}
 	c.Auth.MTLS.applyDefaults()
 	c.TLS.applyDefaults()
+	c.Tracing.applyDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -579,6 +581,9 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.TLS.validate(c.Server.ListenAddr); err != nil {
+		return err
+	}
+	if err := c.Tracing.validate(); err != nil {
 		return err
 	}
 

@@ -24,6 +24,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **A circuit breaker around every backend call.** Closed / Open / Half-Open, configurable per route, so a struggling backend gets a break from traffic instead of every request queuing up behind retries and timeouts.
 - **WebSocket proxying.** `Upgrade: websocket` requests are routed like any other request and pass through CORS, auth, and the rate limiter (one token per connection attempt). After that, frames are relayed transparently in both directions. Per-route idle timeouts, connection caps per route and per client, `Origin` allow-lists, metrics, and graceful close on shutdown are all included.
 - **TLS and mTLS.** An optional HTTPS listener with TLS 1.2+ by default, hot-reloaded certificates (on `SIGHUP` or file change), client certificate verification, an `mtls` route auth mode with certificate-based client identity and tiers, HSTS, an HTTP→HTTPS redirect, and TLS / mTLS to backends.
+- **Distributed tracing.** Optional OpenTelemetry traces with a span per pipeline stage and per backend attempt (retries are visible), W3C `traceparent` / `baggage` propagation in and out, OTLP gRPC/HTTP export, parent-based sampling, trace IDs in log lines and an optional response header. Secrets never reach spans, and a dead collector never slows a request.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
@@ -77,6 +78,7 @@ internal/proxy/        the reverse-proxy router (path prefix / hostname matching
 internal/cache/        the response cache: key derivation, Cache-Control handling, Store-backed get/set
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
 internal/server/       the listeners: plain HTTP or HTTPS (mTLS, certificate hot reload, HSTS), plus the HTTP→HTTPS redirect
+internal/tracing/      OpenTelemetry setup (exporters, sampling, OTEL_* overrides), the server span, and span/propagation helpers
 internal/certgen/      throwaway CA / server / client certificate generation for tests and scripts/gencerts
 internal/websocket/    WebSocket upgrade detection, the frame relay, and the hub tracking open connections (limits, idle timeout, shutdown)
   └─ wstest/           a minimal WebSocket client/server used by tests and scripts/wsclient
@@ -85,6 +87,7 @@ internal/metrics/      Prometheus collectors + /metrics handler
 configs/                example config.yaml
 scripts/loadtest/      goroutine-based load generator (see "Load testing" below)
 scripts/wsclient/      tiny WebSocket client for trying out WebSocket proxying
+observability/         OpenTelemetry Collector config for docker-compose.tracing.yml
 scripts/gencerts/      writes a development CA plus server and client certificates (see "TLS and mTLS")
 ```
 
@@ -483,6 +486,126 @@ curl --cacert certs/ca.pem --cert certs/client.pem --key certs/client-key.pem ht
 curl -i http://localhost:8080/api/ping     # 308 Permanent Redirect -> https://localhost:8443/api/ping
 ```
 
+## Distributed tracing
+
+Gatekeeper can produce an [OpenTelemetry](https://opentelemetry.io/) trace for every request. Each trace has a span for each stage of the pipeline and one span per backend attempt, so retries are visible. Trace context is propagated to backends with the W3C `traceparent` / `tracestate` / `baggage` headers, so a trace started by your client continues through the gateway into your services. Traces are exported over OTLP to any OpenTelemetry Collector or compatible backend: Jaeger, Grafana Tempo, Honeycomb, and so on. See [ADR 5](docs/adr/0005-opentelemetry-otlp-tracing.md) for why.
+
+Tracing is **off by default**. With it off, no spans are created, nothing is exported, and incoming `traceparent` / `tracestate` / `baggage` headers are forwarded to backends untouched, exactly as before.
+
+### Tracing configuration
+
+```yaml
+tracing:
+  enabled: true
+  exporter: otlp_grpc                  # otlp_grpc (default) | otlp_http | stdout
+  endpoint: "otel-collector:4317"      # host:port or URL; default localhost:4317 (gRPC) / localhost:4318 (HTTP)
+  insecure: true                       # plaintext, for a local collector
+  service_name: gatekeeper             # default "gatekeeper"
+  sample_ratio: 1.0                    # fraction of NEW traces recorded (default 1.0)
+  resource_attributes:                 # optional
+    deployment.environment: production
+    service.version: "2.3.0"
+  response_header: X-Trace-Id          # optional: return the trace ID to clients (default off)
+```
+
+- **Sampling is parent-based.** `sample_ratio` decides only for requests that arrive without a `traceparent`. A request whose caller already decided (the sampled flag in its `traceparent`) follows that decision, so a trace is never recorded in some services and not others. An unsampled request is still propagated, with the sampled flag cleared, so the trace ID still links your logs.
+- **`stdout`** pretty-prints each span to standard output. Use it to check that instrumentation works without running a collector.
+- **`SIGHUP`** picks up changes to the `tracing` section: a new exporter, endpoint, sample ratio, or switching tracing on or off. The old pipeline keeps running for 15 seconds so requests already in flight can still export their spans.
+- **Shutdown flushes buffered spans.** On `SIGINT` / `SIGTERM`, once the listener has drained, buffered spans are flushed to the collector, for at most 5 seconds.
+
+**Standard `OTEL_*` environment variables override the file**, as OpenTelemetry users expect:
+
+| Variable | Effect |
+|---|---|
+| `OTEL_SDK_DISABLED=true`, `OTEL_TRACES_EXPORTER=none` | Tracing off, whatever the file says |
+| `OTEL_TRACES_EXPORTER=console` / `otlp` | stdout / OTLP exporter |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `grpc` or `http/protobuf` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Collector endpoint (replaces `endpoint`) |
+| `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Transport security, auth headers (e.g. vendor API keys), timeout |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | Resource attributes (replace `service_name` / `resource_attributes`) |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampler (replaces `sample_ratio`) |
+| `OTEL_BSP_*` | Batch processor queue size, batch size, delays |
+
+The environment variables only override settings. Tracing is switched *on* in the config file.
+
+### Span structure
+
+A request on `/api/users` whose first backend attempt gets a `503` and whose retry succeeds:
+
+```
+GET /api/users                    server  http.route=/api/users  http.response.status_code=200
+├── auth                                  gatekeeper.auth.mode=api_key  gatekeeper.auth.result=success
+├── rate_limit                            gatekeeper.ratelimit.allowed=true  .algorithm=token_bucket  .store=redis
+│                                         gatekeeper.client.tier=free  gatekeeper.client.id_hash=3f9a1c0e5b7d2a64
+├── cache.lookup                          gatekeeper.cache.hit=false
+├── circuit_breaker.check                 gatekeeper.circuit_breaker.state=closed  .allowed=true
+├── backend.attempt               client  gatekeeper.backend.attempt=1  http.response.status_code=503  ERROR
+├── circuit_breaker.check                 gatekeeper.circuit_breaker.state=closed  .allowed=true
+└── backend.attempt               client  gatekeeper.backend.attempt=2  .retry=true  http.response.status_code=200
+    └── (your backend's spans — its traceparent names this attempt as the parent)
+```
+
+- **The server span** is named `<METHOD> <route>`, using the matched route's prefix (or host), or `unmatched`. Its status is set to error only for `5xx` responses, following the HTTP semantic conventions. A `401` or `429` is the client's problem, not the gateway's.
+- **The stage spans are siblings** under the server span, and each covers only its own stage.
+  - A stage that rejects the request is marked `ERROR` with a fixed description: `auth` says `unauthorized`, and `rate_limit` says `rate limit exceeded`. No later stage span appears.
+  - A cache hit has no `circuit_breaker.check` or `backend.attempt` spans at all.
+- **Every attempt is its own `backend.attempt` client span**, and each is propagated to the backend with *its own* span as the parent.
+  - It records the route, method, scheme, backend host and port, attempt number, and status.
+  - A transport failure is recorded as a classified `error.type`: `timeout`, `connection_refused`, `tls`, `dns`, `connection_closed`, `canceled`, or `other`.
+  - A circuit breaker that is open fails `circuit_breaker.check` and no attempt is made.
+- **WebSocket upgrades** get a `websocket.handshake` span (policy checks, backend dial, `101`) and a `websocket.connection` span from the `101` until the tunnel closes. The connection span's `gatekeeper.websocket.close_reason` is `client`, `backend`, `idle_timeout`, or `shutdown`. The backend's upgrade request carries the handshake span's `traceparent`.
+
+### Privacy and safety guarantees
+
+- **Only an explicit allow-list of attributes is recorded.** That's method, route, scheme, protocol version, status codes, backend host and port, the stage outcomes shown above, the client tier, and a **keyed hash of the client identity**.
+- **The client identity is hashed.** The identity can be an API key, so only `gatekeeper.client.id_hash` is recorded: an HMAC-SHA256 with a random per-process key, truncated to 16 hex characters. It correlates one client's requests within a running gateway but can't be reversed by guessing keys offline.
+- **No headers are recorded.** That covers `Authorization`, `X-API-Key`, `Cookie`, and every other header, including the user agent.
+- **No JWTs, request or response bodies, URL paths, or query strings are recorded.** Paths are left out because they often carry IDs.
+- **Raw error messages are never recorded.** They can embed the full URL, query string included, so failures are classified into fixed `error.type` values instead.
+- **Non-standard HTTP methods are recorded as `_OTHER`**, so a client can't inject arbitrary text through the method.
+- A test sends a JWT, an API key, cookies, a query-string token, and a body through every path, including a failing backend, and asserts none of them appear anywhere in any span.
+
+**Tracing is fail-open.**
+- Ending a span is an in-memory enqueue. A batch processor exports in the background from a bounded queue, and when the queue is full it drops spans instead of blocking.
+- Creating the exporter never contacts the collector. An unreachable or slow collector therefore can't delay startup, delay requests, or fail them.
+- Export retries give up after 15 seconds.
+- Export errors are logged at most once every 30 seconds, with a count of the errors held back.
+- A test runs 300 requests against an unreachable collector over both OTLP protocols and checks that none of them is slowed down.
+
+### Correlating traces, logs, and metrics
+
+- **Logs:** every request log line ends with `trace_id=<32 hex chars>` when tracing is on. Without tracing, the line is unchanged.
+- **Clients:** with `tracing.response_header: X-Trace-Id`, every response, including `401` and `429`, carries its trace ID, which is useful in bug reports.
+- **Metrics:** Prometheus exemplars aren't attached. Go from a dashboard panel to a trace by searching Jaeger/Tempo by `http.route` / `http.response.status_code`, or by a trace ID from the logs. See [`grafana/README.md`](grafana/README.md#optional-traces-in-grafana-jaeger-or-tempo).
+
+### Running Jaeger locally
+
+[`docker-compose.tracing.yml`](docker-compose.tracing.yml) is an opt-in add-on. It starts an OpenTelemetry Collector (config in [`observability/otel-collector.yaml`](observability/otel-collector.yaml)) and Jaeger, and runs Gatekeeper with [`configs/config.docker.tracing.yaml`](configs/config.docker.tracing.yaml). That config is the compose config plus a `tracing` section pointing at the collector, with `X-Trace-Id` responses turned on. The plain `docker-compose up` is unchanged.
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.tracing.yml up --build
+# add -f docker-compose.monitoring.yml to run Prometheus + Grafana as well
+```
+
+Join an existing trace by sending your own `traceparent`, here with trace ID `4bf92f3577b34da6a3ce929d0e0e4736`:
+
+```bash
+curl -i http://localhost:8080/api/ping \
+  -H "X-API-Key: demo-free-key" \
+  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+```
+
+```
+HTTP/1.1 200 OK
+X-Trace-Id: 4bf92f3577b34da6a3ce929d0e0e4736
+...
+{"message":"hello from mock-backend", ..., "traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-<attempt span id>-01", ...}
+```
+
+The response's `X-Trace-Id` matches the trace you sent, and the mock backend echoes the `traceparent` it received. It has the same trace ID and the gateway's `backend.attempt` span as its parent. Open the Jaeger UI at <http://localhost:16686>, paste `4bf92f3577b34da6a3ce929d0e0e4736` into the trace ID search box at the top (or go straight to `http://localhost:16686/trace/4bf92f3577b34da6a3ce929d0e0e4736`), and you'll see the span tree above. To browse instead, choose service **gatekeeper** and filter by tag, for example `http.response.status_code=429`. Leave the `traceparent` header out to have Gatekeeper start a fresh trace; the `X-Trace-Id` response header tells you which one.
+
+Running without Docker works the same way: run any OTLP collector, or set `exporter: stdout` to print spans to the gateway's own output.
+
 ## JWT authentication
 
 Besides API keys, Gatekeeper can authenticate requests with a JSON Web Token sent as `Authorization: Bearer <token>`. Which credential a route requires is set per route, so API key clients and JWT clients can share one gateway.
@@ -667,7 +790,8 @@ gatekeeper: config reload failed, keeping previous config: config: invalid: rate
 startup — changing the listen address, the storage backend, the metrics
 path, or TLS settings still requires a restart. The one exception is the
 TLS certificate itself: `SIGHUP` also reloads the server certificate and
-key (see [Certificate hot reload](#certificate-hot-reload)).
+key (see [Certificate hot reload](#certificate-hot-reload)). The `tracing`
+section is reloaded too (see [Distributed tracing](#distributed-tracing)).
 
 ## Run with Docker
 
@@ -713,7 +837,7 @@ Start everything with:
 docker-compose up --build
 ```
 
-To run the same stack over HTTPS with mTLS, add the opt-in [`docker-compose.tls.yml`](docker-compose.tls.yml) override; see [TLS and mTLS](#tls-and-mtls).
+To view traces in Jaeger, add the opt-in [`docker-compose.tracing.yml`](docker-compose.tracing.yml) override; see [Running Jaeger locally](#running-jaeger-locally). To run the same stack over HTTPS with mTLS, add the opt-in [`docker-compose.tls.yml`](docker-compose.tls.yml) override; see [TLS and mTLS](#tls-and-mtls).
 
 Only `gatekeeper` publishes a port to the host — `8080`, matching `server.listen_addr`. `redis` and `mock-backend` are reachable from `gatekeeper` on the compose network but not from the host.
 
@@ -862,6 +986,18 @@ What's covered:
   - The `mtls` and `either` auth modes, with unverified certificates never trusted, and `cn` / `san_dns` / `serial` identity extraction with CN/OU tier mapping driving rate limits, end to end through the real gateway.
   - Backend TLS: a custom CA, a `server_name` override, mTLS to the backend, `insecure_skip_verify`, retries over TLS, and `wss` with backend mTLS.
   - Contradictory TLS config rejected, and every shipped config file loading cleanly.
+- Distributed tracing (`internal/gateway/tracing_test.go`, `internal/tracing`), using OpenTelemetry's in-memory span recorder against the real pipeline:
+  - The expected span tree for a normal request, and cache hit vs miss attributes.
+  - One `backend.attempt` span per retry, each propagated with its own span as the backend's parent.
+  - Attributes and status for unauthorized and rate-limited requests.
+  - An incoming `traceparent` joined (with `tracestate` and baggage) and propagated, including to an HTTPS backend and over a WebSocket upgrade.
+  - Secrets never appearing in any span, and transport errors classified instead of quoted.
+  - Sampling: ratio 0 / 0.5 / 1, and parent-based decisions both ways.
+  - Tracing disabled producing no spans and changing nothing on the wire.
+  - The `X-Trace-Id` response header and `trace_id` in log lines.
+  - An unreachable OTLP collector (gRPC and HTTP) not slowing requests or hanging shutdown.
+  - `SIGHUP` turning tracing on and off.
+  - `OTEL_*` overrides, and the rate-limited exporter error log.
 - A full end-to-end test (`TestGateway_EndToEnd`) that wires config → storage → limiters → the whole middleware chain → the proxy, then drives it through auth, CORS, per-tier rate limiting, and routing together, not in isolation.
 
 ## Load testing
@@ -957,6 +1093,7 @@ cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow
 routes:      [ { path_prefix | host, target, auth_mode: api_key|jwt|mtls|either, backend_tls: { enabled, ca_file, client_cert_file, client_key_file, server_name, insecure_skip_verify }, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen }, websocket, ws_idle_timeout, ws_max_connections, ws_max_connections_per_client, ws_allowed_origins: [...] } ]
 metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
+tracing:     { enabled, exporter: otlp_grpc|otlp_http|stdout, endpoint, insecure, service_name, sample_ratio, resource_attributes: {...}, response_header }
 tls:         { enabled, cert_file, key_file, min_version: "1.2"|"1.3", cipher_suites: [...], client_auth: none|request|require|verify_if_given|require_and_verify, client_ca_file, reload_interval, redirect_http_port, hsts: { enabled, max_age, include_subdomains, preload } }
 ```
 

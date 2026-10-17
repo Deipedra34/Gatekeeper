@@ -1,0 +1,88 @@
+# Gatekeeper configuration for the docker-compose stack with distributed
+# tracing turned on. Used by docker-compose.tracing.yml, which mounts it
+# over /app/configs/config.yaml. It's configs/config.docker.yaml plus the
+# tracing section at the bottom, which sends spans to the "otel-collector"
+# service. See README.md's "Distributed tracing" section.
+#
+# --- copied from config.docker.yaml ---
+
+server:
+  listen_addr: ":8080"
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 60s
+
+storage:
+  backend: redis
+  redis:
+    addr: "redis:6379"
+    password: ""
+    db: 0
+    dial_timeout: 2s
+
+rate_limit:
+  algorithm: token_bucket
+  scope: api_key
+  header_name: "X-Client-ID"
+
+  tiers:
+    default:
+      requests_per_second: 2
+      burst: 5
+    free:
+      requests_per_second: 5
+      burst: 10
+    premium:
+      requests_per_second: 50
+      burst: 100
+
+  clients:
+    "demo-free-key": free
+    "demo-premium-key": premium
+
+auth:
+  enabled: true
+  header: "X-API-Key"
+  api_keys:
+    - "demo-free-key"
+    - "demo-premium-key"
+
+cors:
+  enabled: true
+  allowed_origins: ["*"]
+  allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+  allowed_headers: ["Content-Type", "Authorization", "X-API-Key"]
+  allow_credentials: false
+  max_age: 300
+
+# Everything proxies to the mock-backend service, reachable by its
+# compose service name on the port it listens on (see mockbackend/).
+routes:
+  # WebSocket echo endpoint on the mock backend (/ws/echo). Try it with
+  # `websocat -H "X-API-Key: demo-free-key" ws://localhost:8080/ws/echo`.
+  - path_prefix: "/ws"
+    target: "http://mock-backend:9000"
+    ws_idle_timeout: 5m
+    ws_max_connections: 1000
+    ws_max_connections_per_client: 10
+  - path_prefix: "/api/users"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/api/orders"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/"
+    target: "http://mock-backend:9000"
+
+metrics:
+  enabled: true
+  path: "/metrics"
+
+tracing:
+  enabled: true
+  exporter: otlp_grpc
+  endpoint: "otel-collector:4317"
+  insecure: true                 # plaintext inside the compose network
+  service_name: gatekeeper
+  sample_ratio: 1.0              # record every trace locally
+  resource_attributes:
+    deployment.environment: local
+  response_header: X-Trace-Id    # so curl -i shows which trace to look up

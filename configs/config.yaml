@@ -259,3 +259,27 @@ tls:
   #   max_age: 31536000       # seconds (default: one year)
   #   include_subdomains: false
   #   preload: false
+
+# OpenTelemetry distributed tracing. Off by default; with it off no spans
+# are created and incoming traceparent/tracestate/baggage headers are
+# forwarded to backends untouched, exactly as before. Standard OTEL_*
+# environment variables (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME,
+# OTEL_TRACES_SAMPLER, ...) override these settings. Reloaded on SIGHUP.
+# See README.md's "Distributed tracing" section.
+tracing:
+  enabled: false
+  # otlp_grpc (default), otlp_http, or stdout (prints spans; local debugging).
+  # exporter: otlp_grpc
+  # host:port or URL; defaults to localhost:4317 (gRPC) / localhost:4318 (HTTP).
+  # endpoint: "localhost:4317"
+  # Plaintext, for a local collector.
+  # insecure: true
+  # service_name: gatekeeper
+  # Fraction of new traces recorded (default 1.0). Parent-based: a request
+  # whose traceparent says sampled / not sampled follows its caller.
+  # sample_ratio: 1.0
+  # resource_attributes:
+  #   deployment.environment: production
+  #   service.version: "2.3.0"
+  # Return each request's trace ID in this response header (default: off).
+  # response_header: X-Trace-Id

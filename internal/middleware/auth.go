@@ -5,8 +5,11 @@ import (
 	"crypto/subtle"
 	"net/http"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/websocket"
 )
 
@@ -131,6 +134,54 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 		return id, true, err == nil
 	}
 
+	// decide authenticates r against mode. method is what the decision is
+	// attributed to in metrics and traces: the credential that succeeded,
+	// or — on failure — the one that was tried (see AuthRequests).
+	decide := func(mode string, r *http.Request) authOutcome {
+		switch mode {
+		case config.AuthModeJWT:
+			id, presented, ok := tryJWT(r)
+			if !ok {
+				return authOutcome{method: config.AuthModeJWT, reject: bearerChallenge(presented)}
+			}
+			return authOutcome{id: id, method: config.AuthModeJWT, ok: true}
+
+		case config.AuthModeMTLS:
+			id, _, ok := tryMTLS(r)
+			if !ok {
+				return authOutcome{method: config.AuthModeMTLS, reject: plainUnauthorized("valid client certificate required")}
+			}
+			return authOutcome{id: id, method: config.AuthModeMTLS, ok: true}
+
+		case config.AuthModeEither:
+			if validAPIKey(valid, r.Header.Get(cfg.Header)) {
+				return authOutcome{id: Identity{Method: config.AuthModeAPIKey}, method: config.AuthModeAPIKey, ok: true}
+			}
+			id, presented, ok := tryJWT(r)
+			if ok {
+				return authOutcome{id: id, method: config.AuthModeJWT, ok: true}
+			}
+			certID, certPresented, certOK := tryMTLS(r)
+			if certOK {
+				return authOutcome{id: certID, method: config.AuthModeMTLS, ok: true}
+			}
+			method := config.AuthModeAPIKey
+			switch {
+			case presented:
+				method = config.AuthModeJWT
+			case certPresented:
+				method = config.AuthModeMTLS
+			}
+			return authOutcome{method: method, reject: bearerChallenge(presented)}
+
+		default: // config.AuthModeAPIKey
+			if !validAPIKey(valid, r.Header.Get(cfg.Header)) {
+				return authOutcome{method: config.AuthModeAPIKey, reject: plainUnauthorized("invalid or missing API key")}
+			}
+			return authOutcome{id: Identity{Method: config.AuthModeAPIKey}, method: config.AuthModeAPIKey, ok: true}
+		}
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if id, _, ok := tryMTLS(r); ok {
@@ -146,70 +197,48 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 				mode = modeFor(r)
 			}
 
-			switch mode {
-			case config.AuthModeJWT:
-				id, presented, ok := tryJWT(r)
-				if !ok {
-					record(config.AuthModeJWT, false)
-					websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
-					writeBearerChallenge(w, presented)
-					return
-				}
-				record(config.AuthModeJWT, true)
-				next.ServeHTTP(w, withIdentity(r, id))
-
-			case config.AuthModeMTLS:
-				id, _, ok := tryMTLS(r)
-				if !ok {
-					record(config.AuthModeMTLS, false)
-					websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
-					http.Error(w, "valid client certificate required", http.StatusUnauthorized)
-					return
-				}
-				record(config.AuthModeMTLS, true)
-				next.ServeHTTP(w, withIdentity(r, id))
-
-			case config.AuthModeEither:
-				if validAPIKey(valid, r.Header.Get(cfg.Header)) {
-					record(config.AuthModeAPIKey, true)
-					next.ServeHTTP(w, withIdentity(r, Identity{Method: config.AuthModeAPIKey}))
-					return
-				}
-				id, presented, ok := tryJWT(r)
-				if ok {
-					record(config.AuthModeJWT, true)
-					next.ServeHTTP(w, withIdentity(r, id))
-					return
-				}
-				certID, certPresented, certOK := tryMTLS(r)
-				if certOK {
-					record(config.AuthModeMTLS, true)
-					next.ServeHTTP(w, withIdentity(r, certID))
-					return
-				}
-				switch {
-				case presented:
-					record(config.AuthModeJWT, false)
-				case certPresented:
-					record(config.AuthModeMTLS, false)
-				default:
-					record(config.AuthModeAPIKey, false)
-				}
+			// The span covers the authentication decision only; it ends
+			// before the request moves on, so later stages are its
+			// siblings rather than its children.
+			_, span := tracing.Start(r.Context(), tracing.SpanAuth,
+				trace.WithAttributes(tracing.AttrAuthMode.String(mode)))
+			out := decide(mode, r)
+			record(out.method, out.ok)
+			span.SetAttributes(tracing.AttrAuthMethod.String(out.method), tracing.AttrAuthResult.String(result(out.ok)))
+			if !out.ok {
+				tracing.Fail(span, "unauthorized")
+				span.End()
 				websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
-				writeBearerChallenge(w, presented)
-
-			default: // config.AuthModeAPIKey
-				if !validAPIKey(valid, r.Header.Get(cfg.Header)) {
-					record(config.AuthModeAPIKey, false)
-					websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
-					http.Error(w, "invalid or missing API key", http.StatusUnauthorized)
-					return
-				}
-				record(config.AuthModeAPIKey, true)
-				next.ServeHTTP(w, withIdentity(r, Identity{Method: config.AuthModeAPIKey}))
+				out.reject(w)
+				return
 			}
+			span.End()
+			next.ServeHTTP(w, withIdentity(r, out.id))
 		})
 	}, nil
+}
+
+// authOutcome is the result of one authentication decision.
+type authOutcome struct {
+	id     Identity
+	method string
+	ok     bool
+	reject func(http.ResponseWriter) // writes the 401; set when !ok
+}
+
+func bearerChallenge(invalidToken bool) func(http.ResponseWriter) {
+	return func(w http.ResponseWriter) { writeBearerChallenge(w, invalidToken) }
+}
+
+func plainUnauthorized(msg string) func(http.ResponseWriter) {
+	return func(w http.ResponseWriter) { http.Error(w, msg, http.StatusUnauthorized) }
+}
+
+func result(ok bool) string {
+	if ok {
+		return "success"
+	}
+	return "failure"
 }
 
 func keySet(keys []string) map[string]struct{} {

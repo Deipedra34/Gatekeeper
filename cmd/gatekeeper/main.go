@@ -15,7 +15,8 @@
 //
 // On SIGINT/SIGTERM the server stops accepting connections, finishes
 // in-flight requests, and closes proxied WebSocket connections with a
-// Close frame, all within a 10s shutdown window.
+// Close frame, all within a 10s shutdown window, then flushes any
+// buffered trace spans (up to 5s more).
 package main
 
 import (
@@ -135,6 +136,14 @@ func main() {
 	}
 	if err := <-wsDone; err != nil {
 		log.Printf("gatekeeper: websocket connections did not close in time and were dropped: %v", err)
+	}
+
+	// Last, once no more requests can start: flush buffered spans to the
+	// collector. A dead collector costs at most this timeout, not a hang.
+	tracingCtx, cancelTracing := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelTracing()
+	if err := gw.ShutdownTracing(tracingCtx); err != nil {
+		log.Printf("gatekeeper: flushing traces on shutdown: %v", err)
 	}
 }
 

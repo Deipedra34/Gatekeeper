@@ -70,3 +70,20 @@ grafana/
 ```
 
 This setup is meant for local testing only. The Grafana credentials are the defaults, and Prometheus stores nothing persistently.
+
+## Optional: traces in Grafana (Jaeger or Tempo)
+
+With tracing enabled (see the "Distributed tracing" section of the [main README](../README.md#distributed-tracing)), Grafana can show traces next to the dashboard's metrics. Run both add-ons together:
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.monitoring.yml -f docker-compose.tracing.yml up --build
+```
+
+Then add a trace data source in Grafana (**Connections → Data sources → Add data source**):
+
+- **Jaeger** (what `docker-compose.tracing.yml` runs): URL `http://jaeger:16686`.
+- **Grafana Tempo**, if you send traces there instead: URL of your Tempo query endpoint, e.g. `http://tempo:3200`. Point the OpenTelemetry Collector at Tempo by adding an `otlp/tempo` exporter to [`observability/otel-collector.yaml`](../observability/otel-collector.yaml).
+
+It isn't provisioned automatically, because a provisioned Jaeger data source would show as broken whenever the tracing add-on isn't running.
+
+**Going from metrics to traces.** Gatekeeper doesn't attach trace exemplars to its Prometheus histograms, so there's no click-through from a latency bucket straight to a trace. Instead, every request log line carries `trace_id=<id>`, and responses can carry it in a header (`tracing.response_header`). Take a trace ID from either and paste it into **Explore → Jaeger/Tempo → Trace ID**. In Jaeger's own UI (<http://localhost:16686>), search by service `gatekeeper` and filter by tags such as `http.route=/api/users` or `http.response.status_code=429`, the same dimensions the dashboard's panels use.

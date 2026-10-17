@@ -1,0 +1,40 @@
+# OpenTelemetry Collector config for docker-compose.tracing.yml.
+#
+# Gatekeeper sends spans here over OTLP (gRPC :4317 or HTTP :4318); the
+# collector batches them and forwards them to Jaeger, and also prints a
+# one-line summary of each batch to its own log (`docker-compose logs
+# otel-collector`) so you can see spans arriving even without the UI.
+#
+# To send traces somewhere else (Grafana Tempo, a vendor backend), add an
+# exporter here and list it under service.pipelines.traces.exporters —
+# Gatekeeper's own config doesn't change.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Keeps the collector's own memory bounded if Jaeger is slow or down.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  batch: {}
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/jaeger, debug]

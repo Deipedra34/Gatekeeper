@@ -102,11 +102,21 @@ func (cb *CircuitBreaker) State() State {
 // caller must then call exactly one of Report or Release for that same
 // call before it can be let through again.
 func (cb *CircuitBreaker) Allow() bool {
+	allowed, _ := cb.AllowState()
+	return allowed
+}
+
+// AllowState is Allow, also returning the state the decision was made in
+// (for tracing), read under the same lock so the two always agree.
+func (cb *CircuitBreaker) AllowState() (bool, State) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	cb.maybeExpireOpen(time.Now())
+	return cb.allowLocked(), cb.state
+}
 
+func (cb *CircuitBreaker) allowLocked() bool {
 	switch cb.state {
 	case Closed:
 		return true
