@@ -19,6 +19,7 @@ import (
 
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/lb"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/proxy"
@@ -45,6 +46,13 @@ type Gateway struct {
 	// counting toward its route's limits after the next, and Shutdown
 	// reaches it either way.
 	wsHub *websocket.Hub
+
+	// backends tracks every load-balanced backend for /metrics; like
+	// wsHub it outlives reloads. router is the live router, kept so the
+	// next reload can share unchanged backends with it and drain the
+	// removed ones.
+	backends *lb.Registry
+	router   atomic.Pointer[proxy.Router]
 
 	configPath string
 
@@ -91,7 +99,11 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		logger:     logger,
 		configPath: configPath,
 		wsHub:      websocket.NewHub(m),
+		backends:   lb.NewRegistry(),
 		retiring:   map[*tracing.Provider]*time.Timer{},
+	}
+	if m != nil {
+		m.SetBackendSource(g.backends.Snapshot)
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -100,15 +112,24 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 	if err != nil {
 		return nil, err
 	}
-	h, err := g.build(cfg, tp)
+	h, router, err := g.build(cfg, tp, nil)
 	if err != nil {
 		_ = tp.Shutdown(context.Background())
 		return nil, err
 	}
 	g.pipeline.Store(&h)
+	g.router.Store(router)
 	g.current.Store(cfg)
 	g.tracer.Store(tp)
 	return g, nil
+}
+
+// Close stops background work tied to the current config — active
+// health checks on backends. Call it on shutdown.
+func (g *Gateway) Close() {
+	if r := g.router.Load(); r != nil {
+		r.Close()
+	}
 }
 
 // ServeHTTP dispatches the request to the currently active pipeline.
@@ -153,16 +174,23 @@ func (g *Gateway) Reload() error {
 			return err
 		}
 	}
-	h, err := g.build(cfg, tp)
+	oldRouter := g.router.Load()
+	h, router, err := g.build(cfg, tp, oldRouter)
 	if err != nil {
 		if tp != old {
 			_ = tp.Shutdown(context.Background())
 		}
 		return err
 	}
+	// Backends shared with the old router pick up their new settings now,
+	// right before the swap; backends the new config dropped drain behind
+	// it — in-flight requests finish, new ones go elsewhere.
+	router.Activate()
 	g.pipeline.Store(&h)
+	g.router.Store(router)
 	g.current.Store(cfg)
 	g.tracer.Store(tp)
+	oldRouter.Retire(router)
 	if tp != old {
 		g.retire(old)
 	}
@@ -221,20 +249,29 @@ func (g *Gateway) retire(p *tracing.Provider) {
 // build assembles the reverse proxy and middleware chain for cfg. It
 // touches nothing on g, so a failure part-way through leaves the active
 // pipeline untouched.
-func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider) (http.Handler, error) {
-	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache, proxy.WithWebSocketHub(g.wsHub))
+// prev, if non-nil, is the live router being replaced; the new router is
+// then built to share its unchanged backends and isn't live until
+// Activate. On error, nothing live has been touched.
+func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Router) (http.Handler, *proxy.Router, error) {
+	opts := []proxy.Option{proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends)}
+	if prev != nil {
+		opts = append(opts, proxy.WithPrevious(prev))
+	}
+	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache, opts...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	limiters, err := buildLimiters(cfg, g.store)
 	if err != nil {
-		return nil, err
+		router.Discard()
+		return nil, nil, err
 	}
 
 	auth, err := middleware.Auth(cfg.Auth, router.AuthModeFor, g.metrics)
 	if err != nil {
-		return nil, err
+		router.Discard()
+		return nil, nil, err
 	}
 	if !cfg.Auth.Enabled && routesAcceptJWT(cfg.Routes) {
 		g.logger.Printf("auth: auth.enabled is false, so routes with auth_mode jwt or either are NOT protected")
@@ -250,7 +287,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider) (http.Handler,
 	// Outermost, so the server span covers the whole request and every
 	// stage below can start its span from it. A no-op when disabled.
 	h = tp.Handler(h, router.RouteLabelFor)
-	return h, nil
+	return h, router, nil
 }
 
 func routesAcceptJWT(routes []config.Route) bool {

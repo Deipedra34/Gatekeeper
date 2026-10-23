@@ -8,3 +8,4 @@ format: Title, Status, Context, Decision, Consequences.
 3. [A Store interface to decouple algorithms from storage backends](0003-store-interface-abstraction.md)
 4. [FallbackStore for graceful degradation when Redis is unreachable](0004-fallback-store-graceful-degradation.md)
 5. [OpenTelemetry with OTLP for distributed tracing](0005-opentelemetry-otlp-tracing.md)
+6. [Load balancing: per-backend state, per-attempt selection, and drain-on-reload](0006-load-balancing.md)

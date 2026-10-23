@@ -112,7 +112,10 @@ func (s *Slot) Release() {
 // closes, then releases slot and closes both connections. It blocks for
 // the lifetime of the connection and returns why it closed (one of the
 // CloseReason* values). idleTimeout <= 0 disables the idle timeout.
-func (h *Hub) Serve(slot *Slot, client, backend Endpoint, idleTimeout time.Duration) string {
+//
+// When ctx is done — the backend was removed by a config reload and its
+// drain timeout ran out — the connection is closed gracefully (1001).
+func (h *Hub) Serve(ctx context.Context, slot *Slot, client, backend Endpoint, idleTimeout time.Duration) string {
 	defer slot.Release()
 
 	t := newTunnel(slot.route, client, backend, idleTimeout)
@@ -132,7 +135,11 @@ func (h *Hub) Serve(slot *Slot, client, backend Endpoint, idleTimeout time.Durat
 		t.close(closeGoingAway, "server shutting down", CloseReasonShutdown, closeWriteTimeout)
 	}
 
+	stopDrainWatch := context.AfterFunc(ctx, func() {
+		t.close(closeGoingAway, "backend removed", CloseReasonDrained, idleCloseGrace)
+	})
 	reason := t.run()
+	stopDrainWatch()
 	// Free the slot before the metrics say the connection is gone, so
 	// nobody observing the gauge can race a new handshake into a limit
 	// that's about to be lifted.

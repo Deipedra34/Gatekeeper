@@ -189,6 +189,31 @@ cors:
 #   ws_allowed_origins             - if set, upgrades whose Origin header
 #                                    isn't listed get 403 ("*" = any).
 # See README.md's "WebSocket proxying" section.
+#
+# Instead of a single target, a route can spread traffic over several
+# backends (see README.md's "Load balancing" section):
+#   backends:                       # instead of target
+#     - target: "http://10.0.0.1:9001"
+#       weight: 3                   # default 1
+#     - target: "http://10.0.0.2:9001"
+#   lb_strategy: round_robin        # round_robin (default), least_connections,
+#                                   # weighted_round_robin, random, ip_hash,
+#                                   # consistent_hash
+#   lb_hash_header: X-User-ID       # consistent_hash key (default: client IP)
+#   health_check:                   # active probes (off by default)
+#     enabled: true
+#     path: /health                 # default /health
+#     interval: 10s                 # default 10s
+#     timeout: 2s                   # default 2s
+#     healthy_threshold: 2          # passing probes to return (default 2)
+#     unhealthy_threshold: 3        # failing probes to leave (default 3)
+#     expected_status: [200]        # default: any 2xx/3xx
+#   passive_health_check:           # on by default with 2+ backends
+#     consecutive_failures: 5       # default 5
+#     ejection_duration: 30s        # default 30s
+#   drain_timeout: 30s              # for backends a reload removes (default 30s)
+# Circuit breakers are per backend; a single target behaves exactly as
+# before.
 routes:
   - path_prefix: "/ws"
     target: "http://localhost:9000"

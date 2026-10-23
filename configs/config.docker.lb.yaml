@@ -1,0 +1,97 @@
+# Gatekeeper configuration for the load-balancing demo (see
+# docker-compose.lb.yml). It's configs/config.docker.yaml plus an
+# /api/lb route spread over three mock-backend instances, with active and
+# passive health checks, so failover can be watched end to end. See
+# README.md's "Load balancing" section.
+#
+# --- based on config.docker.yaml ---
+
+server:
+  listen_addr: ":8080"
+  read_timeout: 10s
+  write_timeout: 10s
+  idle_timeout: 60s
+
+storage:
+  backend: redis
+  redis:
+    addr: "redis:6379"
+    password: ""
+    db: 0
+    dial_timeout: 2s
+
+rate_limit:
+  algorithm: token_bucket
+  scope: api_key
+  header_name: "X-Client-ID"
+
+  tiers:
+    default:
+      requests_per_second: 2
+      burst: 5
+    free:
+      requests_per_second: 5
+      burst: 10
+    premium:
+      requests_per_second: 50
+      burst: 100
+
+  clients:
+    "demo-free-key": free
+    "demo-premium-key": premium
+
+auth:
+  enabled: true
+  header: "X-API-Key"
+  api_keys:
+    - "demo-free-key"
+    - "demo-premium-key"
+
+cors:
+  enabled: true
+  allowed_origins: ["*"]
+  allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+  allowed_headers: ["Content-Type", "Authorization", "X-API-Key"]
+  allow_credentials: false
+  max_age: 300
+
+# Everything proxies to the mock-backend service, reachable by its
+# compose service name on the port it listens on (see mockbackend/).
+routes:
+  # Spread over three instances. Cache off so every request really goes
+  # to a backend and the distribution is visible.
+  - path_prefix: "/api/lb"
+    lb_strategy: round_robin        # try least_connections, random, ip_hash, ...
+    cache: {enabled: false}
+    drain_timeout: 10s
+    backends:
+      - target: "http://mock-backend:9000"
+      - target: "http://mock-backend-2:9000"
+      - target: "http://mock-backend-3:9000"
+    health_check:
+      enabled: true
+      path: /health
+      interval: 2s
+      timeout: 1s
+      healthy_threshold: 2
+      unhealthy_threshold: 2
+    passive_health_check:           # on by default with 2+ backends
+      consecutive_failures: 3
+      ejection_duration: 10s
+  # WebSocket echo endpoint on the mock backend (/ws/echo). Try it with
+  # `websocat -H "X-API-Key: demo-free-key" ws://localhost:8080/ws/echo`.
+  - path_prefix: "/ws"
+    target: "http://mock-backend:9000"
+    ws_idle_timeout: 5m
+    ws_max_connections: 1000
+    ws_max_connections_per_client: 10
+  - path_prefix: "/api/users"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/api/orders"
+    target: "http://mock-backend:9000"
+  - path_prefix: "/"
+    target: "http://mock-backend:9000"
+
+metrics:
+  enabled: true
+  path: "/metrics"

@@ -137,6 +137,7 @@ func main() {
 	if err := <-wsDone; err != nil {
 		log.Printf("gatekeeper: websocket connections did not close in time and were dropped: %v", err)
 	}
+	gw.Close() // stop backend health checks
 
 	// Last, once no more requests can start: flush buffered spans to the
 	// collector. A dead collector costs at most this timeout, not a hang.

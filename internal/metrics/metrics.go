@@ -108,7 +108,107 @@ type Metrics struct {
 	TLSCertificateReloads *prometheus.CounterVec
 
 	certExpiry *certExpiryCollector
+
+	// BackendRequests counts backend attempts per backend, by route,
+	// backend, and outcome ("success", or "failure" for a timeout,
+	// connection error, or 5xx). Each retry attempt counts separately.
+	BackendRequests *prometheus.CounterVec
+
+	// BackendEjections counts passive health ejections: a backend taken
+	// out of rotation after consecutive failed requests.
+	BackendEjections *prometheus.CounterVec
+
+	// HealthChecks counts active health probes, by route, backend, and
+	// result ("success" or "failure").
+	HealthChecks *prometheus.CounterVec
+
+	backends *backendCollector
 }
+
+// BackendState is one backend's live state, as reported by the load
+// balancer when /metrics is scraped.
+type BackendState struct {
+	Route, Backend string
+	Healthy        bool  // passing health checks and not ejected
+	InRotation     bool  // healthy and not draining
+	Draining       bool  // removed by a reload, finishing in-flight work
+	InFlight       int64 // requests and WebSocket connections in flight
+	BreakerState   int   // circuitbreaker.State, or -1 with no breaker
+}
+
+// backendCollector turns the load balancer's backend states into
+// gauges at scrape time, so they're never stale and a backend removed by
+// a reload simply stops being reported.
+type backendCollector struct {
+	source atomic.Pointer[func() []BackendState]
+
+	up, active, breaker, draining, inRotation *prometheus.Desc
+}
+
+func newBackendCollector() *backendCollector {
+	return &backendCollector{
+		up: prometheus.NewDesc("gatekeeper_backend_up",
+			"1 if the backend is healthy (passing health checks, not ejected), 0 if not.", []string{"route", "backend"}, nil),
+		active: prometheus.NewDesc("gatekeeper_backend_active_connections",
+			"Requests and WebSocket connections currently in flight to the backend.", []string{"route", "backend"}, nil),
+		breaker: prometheus.NewDesc("gatekeeper_backend_circuit_breaker_state",
+			"Per-backend circuit breaker state: 0=closed, 1=open, 2=half-open.", []string{"route", "backend"}, nil),
+		draining: prometheus.NewDesc("gatekeeper_backend_draining",
+			"1 while a backend removed by a config reload finishes its in-flight requests.", []string{"route", "backend"}, nil),
+		inRotation: prometheus.NewDesc("gatekeeper_route_backends_in_rotation",
+			"Number of the route's backends currently receiving new traffic.", []string{"route"}, nil),
+	}
+}
+
+func (c *backendCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.up
+	ch <- c.active
+	ch <- c.breaker
+	ch <- c.draining
+	ch <- c.inRotation
+}
+
+func (c *backendCollector) Collect(ch chan<- prometheus.Metric) {
+	src := c.source.Load()
+	if src == nil {
+		return
+	}
+	rotation := map[string]float64{}
+	for _, b := range (*src)() {
+		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, boolValue(b.Healthy), b.Route, b.Backend)
+		ch <- prometheus.MustNewConstMetric(c.active, prometheus.GaugeValue, float64(b.InFlight), b.Route, b.Backend)
+		ch <- prometheus.MustNewConstMetric(c.draining, prometheus.GaugeValue, boolValue(b.Draining), b.Route, b.Backend)
+		if b.BreakerState >= 0 {
+			ch <- prometheus.MustNewConstMetric(c.breaker, prometheus.GaugeValue, float64(b.BreakerState), b.Route, b.Backend)
+		}
+		if _, ok := rotation[b.Route]; !ok {
+			rotation[b.Route] = 0
+		}
+		if b.InRotation {
+			rotation[b.Route]++
+		}
+	}
+	for route, n := range rotation {
+		ch <- prometheus.MustNewConstMetric(c.inRotation, prometheus.GaugeValue, n, route)
+	}
+}
+
+func boolValue(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// SetBackendSource tells /metrics where to read backend state from (the
+// load balancer's registry).
+func (m *Metrics) SetBackendSource(src func() []BackendState) {
+	m.backends.source.Store(&src)
+}
+
+// BackendStateCollector is the collector behind the per-backend gauges,
+// exposed for tests.
+func (m *Metrics) BackendStateCollector() prometheus.Collector { return m.backends }
 
 // certExpiryCollector reports seconds until the server certificate
 // expires, computed at scrape time so it keeps counting down between
@@ -228,6 +328,19 @@ func New() *Metrics {
 			Name: "gatekeeper_tls_certificate_reloads_total",
 			Help: "Total number of server certificate load attempts, by result (success or failure).",
 		}, []string{"result"}),
+		BackendRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_backend_requests_total",
+			Help: "Total number of attempts sent to each backend, by route, backend, and outcome (success or failure). Retries count separately.",
+		}, []string{"route", "backend", "outcome"}),
+		BackendEjections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_backend_ejections_total",
+			Help: "Total number of times a backend was taken out of rotation by passive health checking.",
+		}, []string{"route", "backend"}),
+		HealthChecks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_backend_health_checks_total",
+			Help: "Total number of active health check probes, by route, backend, and result (success or failure).",
+		}, []string{"route", "backend", "result"}),
+		backends: newBackendCollector(),
 		certExpiry: &certExpiryCollector{
 			desc: prometheus.NewDesc("gatekeeper_tls_certificate_expiry_seconds",
 				"Seconds until the server certificate currently in use expires (negative once expired).", nil, nil),
@@ -256,6 +369,10 @@ func New() *Metrics {
 		m.MTLSVerifications,
 		m.TLSCertificateReloads,
 		m.certExpiry,
+		m.BackendRequests,
+		m.BackendEjections,
+		m.HealthChecks,
+		m.backends,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)

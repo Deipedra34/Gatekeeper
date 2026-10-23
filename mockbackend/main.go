@@ -8,6 +8,16 @@
 // /ws/echo is a minimal WebSocket echo endpoint for trying out
 // Gatekeeper's WebSocket proxying end to end; everything else gets the
 // JSON echo below.
+//
+// For load-balancing demos, several instances can run side by side
+// (docker-compose.lb.yml). Each reports its INSTANCE_NAME (default: the
+// hostname), serves /health for active health checks, and can be told to
+// misbehave:
+//
+//	POST /_admin/fail     every request (including /health) answers 503
+//	POST /_admin/slow?delay=2s   every request waits that long first
+//	POST /_admin/recover  back to normal
+//	GET  /_admin/status   current mode
 package main
 
 import (
@@ -21,8 +31,82 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
+
+// mode is how this instance currently behaves; see /_admin/*.
+var mode = struct {
+	sync.Mutex
+	failing bool
+	delay   time.Duration
+}{}
+
+var instance = func() string {
+	if name := os.Getenv("INSTANCE_NAME"); name != "" {
+		return name
+	}
+	host, _ := os.Hostname()
+	return host
+}()
+
+// misbehave applies the current failure mode; it reports whether the
+// request has already been answered.
+func misbehave(w http.ResponseWriter) bool {
+	mode.Lock()
+	failing, delay := mode.failing, mode.delay
+	mode.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	if failing {
+		http.Error(w, "mock-backend "+instance+" is failing (POST /_admin/recover to fix)", http.StatusServiceUnavailable)
+		return true
+	}
+	return false
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if misbehave(w) {
+		return
+	}
+	_, _ = io.WriteString(w, "ok "+instance+"\n")
+}
+
+func handleAdmin(w http.ResponseWriter, r *http.Request) {
+	action := strings.TrimPrefix(r.URL.Path, "/_admin/")
+	if action != "status" && r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	mode.Lock()
+	switch action {
+	case "fail":
+		mode.failing = true
+	case "slow":
+		d, err := time.ParseDuration(r.URL.Query().Get("delay"))
+		if err != nil || d < 0 {
+			mode.Unlock()
+			http.Error(w, "delay must be a duration like 2s", http.StatusBadRequest)
+			return
+		}
+		mode.delay = d
+	case "recover":
+		mode.failing, mode.delay = false, 0
+	case "status":
+	default:
+		mode.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	failing, delay := mode.failing, mode.delay
+	mode.Unlock()
+	if action != "status" {
+		log.Printf("mock-backend %s: %s (failing=%t delay=%s)", instance, action, failing, delay)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"instance": instance, "failing": failing, "delay": delay.String()})
+}
 
 func main() {
 	port := os.Getenv("PORT")
@@ -32,9 +116,11 @@ func main() {
 
 	http.HandleFunc("/", handle)
 	http.HandleFunc("/ws/echo", handleWebSocketEcho)
+	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/_admin/", handleAdmin)
 
 	addr := ":" + port
-	log.Printf("mock-backend: listening on %s", addr)
+	log.Printf("mock-backend %s: listening on %s", instance, addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("mock-backend: %v", err)
 	}
@@ -46,8 +132,12 @@ func main() {
 // propagated is also pulled out into its own fields and logged, so it's
 // easy to match a request to its trace.
 func handle(w http.ResponseWriter, r *http.Request) {
+	if misbehave(w) {
+		return
+	}
 	resp := struct {
 		Message     string      `json:"message"`
+		Instance    string      `json:"instance"`
 		Method      string      `json:"method"`
 		Path        string      `json:"path"`
 		Host        string      `json:"host"`
@@ -58,6 +148,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		Timestamp   string      `json:"timestamp"`
 	}{
 		Message:     "hello from mock-backend",
+		Instance:    instance,
 		Method:      r.Method,
 		Path:        r.URL.Path,
 		Host:        r.Host,

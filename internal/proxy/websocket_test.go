@@ -465,7 +465,7 @@ func TestWebSocket_CircuitBreakerCountsHandshakesNotConnections(t *testing.T) {
 	}}, noRetryProxyConfig(), m, nil)
 	require.NoError(t, err)
 	gw := gatewayFor(t, router)
-	breaker := router.routes[0].breaker
+	breaker := router.routes[0].pool.Backends()[0].Breaker()
 
 	// Long-lived connections that end in every way — client close,
 	// client vanishing — never count against the breaker.

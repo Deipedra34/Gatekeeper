@@ -704,3 +704,90 @@ tracing:
 		})
 	}
 }
+
+func TestLoad_RouteBackendsAndLoadBalancing(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+routes:
+  - path_prefix: "/single"
+    target: "http://localhost:9000"
+  - path_prefix: "/pool"
+    lb_strategy: weighted_round_robin
+    drain_timeout: 5s
+    backends:
+      - target: "http://a:9000"
+        weight: 3
+      - target: "https://b:9443"
+        backend_tls: {enabled: true, server_name: b.internal}
+    health_check:
+      enabled: true
+      path: /healthz
+      expected_status: [200, 204]
+  - path_prefix: "/sticky"
+    lb_strategy: consistent_hash
+    lb_hash_header: X-User-ID
+    passive_health_check: {enabled: false}
+    backends:
+      - target: "http://c:9000"
+      - target: "http://d:9000"
+`))
+	require.NoError(t, err)
+
+	single := cfg.Routes[0]
+	assert.Equal(t, []BackendConfig{{Target: "http://localhost:9000", Weight: 1, BackendTLS: &BackendTLSConfig{}}}, single.EffectiveBackends())
+	assert.Equal(t, LBRoundRobin, single.EffectiveLBStrategy())
+	assert.False(t, single.PassiveHealthEnabled(), "passive ejection is off for a single target")
+	assert.Equal(t, DefaultDrainTimeout, single.EffectiveDrainTimeout())
+
+	pool := cfg.Routes[1]
+	bs := pool.EffectiveBackends()
+	require.Len(t, bs, 2)
+	assert.Equal(t, 3, bs[0].Weight)
+	assert.Equal(t, 1, bs[1].Weight, "weight defaults to 1")
+	assert.False(t, bs[0].BackendTLS.Enabled, "inherits the route's (empty) backend_tls")
+	assert.Equal(t, "b.internal", bs[1].BackendTLS.ServerName, "a backend can override it")
+	assert.True(t, pool.PassiveHealthEnabled(), "passive ejection defaults on for 2+ backends")
+	assert.Equal(t, 5*time.Second, pool.EffectiveDrainTimeout())
+	hc := pool.HealthCheck.WithDefaults()
+	assert.Equal(t, "/healthz", hc.Path)
+	assert.Equal(t, DefaultHealthCheckInterval, hc.Interval.Duration)
+	assert.Equal(t, DefaultHealthyThreshold, hc.HealthyThreshold)
+
+	assert.False(t, cfg.Routes[2].PassiveHealthEnabled())
+	assert.Equal(t, "X-User-ID", cfg.Routes[2].LBHashHeader)
+}
+
+func TestLoad_RejectsInvalidBackends(t *testing.T) {
+	cases := map[string]string{
+		"both target and backends": `target: "http://a"
+    backends: [{target: "http://b"}]`,
+		"neither":                `cache: {ttl: 1s}`,
+		"backend without target": `backends: [{weight: 2}]`,
+		"backend not a URL":      `backends: [{target: "a:9000"}]`,
+		"duplicate backend":      `backends: [{target: "http://a"}, {target: "http://a"}]`,
+		"negative weight":        `backends: [{target: "http://a", weight: -1}]`,
+		"unknown strategy": `backends: [{target: "http://a"}]
+    lb_strategy: fastest`,
+		"hash header on round robin": `backends: [{target: "http://a"}]
+    lb_hash_header: X-User`,
+		"health timeout above interval": `backends: [{target: "http://a"}]
+    health_check: {enabled: true, interval: 1s, timeout: 2s}`,
+		"health path relative": `backends: [{target: "http://a"}]
+    health_check: {enabled: true, path: health}`,
+		"bad expected status": `backends: [{target: "http://a"}]
+    health_check: {enabled: true, expected_status: [42]}`,
+		"backend_tls on http backend": `backends: [{target: "http://a", backend_tls: {enabled: true}}]`,
+		"negative drain timeout": `backends: [{target: "http://a"}]
+    drain_timeout: -1s`,
+	}
+	for name, route := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, `
+routes:
+  - path_prefix: "/"
+    `+route+`
+`))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "routes[0]")
+		})
+	}
+}

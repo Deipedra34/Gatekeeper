@@ -82,6 +82,7 @@ const (
 	AttrBreakerState   = attribute.Key("gatekeeper.circuit_breaker.state")
 	AttrBreakerAllowed = attribute.Key("gatekeeper.circuit_breaker.allowed")
 
+	AttrBackend = attribute.Key("gatekeeper.backend")
 	AttrAttempt = attribute.Key("gatekeeper.backend.attempt")
 	AttrRetry   = attribute.Key("gatekeeper.backend.retry")
 

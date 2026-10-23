@@ -25,6 +25,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **WebSocket proxying.** `Upgrade: websocket` requests are routed like any other request and pass through CORS, auth, and the rate limiter (one token per connection attempt). After that, frames are relayed transparently in both directions. Per-route idle timeouts, connection caps per route and per client, `Origin` allow-lists, metrics, and graceful close on shutdown are all included.
 - **TLS and mTLS.** An optional HTTPS listener with TLS 1.2+ by default, hot-reloaded certificates (on `SIGHUP` or file change), client certificate verification, an `mtls` route auth mode with certificate-based client identity and tiers, HSTS, an HTTP→HTTPS redirect, and TLS / mTLS to backends.
 - **Distributed tracing.** Optional OpenTelemetry traces with a span per pipeline stage and per backend attempt (retries are visible), W3C `traceparent` / `baggage` propagation in and out, OTLP gRPC/HTTP export, parent-based sampling, trace IDs in log lines and an optional response header. Secrets never reach spans, and a dead collector never slows a request.
+- **Load balancing and health checks.** A route can spread traffic over several backends with round robin, weighted round robin, least connections, random, or sticky IP / header hashing. Active and passive health checks take failing backends out of rotation and bring them back. Circuit breakers are per backend, retries fail over to a different backend, and backends removed by a reload drain gracefully. A single `target` still works exactly as before.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
@@ -78,6 +79,7 @@ internal/proxy/        the reverse-proxy router (path prefix / hostname matching
 internal/cache/        the response cache: key derivation, Cache-Control handling, Store-backed get/set
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
 internal/server/       the listeners: plain HTTP or HTTPS (mTLS, certificate hot reload, HSTS), plus the HTTP→HTTPS redirect
+internal/lb/           load balancing: backend pools, strategies, consistent hashing, active/passive health checks, draining
 internal/tracing/      OpenTelemetry setup (exporters, sampling, OTEL_* overrides), the server span, and span/propagation helpers
 internal/certgen/      throwaway CA / server / client certificate generation for tests and scripts/gencerts
 internal/websocket/    WebSocket upgrade detection, the frame relay, and the hub tracking open connections (limits, idle timeout, shutdown)
@@ -141,9 +143,139 @@ All four fields are optional; any left unset get the defaults shown above.
 
 **Interaction with rate limiting and metrics:** the rate limiter middleware sits in front of the proxy and only ever sees the original incoming request once, so retries against the backend never cost a client extra rate-limit budget — a request that retries twice before succeeding still counts as exactly one allowed request against that client's limit. Retry attempts and final outcomes are tracked as their own metrics, separate from the raw allow/reject counters (see [Metrics](#metrics) below).
 
+## Load balancing
+
+A route can spread its traffic over several backends instead of one `target`. Gatekeeper picks a backend per request, health-checks backends actively and passively, and routes around the ones that are down. It also fails over between them on retry, and drains backends a reload removes. A route with a single `target` is simply a pool of one and behaves exactly as before. See [ADR 6](docs/adr/0006-load-balancing.md) for the design.
+
+```yaml
+routes:
+  - path_prefix: "/api/orders"
+    lb_strategy: least_connections     # default round_robin
+    backends:                          # instead of target:
+      - target: "http://10.0.0.11:9000"
+        weight: 2                      # default 1
+      - target: "http://10.0.0.12:9000"
+      - target: "https://10.0.0.13:9443"
+        backend_tls: { enabled: true, ca_file: "certs/internal-ca.pem" }   # per-backend override
+    health_check:                      # active probes; off by default
+      enabled: true
+      path: /health                    # default /health, appended to each target's base path
+      interval: 10s                    # default 10s
+      timeout: 2s                      # default 2s (must not exceed interval)
+      healthy_threshold: 2             # consecutive passes to come back (default 2)
+      unhealthy_threshold: 3           # consecutive failures to leave (default 3)
+      expected_status: [200, 204]      # default: any 2xx or 3xx
+    passive_health_check:              # on by default with 2+ backends
+      consecutive_failures: 5          # default 5
+      ejection_duration: 30s           # default 30s
+    drain_timeout: 30s                 # default 30s
+```
+
+`backend_tls` set on the route applies to every backend. A backend's own `backend_tls` replaces it for that backend. Circuit breaker settings (`circuit_breaker:`) apply to each backend separately.
+
+### Strategies
+
+| `lb_strategy` | Picks | Uses `weight` |
+|---|---|---|
+| `round_robin` (default) | Each backend in turn | no |
+| `weighted_round_robin` | In proportion to weight, interleaved: weights 5:1 give a ratio of 5:1 without five-in-a-row bursts (nginx's smooth algorithm) | yes |
+| `least_connections` | The backend with the fewest in-flight requests and WebSocket connections relative to its weight; ties rotate | yes |
+| `random` | At random, weighted | yes |
+| `ip_hash` | Sticky by client IP: the first `X-Forwarded-For` entry, else the connection address | yes (ring share) |
+| `consistent_hash` | Sticky by the `lb_hash_header` value (e.g. `X-User-ID`), falling back to the client IP when the header is missing | yes (ring share) |
+
+**The hash strategies use a consistent hash ring with virtual nodes**, so when a backend leaves rotation only *its* clients move. Everyone else stays put, and its clients return when it does. Stickiness is best-effort: the key comes from the client, so never rely on it for security.
+
+**WebSocket connections are balanced once, at the handshake,** and stay on that backend for their lifetime. While open, they count as an active connection for `least_connections`.
+
+### Health checks and failover
+
+A backend is **in rotation** when it is:
+- passing active health checks (if they're enabled),
+- not passively ejected, and
+- not draining.
+
+Only backends in rotation are picked.
+
+- **Active checks** probe every backend with `GET <target><path>` on `interval`, through the same transport real requests use (so its TLS settings apply). `unhealthy_threshold` consecutive failures take it out; `healthy_threshold` consecutive passes bring it back. Backends start out healthy, so a restart doesn't begin with 503s.
+- **Passive checks** watch real traffic. After `consecutive_failures` failed requests in a row (timeouts, connection errors, `5xx`), the backend is ejected for `ejection_duration` and then gets traffic again, without waiting for a probe. They're on by default for routes with two or more backends and off for single-target routes, where there's nowhere else to send the traffic.
+- **Circuit breakers are per backend.** One failing backend trips only its own breaker. A backend whose circuit is open is skipped, and its siblings take the traffic.
+- **Retries prefer a different backend.** A retry goes to a healthy backend the request hasn't tried yet. It reuses a tried one only when there's nothing else, which is also why single-target routes still retry against their one backend.
+- **When no backend is in rotation,** requests fail fast with `503 no healthy backend available` instead of waiting on backends known to be down. If backends are healthy but every one has an open circuit, the answer is the familiar `503 circuit breaker open`.
+
+Rate limiting, auth, and caching sit in front of the pool and work the same as before. The cache is shared by all of a route's backends. Each `backend.attempt` trace span carries a `gatekeeper.backend` attribute naming the backend it went to.
+
+### Config reloads and draining
+
+On `SIGHUP`:
+- **Unchanged backends carry over** with their health, circuit breaker state, and in-flight count intact. A backend is identified by its route and target URL. New settings, such as a weight change or updated TLS files, take effect for it once the whole reload has succeeded.
+- **New backends join immediately.**
+- **Removed backends drain.** They get no new requests, and the requests and WebSocket connections already on them keep running. When the last one finishes, the backend is forgotten. If `drain_timeout` passes first, whatever is still running is cancelled: an HTTP attempt can be retried on a backend that's still in rotation, and WebSockets are closed with `1001`.
+- **A reload that fails leaves the live pools untouched.**
+
+### Load balancing metrics
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gatekeeper_backend_up` | `route`, `backend` | 1 healthy, 0 failing checks or ejected |
+| `gatekeeper_route_backends_in_rotation` | `route` | Backends currently receiving new traffic (0 means 503s) |
+| `gatekeeper_backend_active_connections` | `route`, `backend` | In-flight requests and WebSocket connections |
+| `gatekeeper_backend_requests_total` | `route`, `backend`, `outcome` | Attempts per backend; retries count separately |
+| `gatekeeper_backend_health_checks_total` | `route`, `backend`, `result` | Active probes |
+| `gatekeeper_backend_ejections_total` | `route`, `backend` | Passive ejections |
+| `gatekeeper_backend_circuit_breaker_state` | `route`, `backend` | 0 closed, 1 open, 2 half-open |
+| `gatekeeper_backend_draining` | `route`, `backend` | 1 while a removed backend drains |
+
+The live-state gauges are computed at scrape time, so a removed backend's gauges disappear once it has drained. Single-target routes keep reporting `gatekeeper_circuit_breaker_state{route}` as before. The Grafana dashboard has a **Load balancing** row for all of the above.
+
+### Demo: kill a backend and watch traffic shift
+
+[`docker-compose.lb.yml`](docker-compose.lb.yml) adds two more mock-backend instances and runs Gatekeeper with [`configs/config.docker.lb.yaml`](configs/config.docker.lb.yaml). In that config, `/api/lb` is balanced over all three with active (2s) and passive health checks. The plain `docker-compose up` is unchanged.
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.lb.yml up --build
+```
+
+Send a dozen requests and count which instance answered each. Every mock-backend response includes `"instance"`:
+
+```bash
+for i in $(seq 1 12); do
+  curl -s http://localhost:8080/api/lb/hello -H "X-API-Key: demo-premium-key" | grep -o '"instance":"[^"]*"'
+done | sort | uniq -c
+```
+
+```
+      4 "instance":"mock-backend-1"
+      4 "instance":"mock-backend-2"
+      4 "instance":"mock-backend-3"
+```
+
+Now kill one and run the loop again:
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.lb.yml stop mock-backend-2
+```
+
+```
+      6 "instance":"mock-backend-1"
+      6 "instance":"mock-backend-3"
+```
+
+No request fails while this happens. Any request that hits the dead instance is retried on another one, the passive check ejects it after 3 failures, and the active check confirms it's down within two 2-second probes. `curl -s localhost:8080/metrics | grep -E 'backend_up|in_rotation'` shows it: `gatekeeper_backend_up{...mock-backend-2...} 0` and `gatekeeper_route_backends_in_rotation{route="/api/lb"} 2`. Start it again (`... start mock-backend-2`) and it's back in rotation after two passing probes.
+
+Each instance's admin endpoints are published on the host (`9101`, `9102`, `9103`), so you can also make one misbehave without stopping it:
+
+```bash
+curl -X POST localhost:9102/_admin/fail             # answer 503 to everything, health checks included
+curl -X POST "localhost:9102/_admin/slow?delay=3s"   # answer slowly
+curl -X POST localhost:9102/_admin/recover          # back to normal
+```
+
+A failing instance is taken out the same way as a dead one. A slow one stays in rotation, but with `lb_strategy: least_connections` it naturally receives fewer requests, because its requests stay in flight longer.
+
 ## Circuit breaker
 
-Every route's backend calls go through a circuit breaker with three states:
+Every route's backend calls go through a circuit breaker with three states. With [several backends](#load-balancing), each backend has its own breaker, so one bad backend never trips the whole route:
 
 - **Closed** — normal operation. Requests go to the backend as usual; failures are counted.
 - **Open** — the backend has failed too many times in a row. Every request is **failed fast** with `503 Service Unavailable` — the backend is never contacted at all — until the configured cooldown elapses.
@@ -837,7 +969,7 @@ Start everything with:
 docker-compose up --build
 ```
 
-To view traces in Jaeger, add the opt-in [`docker-compose.tracing.yml`](docker-compose.tracing.yml) override; see [Running Jaeger locally](#running-jaeger-locally). To run the same stack over HTTPS with mTLS, add the opt-in [`docker-compose.tls.yml`](docker-compose.tls.yml) override; see [TLS and mTLS](#tls-and-mtls).
+To try load balancing and failover across three mock-backend instances, add [`docker-compose.lb.yml`](docker-compose.lb.yml); see [the demo](#demo-kill-a-backend-and-watch-traffic-shift). To view traces in Jaeger, add the opt-in [`docker-compose.tracing.yml`](docker-compose.tracing.yml) override; see [Running Jaeger locally](#running-jaeger-locally). To run the same stack over HTTPS with mTLS, add the opt-in [`docker-compose.tls.yml`](docker-compose.tls.yml) override; see [TLS and mTLS](#tls-and-mtls).
 
 Only `gatekeeper` publishes a port to the host — `8080`, matching `server.listen_addr`. `redis` and `mock-backend` are reachable from `gatekeeper` on the compose network but not from the host.
 
@@ -937,6 +1069,8 @@ gatekeeper_tls_certificate_reloads_total{result="success"} 2
 
 The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
+Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics).
+
 (`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
 
 ### Grafana dashboard
@@ -986,6 +1120,16 @@ What's covered:
   - The `mtls` and `either` auth modes, with unverified certificates never trusted, and `cn` / `san_dns` / `serial` identity extraction with CN/OU tier mapping driving rate limits, end to end through the real gateway.
   - Backend TLS: a custom CA, a `server_name` override, mTLS to the backend, `insecure_skip_verify`, retries over TLS, and `wss` with backend mTLS.
   - Contradictory TLS config rejected, and every shipped config file loading cleanly.
+- Load balancing (`internal/lb`, `internal/proxy/lb_test.go`, `internal/gateway/lb_test.go`):
+  - Each strategy's distribution, weights being respected (and smooth), and least connections tracking in-flight load.
+  - Sticky hashing being stable, moving only the affected clients when a backend leaves, and returning them when it comes back.
+  - Active health checks removing and re-adding a backend, and all-unhealthy failing fast with 503.
+  - Passive ejection and its expiry.
+  - Per-backend circuit breakers not tripping siblings, and retries picking a different backend.
+  - WebSockets staying on their backend, and mixed TLS/plain pools.
+  - SIGHUP reloads adding backends, removing and draining them (with the timeout cancelling stragglers, which are retried elsewhere), carrying state over for unchanged backends, and failing without touching the live pool.
+  - Single-target routes behaving exactly as before.
+  - Concurrent load across every strategy under `-race`.
 - Distributed tracing (`internal/gateway/tracing_test.go`, `internal/tracing`), using OpenTelemetry's in-memory span recorder against the real pipeline:
   - The expected span tree for a normal request, and cache hit vs miss attributes.
   - One `backend.attempt` span per retry, each propagated with its own span as the backend's parent.
@@ -1090,7 +1234,7 @@ storage:     { backend: memory|redis, redis: { addr, password, db, dial_timeout 
 rate_limit:  { algorithm, scope: api_key|ip|header, header_name, tiers: {...}, clients: {...} }
 auth:        { enabled, header, api_keys: [...], jwt: { algorithm: HS256|RS256, secret | secret_env, public_key_file, issuer, audience, leeway, client_id_claim, tier_claim }, mtls: { identity_field: cn|san_dns|serial, tiers: { <tier>: { cn: [...], ou: [...] } } } }
 cors:        { enabled, allowed_origins, allowed_methods, allowed_headers, allow_credentials, max_age }
-routes:      [ { path_prefix | host, target, auth_mode: api_key|jwt|mtls|either, backend_tls: { enabled, ca_file, client_cert_file, client_key_file, server_name, insecure_skip_verify }, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen }, websocket, ws_idle_timeout, ws_max_connections, ws_max_connections_per_client, ws_allowed_origins: [...] } ]
+routes:      [ { path_prefix | host, target | backends: [ { target, weight, backend_tls } ], lb_strategy, lb_hash_header, health_check: { enabled, path, interval, timeout, healthy_threshold, unhealthy_threshold, expected_status }, passive_health_check: { enabled, consecutive_failures, ejection_duration }, drain_timeout, auth_mode: api_key|jwt|mtls|either, backend_tls: { enabled, ca_file, client_cert_file, client_key_file, server_name, insecure_skip_verify }, cache: { enabled, ttl }, circuit_breaker: { enabled, failure_threshold, open_duration, half_open_max_requests, half_open_successes_to_close, half_open_failures_to_reopen }, websocket, ws_idle_timeout, ws_max_connections, ws_max_connections_per_client, ws_allowed_origins: [...] } ]
 metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
 tracing:     { enabled, exporter: otlp_grpc|otlp_http|stdout, endpoint, insecure, service_name, sample_ratio, resource_attributes: {...}, response_header }

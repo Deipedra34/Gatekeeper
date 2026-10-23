@@ -1,0 +1,58 @@
+# Optional load-balancing demo for the docker-compose stack: two more
+# mock-backend instances next to the existing one, and Gatekeeper running
+# configs/config.docker.lb.yaml, whose /api/lb route balances across all
+# three with active and passive health checks.
+#
+# Layered on top of docker-compose.yml; a plain `docker-compose up` still
+# runs the single-backend stack.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.lb.yml up --build
+#
+# Each instance's admin endpoints are published on the host so you can
+# break one on purpose (requests through Gatekeeper are load balanced, so
+# they can't target a single instance):
+#   mock-backend    -> http://localhost:9101
+#   mock-backend-2  -> http://localhost:9102
+#   mock-backend-3  -> http://localhost:9103
+#
+#   curl -X POST localhost:9102/_admin/fail            # 503 for everything
+#   curl -X POST "localhost:9102/_admin/slow?delay=3s"  # slow down
+#   curl -X POST localhost:9102/_admin/recover
+#   docker-compose stop mock-backend-2                  # or just kill it
+#
+# See README.md's "Load balancing" section for the full demo.
+
+services:
+  mock-backend:
+    environment:
+      INSTANCE_NAME: mock-backend-1
+    ports:
+      - "9101:9000"
+
+  mock-backend-2:
+    build:
+      context: ./mockbackend
+    restart: unless-stopped
+    environment:
+      INSTANCE_NAME: mock-backend-2
+    ports:
+      - "9102:9000"
+
+  mock-backend-3:
+    build:
+      context: ./mockbackend
+    restart: unless-stopped
+    environment:
+      INSTANCE_NAME: mock-backend-3
+    ports:
+      - "9103:9000"
+
+  gatekeeper:
+    depends_on:
+      mock-backend-2:
+        condition: service_started
+      mock-backend-3:
+        condition: service_started
+    volumes:
+      - ./configs/config.docker.lb.yaml:/app/configs/config.yaml:ro

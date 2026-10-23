@@ -193,7 +193,7 @@ func TestBackendTLS_RetriesAndCircuitBreakerStillApply(t *testing.T) {
 	require.NoError(t, err)
 	_, isRetry := router.routes[0].proxy.Transport.(*retryTransport)
 	require.True(t, isRetry, "the TLS transport sits inside the retry transport")
-	require.NotNil(t, router.routes[0].breaker)
+	require.NotNil(t, router.routes[0].pool.Backends()[0].Breaker())
 
 	rec := serve(t, router, "/")
 	assert.Equal(t, http.StatusOK, rec.Code, "a 503 from the HTTPS backend is retried")

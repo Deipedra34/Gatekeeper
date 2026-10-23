@@ -18,6 +18,7 @@ const (
 	CloseReasonBackend     = "backend"
 	CloseReasonIdleTimeout = "idle_timeout"
 	CloseReasonShutdown    = "shutdown"
+	CloseReasonDrained     = "backend_removed"
 )
 
 // Close status codes the gateway sends when it ends a connection itself

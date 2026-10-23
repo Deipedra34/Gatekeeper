@@ -121,8 +121,8 @@ const (
 // master switch: when it's false every request is let through regardless
 // of any route's auth_mode, exactly as before JWT support existed.
 type AuthConfig struct {
-	Enabled bool      `yaml:"enabled"`
-	Header  string    `yaml:"header"`
+	Enabled bool       `yaml:"enabled"`
+	Header  string     `yaml:"header"`
 	APIKeys []string   `yaml:"api_keys"`
 	JWT     JWTConfig  `yaml:"jwt"`
 	MTLS    MTLSConfig `yaml:"mtls"`
@@ -213,8 +213,32 @@ type Route struct {
 	// enabled: "api_key" (the default), "jwt", "mtls", or "either".
 	AuthMode string `yaml:"auth_mode"`
 
-	// BackendTLS configures TLS from Gatekeeper to this route's backend.
+	// BackendTLS configures TLS from Gatekeeper to this route's backend
+	// (every backend, unless one sets its own).
 	BackendTLS BackendTLSConfig `yaml:"backend_tls"`
+
+	// Backends, used instead of Target, spreads the route over several
+	// backends (see EffectiveBackends). Target and Backends are mutually
+	// exclusive; a route with a single Target is a one-backend pool and
+	// behaves exactly as it did before load balancing existed.
+	Backends []BackendConfig `yaml:"backends"`
+
+	// LBStrategy picks a backend per request: round_robin (the default),
+	// least_connections, weighted_round_robin, random, ip_hash, or
+	// consistent_hash.
+	LBStrategy string `yaml:"lb_strategy"`
+
+	// LBHashHeader is the request header consistent_hash keys on; empty
+	// means the client IP.
+	LBHashHeader string `yaml:"lb_hash_header"`
+
+	HealthCheck        HealthCheckConfig   `yaml:"health_check"`
+	PassiveHealthCheck PassiveHealthConfig `yaml:"passive_health_check"`
+
+	// DrainTimeout bounds how long a backend removed by a config reload
+	// may keep serving its in-flight requests before they're cancelled.
+	// Defaults to 30s.
+	DrainTimeout Duration `yaml:"drain_timeout"`
 
 	// WebSocket toggles proxying of WebSocket upgrade requests on this
 	// route. Defaults to true when unset; set it to false to refuse
@@ -538,14 +562,11 @@ func (c *Config) validate() error {
 		if r.PathPrefix == "" && r.Host == "" {
 			return fmt.Errorf("routes[%d]: either path_prefix or host must be set", i)
 		}
-		if r.Target == "" {
-			return fmt.Errorf("routes[%d]: target is required", i)
+		if err := r.validateBackends(); err != nil {
+			return fmt.Errorf("routes[%d]: %w", i, err)
 		}
 		if r.Cache.TTL.Duration < 0 {
 			return fmt.Errorf("routes[%d]: cache.ttl must be >= 0", i)
-		}
-		if err := r.BackendTLS.validate(r.Target); err != nil {
-			return fmt.Errorf("routes[%d]: %w", i, err)
 		}
 		if r.WSIdleTimeout.Duration < 0 {
 			return fmt.Errorf("routes[%d]: ws_idle_timeout must be >= 0", i)

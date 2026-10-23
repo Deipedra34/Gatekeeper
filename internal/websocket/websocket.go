@@ -31,6 +31,7 @@ const (
 	RejectCircuitOpen    = "circuit_open"
 	RejectShuttingDown   = "shutting_down"
 	RejectBackend        = "backend"
+	RejectNoHealthy      = "no_healthy_backend"
 )
 
 // IsUpgrade reports whether r asks to be upgraded to the WebSocket
