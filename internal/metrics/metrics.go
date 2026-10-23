@@ -260,7 +260,7 @@ func New() *Metrics {
 		}, []string{"client", "tier"}),
 		RequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gatekeeper_request_duration_seconds",
-			Help:    "End-to-end latency of requests handled by the gateway, including the proxied backend call.",
+			Help:    "End-to-end latency of requests handled by the gateway (rejections included), by route and status code, including the proxied backend call. WebSocket connections are excluded.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"route", "status"}),
 		ProxyRetries: prometheus.NewCounterVec(prometheus.CounterOpts{

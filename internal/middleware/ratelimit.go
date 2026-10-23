@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"math"
 	"net"
@@ -60,8 +62,15 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			client := clientKey(cfg, r)
 			tier := clientTier(cfg, client)
+			// label is how the client appears in metrics and logs: never
+			// a raw API key.
+			label := client
+			if cfg.Scope == "api_key" {
+				label = APIKeyFingerprint(client)
+			}
 			if id, ok := IdentityFrom(r.Context()); ok && (id.Method == config.AuthModeJWT || id.Method == config.AuthModeMTLS) {
 				client = id.Method + ":" + id.Client
+				label = client
 				tier = claimedTier(id.Tier, limiters)
 			}
 
@@ -84,7 +93,7 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 				// Fail open, as before; the span says so.
 				span.SetAttributes(tracing.AttrRateLimitAllowed.Bool(true), tracing.AttrRateLimitError.Bool(true))
 				span.End()
-				log.Printf("ratelimiter: allow check failed for client %q, allowing request through: %v", client, err)
+				log.Printf("ratelimiter: allow check failed for client %q, allowing request through: %v", label, err)
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -100,20 +109,36 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 
 			w.Header().Set("X-RateLimit-Limit", strconv.FormatInt(result.Limit, 10))
 			w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(result.Remaining, 10))
-			m.LimiterRemaining.WithLabelValues(client, tier).Set(float64(result.Remaining))
+			m.LimiterRemaining.WithLabelValues(label, tier).Set(float64(result.Remaining))
 
 			if !result.Allowed {
 				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(result.RetryAfter.Seconds()))))
-				m.RequestsRejected.WithLabelValues(client, tier).Inc()
+				m.RequestsRejected.WithLabelValues(label, tier).Inc()
 				websocket.RecordRejectionFor(r, m, websocket.RejectRateLimit)
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}
 
-			m.RequestsAllowed.WithLabelValues(client, tier).Inc()
+			m.RequestsAllowed.WithLabelValues(label, tier).Inc()
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// APIKeyFingerprint is how an API key is identified in metrics and logs:
+// "key:" followed by the first 12 hex characters of its SHA-256. It's
+// stable across restarts and replicas (so Prometheus series continue), and
+// an operator can work out which key it is with
+//
+//	printf %s "$KEY" | sha256sum | cut -c1-12
+//
+// but the key itself never appears. An empty key (no key sent) stays "".
+func APIKeyFingerprint(key string) string {
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return "key:" + hex.EncodeToString(sum[:])[:12]
 }
 
 // RateLimitOption customises RateLimit.

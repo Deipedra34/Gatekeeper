@@ -16,6 +16,7 @@ import (
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/gateway"
 	"gatekeeper/internal/metrics"
+	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/ratelimiter/store"
 	"gatekeeper/internal/websocket"
 	"gatekeeper/internal/websocket/wstest"
@@ -182,7 +183,7 @@ func TestGateway_WebSocketHandshakeIsRateLimitedNotFrames(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		mustRoundTrip(t, c, fmt.Sprintf("frame %d", i))
 	}
-	assert.Equal(t, 1.0, testutil.ToFloat64(m.RequestsAllowed.WithLabelValues("key-alice", "default")),
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.RequestsAllowed.WithLabelValues(middleware.APIKeyFingerprint("key-alice"), "default")),
 		"one token for the handshake, none for frames")
 
 	// A second handshake from the same client, though, costs a token it

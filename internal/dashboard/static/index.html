@@ -174,9 +174,9 @@ function addLogRow(key, status, remaining, ms) {
   const time = new Date().toLocaleTimeString('en-US', { hour12: false });
   row.innerHTML =
     '<span class="t">' + time + '</span>' +
-    '<span class="' + statusClass(status) + '">' + status + '</span>' +
-    '<span>' + (key || '(no key)') + '</span>' +
-    '<span>remaining=' + remaining + '  ·  ' + ms + 'ms</span>';
+    '<span class="' + statusClass(status) + '">' + esc(status) + '</span>' +
+    '<span>' + esc(key || '(no key)') + '</span>' +
+    '<span>remaining=' + esc(remaining) + '  ·  ' + esc(ms) + 'ms</span>';
   logEl.prepend(row);
   while (logEl.children.length > 200) logEl.removeChild(logEl.lastChild);
 }
@@ -229,6 +229,31 @@ document.getElementById('clearBtn').addEventListener('click', () => {
 });
 
 // --- Live /metrics polling ---
+
+// Label values come from clients (an IP, a header value), so they're
+// escaped before going into the table.
+function esc(v) {
+  return String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Gatekeeper never puts API keys in metrics: it reports each one as
+// "key:" + the first 12 hex characters of its SHA-256. Work out the demo
+// keys' fingerprints so the table can show which is which.
+const keyNames = {};
+(async () => {
+  if (!window.crypto || !crypto.subtle) return;
+  for (const opt of document.querySelectorAll('#apiKey option')) {
+    if (!opt.value) continue;
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(opt.value));
+    const hex = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+    keyNames['key:' + hex.slice(0, 12)] = opt.value;
+  }
+})();
+
+function clientName(label) {
+  return keyNames[label] ? keyNames[label] + ' (' + label + ')' : (label || '(no key)');
+}
+
 function parseMetrics(text) {
   const rows = {};
   const re = /^gatekeeper_(requests_allowed_total|requests_rejected_total|limiter_remaining)\{client="([^"]*)",tier="([^"]*)"\}\s+([0-9.eE+-]+)/gm;
@@ -251,10 +276,10 @@ async function refreshMetrics() {
     const rows = parseMetrics(text);
     const tbody = document.querySelector('#metricsTable tbody');
     tbody.innerHTML = rows.map(r =>
-      '<tr><td>' + r.client + '</td><td>' + r.tier + '</td>' +
-      '<td class="mono">' + r.allowed + '</td>' +
-      '<td class="mono">' + r.rejected + '</td>' +
-      '<td class="mono">' + r.remaining + '</td></tr>'
+      '<tr><td>' + esc(clientName(r.client)) + '</td><td>' + esc(r.tier) + '</td>' +
+      '<td class="mono">' + esc(r.allowed) + '</td>' +
+      '<td class="mono">' + esc(r.rejected) + '</td>' +
+      '<td class="mono">' + esc(r.remaining) + '</td></tr>'
     ).join('') || '<tr><td colspan="5" style="color:var(--muted)">No data yet — send a request.</td></tr>';
   } catch (e) { /* metrics endpoint might be disabled; ignore */ }
 }

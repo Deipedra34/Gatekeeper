@@ -1025,12 +1025,12 @@ curl http://localhost:8080/metrics
 ```
 
 ```
-gatekeeper_limiter_remaining{client="demo-free-key",tier="free"} 0
-gatekeeper_limiter_remaining{client="demo-premium-key",tier="premium"} 0
-gatekeeper_requests_allowed_total{client="demo-free-key",tier="free"} 11
-gatekeeper_requests_allowed_total{client="demo-premium-key",tier="premium"} 102
-gatekeeper_requests_rejected_total{client="demo-free-key",tier="free"} 190
-gatekeeper_requests_rejected_total{client="demo-premium-key",tier="premium"} 98
+gatekeeper_limiter_remaining{client="key:9f8cfdb17116",tier="free"} 0
+gatekeeper_limiter_remaining{client="key:24fdfedfe3f3",tier="premium"} 0
+gatekeeper_requests_allowed_total{client="key:9f8cfdb17116",tier="free"} 11
+gatekeeper_requests_allowed_total{client="key:24fdfedfe3f3",tier="premium"} 102
+gatekeeper_requests_rejected_total{client="key:9f8cfdb17116",tier="free"} 190
+gatekeeper_requests_rejected_total{client="key:24fdfedfe3f3",tier="premium"} 98
 gatekeeper_proxy_retries_total{route="/api"} 4
 gatekeeper_proxy_request_outcomes_total{route="/api",outcome="success"} 108
 gatekeeper_proxy_request_outcomes_total{route="/api",outcome="failure"} 3
@@ -1038,6 +1038,8 @@ gatekeeper_cache_hits_total{route="/api"} 76
 gatekeeper_cache_misses_total{route="/api"} 32
 gatekeeper_circuit_breaker_state{route="/api"} 0
 gatekeeper_circuit_breaker_rejections_total{route="/api"} 0
+gatekeeper_request_duration_seconds_count{route="/api",status="200"} 108
+gatekeeper_request_duration_seconds_count{route="/api",status="429"} 288
 gatekeeper_auth_requests_total{method="api_key",result="success"} 213
 gatekeeper_auth_requests_total{method="api_key",result="failure"} 4
 gatekeeper_auth_requests_total{method="jwt",result="success"} 57
@@ -1071,7 +1073,15 @@ The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only
 
 Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics).
 
-(`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
+**Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
+
+```bash
+printf %s "demo-free-key" | sha256sum | cut -c1-12   # 9f8cfdb17116 -> client="key:9f8cfdb17116"
+```
+
+JWT and mTLS clients are labelled `jwt:<client id>` / `mtls:<identity>`, and `ip` / `header` scopes use the IP or header value, as before. Use high-entropy API keys: a fingerprint can't be reversed, but anyone who can read metrics can confirm a guess at a short, predictable key.
+
+`gatekeeper_request_duration_seconds` is a histogram of every request's end-to-end latency through the gateway, by `route` (`unmatched` if none matched) and `status`. That includes auth, rate limiting, the cache, the proxied backend call, and rejections such as `401` / `429`. Established WebSocket connections are left out, since they have `gatekeeper_websocket_connection_duration_seconds`. The usual Go/process collectors are exposed too.
 
 ### Grafana dashboard
 

@@ -118,3 +118,12 @@ func TestRateLimit_HeaderScopeUsesConfiguredHeader(t *testing.T) {
 	handler.ServeHTTP(rec2, req2)
 	assert.Equal(t, http.StatusOK, rec2.Code, "a different header value is a different client with its own allowance")
 }
+
+func TestAPIKeyFingerprint(t *testing.T) {
+	assert.Equal(t, "", APIKeyFingerprint(""))
+	fp := APIKeyFingerprint("demo-free-key")
+	assert.Regexp(t, `^key:[0-9a-f]{12}$`, fp)
+	assert.Equal(t, fp, APIKeyFingerprint("demo-free-key"), "stable, so metrics series continue across restarts")
+	assert.NotEqual(t, fp, APIKeyFingerprint("demo-free-kez"))
+	assert.NotContains(t, fp, "demo")
+}

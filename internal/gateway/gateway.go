@@ -278,6 +278,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 	}
 
 	h := middleware.Chain(router,
+		middleware.RequestMetrics(g.metrics, router.RouteLabelFor),
 		middleware.RequestLogger(g.logger),
 		middleware.WebSocketHandshake(router.RouteLabelFor),
 		middleware.CORS(cfg.CORS),
