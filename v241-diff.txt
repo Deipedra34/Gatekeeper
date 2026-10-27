@@ -1,0 +1,442 @@
+﻿diff --git a/README.md b/README.md
+index 7abae31..50f6b21 100644
+--- a/README.md
++++ b/README.md
+@@ -1025,12 +1025,12 @@ curl http://localhost:8080/metrics
+ ```
+ 
+ ```
+-gatekeeper_limiter_remaining{client="demo-free-key",tier="free"} 0
+-gatekeeper_limiter_remaining{client="demo-premium-key",tier="premium"} 0
+-gatekeeper_requests_allowed_total{client="demo-free-key",tier="free"} 11
+-gatekeeper_requests_allowed_total{client="demo-premium-key",tier="premium"} 102
+-gatekeeper_requests_rejected_total{client="demo-free-key",tier="free"} 190
+-gatekeeper_requests_rejected_total{client="demo-premium-key",tier="premium"} 98
++gatekeeper_limiter_remaining{client="key:9f8cfdb17116",tier="free"} 0
++gatekeeper_limiter_remaining{client="key:24fdfedfe3f3",tier="premium"} 0
++gatekeeper_requests_allowed_total{client="key:9f8cfdb17116",tier="free"} 11
++gatekeeper_requests_allowed_total{client="key:24fdfedfe3f3",tier="premium"} 102
++gatekeeper_requests_rejected_total{client="key:9f8cfdb17116",tier="free"} 190
++gatekeeper_requests_rejected_total{client="key:24fdfedfe3f3",tier="premium"} 98
+ gatekeeper_proxy_retries_total{route="/api"} 4
+ gatekeeper_proxy_request_outcomes_total{route="/api",outcome="success"} 108
+ gatekeeper_proxy_request_outcomes_total{route="/api",outcome="failure"} 3
+@@ -1038,6 +1038,8 @@ gatekeeper_cache_hits_total{route="/api"} 76
+ gatekeeper_cache_misses_total{route="/api"} 32
+ gatekeeper_circuit_breaker_state{route="/api"} 0
+ gatekeeper_circuit_breaker_rejections_total{route="/api"} 0
++gatekeeper_request_duration_seconds_count{route="/api",status="200"} 108
++gatekeeper_request_duration_seconds_count{route="/api",status="429"} 288
+ gatekeeper_auth_requests_total{method="api_key",result="success"} 213
+ gatekeeper_auth_requests_total{method="api_key",result="failure"} 4
+ gatekeeper_auth_requests_total{method="jwt",result="success"} 57
+@@ -1071,7 +1073,15 @@ The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only
+ 
+ Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics).
+ 
+-(`gatekeeper_request_duration_seconds` is also exposed as a histogram, alongside the usual Go/process collectors.)
++**Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
++
++```bash
++printf %s "demo-free-key" | sha256sum | cut -c1-12   # 9f8cfdb17116 -> client="key:9f8cfdb17116"
++```
++
++JWT and mTLS clients are labelled `jwt:<client id>` / `mtls:<identity>`, and `ip` / `header` scopes use the IP or header value, as before. Use high-entropy API keys: a fingerprint can't be reversed, but anyone who can read metrics can confirm a guess at a short, predictable key.
++
++`gatekeeper_request_duration_seconds` is a histogram of every request's end-to-end latency through the gateway, by `route` (`unmatched` if none matched) and `status`. That includes auth, rate limiting, the cache, the proxied backend call, and rejections such as `401` / `429`. Established WebSocket connections are left out, since they have `gatekeeper_websocket_connection_duration_seconds`. The usual Go/process collectors are exposed too.
+ 
+ ### Grafana dashboard
+ 
+diff --git a/internal/dashboard/static/index.html b/internal/dashboard/static/index.html
+index 2aa58ea..c45ff5b 100644
+--- a/internal/dashboard/static/index.html
++++ b/internal/dashboard/static/index.html
+@@ -174,9 +174,9 @@ function addLogRow(key, status, remaining, ms) {
+   const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+   row.innerHTML =
+     '<span class="t">' + time + '</span>' +
+-    '<span class="' + statusClass(status) + '">' + status + '</span>' +
+-    '<span>' + (key || '(no key)') + '</span>' +
+-    '<span>remaining=' + remaining + '  ┬À  ' + ms + 'ms</span>';
++    '<span class="' + statusClass(status) + '">' + esc(status) + '</span>' +
++    '<span>' + esc(key || '(no key)') + '</span>' +
++    '<span>remaining=' + esc(remaining) + '  ┬À  ' + esc(ms) + 'ms</span>';
+   logEl.prepend(row);
+   while (logEl.children.length > 200) logEl.removeChild(logEl.lastChild);
+ }
+@@ -229,6 +229,31 @@ document.getElementById('clearBtn').addEventListener('click', () => {
+ });
+ 
+ // --- Live /metrics polling ---
++
++// Label values come from clients (an IP, a header value), so they're
++// escaped before going into the table.
++function esc(v) {
++  return String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
++}
++
++// Gatekeeper never puts API keys in metrics: it reports each one as
++// "key:" + the first 12 hex characters of its SHA-256. Work out the demo
++// keys' fingerprints so the table can show which is which.
++const keyNames = {};
++(async () => {
++  if (!window.crypto || !crypto.subtle) return;
++  for (const opt of document.querySelectorAll('#apiKey option')) {
++    if (!opt.value) continue;
++    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(opt.value));
++    const hex = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
++    keyNames['key:' + hex.slice(0, 12)] = opt.value;
++  }
++})();
++
++function clientName(label) {
++  return keyNames[label] ? keyNames[label] + ' (' + label + ')' : (label || '(no key)');
++}
++
+ function parseMetrics(text) {
+   const rows = {};
+   const re = /^gatekeeper_(requests_allowed_total|requests_rejected_total|limiter_remaining)\{client="([^"]*)",tier="([^"]*)"\}\s+([0-9.eE+-]+)/gm;
+@@ -251,10 +276,10 @@ async function refreshMetrics() {
+     const rows = parseMetrics(text);
+     const tbody = document.querySelector('#metricsTable tbody');
+     tbody.innerHTML = rows.map(r =>
+-      '<tr><td>' + r.client + '</td><td>' + r.tier + '</td>' +
+-      '<td class="mono">' + r.allowed + '</td>' +
+-      '<td class="mono">' + r.rejected + '</td>' +
+-      '<td class="mono">' + r.remaining + '</td></tr>'
++      '<tr><td>' + esc(clientName(r.client)) + '</td><td>' + esc(r.tier) + '</td>' +
++      '<td class="mono">' + esc(r.allowed) + '</td>' +
++      '<td class="mono">' + esc(r.rejected) + '</td>' +
++      '<td class="mono">' + esc(r.remaining) + '</td></tr>'
+     ).join('') || '<tr><td colspan="5" style="color:var(--muted)">No data yet ÔÇö send a request.</td></tr>';
+   } catch (e) { /* metrics endpoint might be disabled; ignore */ }
+ }
+diff --git a/internal/gateway/gateway.go b/internal/gateway/gateway.go
+index e50791f..2d9c3b7 100644
+--- a/internal/gateway/gateway.go
++++ b/internal/gateway/gateway.go
+@@ -278,6 +278,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
+ 	}
+ 
+ 	h := middleware.Chain(router,
++		middleware.RequestMetrics(g.metrics, router.RouteLabelFor),
+ 		middleware.RequestLogger(g.logger),
+ 		middleware.WebSocketHandshake(router.RouteLabelFor),
+ 		middleware.CORS(cfg.CORS),
+diff --git a/internal/gateway/metrics_test.go b/internal/gateway/metrics_test.go
+new file mode 100644
+index 0000000..b333298
+--- /dev/null
++++ b/internal/gateway/metrics_test.go
+@@ -0,0 +1,99 @@
++package gateway_test
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus/testutil"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"gatekeeper/internal/middleware"
++	"gatekeeper/internal/websocket/wstest"
++)
++
++// metricsYAML: API key auth with api_key-scoped limits (burst 2), one
++// plain route and one WebSocket route.
++func metricsYAML(httpBackend, wsBackend string, burst int) string {
++	return fmt.Sprintf(`
++storage: {backend: memory}
++rate_limit:
++  algorithm: fixed_window
++  scope: api_key
++  tiers:
++    default: {requests_per_second: 1, burst: %d}
++auth:
++  enabled: true
++  api_keys: ["sk-live-0123456789abcdef"]
++routes:
++  - path_prefix: "/ws"
++    target: %q
++  - path_prefix: "/api"
++    target: %q
++`, burst, wsBackend, httpBackend)
++}
++
++func TestMetrics_RequestDurationIsRecordedByRouteAndStatus(t *testing.T) {
++	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
++	t.Cleanup(backend.Close)
++	ws := httptest.NewServer(wstest.EchoHandler())
++	t.Cleanup(ws.Close)
++	g := newLBGateway(t, metricsYAML(backend.URL, ws.URL, 3))
++
++	// An established WebSocket connection is not a "request latency"
++	// (it uses one of the 3 tokens).
++	srv := httptest.NewServer(g.gw)
++	t.Cleanup(srv.Close)
++	c, _, err := wstest.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/ws", http.Header{"X-Api-Key": {"sk-live-0123456789abcdef"}})
++	require.NoError(t, err)
++	time.Sleep(20 * time.Millisecond)
++	c.Close()
++
++	key := http.Header{"X-Api-Key": {"sk-live-0123456789abcdef"}}
++	send := func(path string, h http.Header) int {
++		req := httptest.NewRequest(http.MethodGet, path, nil)
++		for k, v := range h {
++			req.Header[k] = v
++		}
++		rec := httptest.NewRecorder()
++		g.gw.ServeHTTP(rec, req)
++		return rec.Code
++	}
++	require.Equal(t, http.StatusOK, send("/api/a", key))
++	require.Equal(t, http.StatusOK, send("/api/b", key))
++	require.Equal(t, http.StatusTooManyRequests, send("/api/c", key))
++	require.Equal(t, http.StatusUnauthorized, send("/api/d", nil))
++
++	hist := g.m.RequestDuration
++	assert.Equal(t, 3, testutil.CollectAndCount(hist), "one series per route+status seen: 200, 429, 401 on /api")
++	body := g.metrics(t)
++	assert.Contains(t, body, `gatekeeper_request_duration_seconds_count{route="/api",status="200"} 2`)
++	assert.Contains(t, body, `gatekeeper_request_duration_seconds_count{route="/api",status="429"} 1`)
++	assert.Contains(t, body, `gatekeeper_request_duration_seconds_count{route="/api",status="401"} 1`)
++	assert.NotContains(t, body, `gatekeeper_request_duration_seconds_count{route="/ws"`, "the 101 isn't timed")
++}
++
++func TestMetrics_APIKeysNeverAppearInLabels(t *testing.T) {
++	const apiKey = "sk-live-0123456789abcdef"
++	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
++	t.Cleanup(backend.Close)
++	g := newLBGateway(t, metricsYAML(backend.URL, backend.URL, 2))
++
++	for i := 0; i < 3; i++ { // 2 allowed, 1 rejected
++		req := httptest.NewRequest(http.MethodGet, "/api/x", nil)
++		req.Header.Set("X-Api-Key", apiKey)
++		g.gw.ServeHTTP(httptest.NewRecorder(), req)
++	}
++
++	body := g.metrics(t)
++	assert.NotContains(t, body, apiKey, "the raw key is nowhere in /metrics")
++	fp := middleware.APIKeyFingerprint(apiKey)
++	assert.Equal(t, "key:8598adc12a31", fp, "matches: printf %%s \"$KEY\" | sha256sum | cut -c1-12")
++	assert.Contains(t, body, fmt.Sprintf(`gatekeeper_requests_allowed_total{client=%q,tier="default"} 2`, fp))
++	assert.Contains(t, body, fmt.Sprintf(`gatekeeper_requests_rejected_total{client=%q,tier="default"} 1`, fp))
++	assert.Contains(t, body, fmt.Sprintf(`gatekeeper_limiter_remaining{client=%q,tier="default"} 0`, fp))
++}
+diff --git a/internal/gateway/websocket_test.go b/internal/gateway/websocket_test.go
+index ad3e4cf..5426401 100644
+--- a/internal/gateway/websocket_test.go
++++ b/internal/gateway/websocket_test.go
+@@ -16,6 +16,7 @@ import (
+ 	"gatekeeper/internal/config"
+ 	"gatekeeper/internal/gateway"
+ 	"gatekeeper/internal/metrics"
++	"gatekeeper/internal/middleware"
+ 	"gatekeeper/internal/ratelimiter/store"
+ 	"gatekeeper/internal/websocket"
+ 	"gatekeeper/internal/websocket/wstest"
+@@ -182,7 +183,7 @@ func TestGateway_WebSocketHandshakeIsRateLimitedNotFrames(t *testing.T) {
+ 	for i := 0; i < 25; i++ {
+ 		mustRoundTrip(t, c, fmt.Sprintf("frame %d", i))
+ 	}
+-	assert.Equal(t, 1.0, testutil.ToFloat64(m.RequestsAllowed.WithLabelValues("key-alice", "default")),
++	assert.Equal(t, 1.0, testutil.ToFloat64(m.RequestsAllowed.WithLabelValues(middleware.APIKeyFingerprint("key-alice"), "default")),
+ 		"one token for the handshake, none for frames")
+ 
+ 	// A second handshake from the same client, though, costs a token it
+diff --git a/internal/metrics/metrics.go b/internal/metrics/metrics.go
+index ff0225f..3e14ccb 100644
+--- a/internal/metrics/metrics.go
++++ b/internal/metrics/metrics.go
+@@ -260,7 +260,7 @@ func New() *Metrics {
+ 		}, []string{"client", "tier"}),
+ 		RequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+ 			Name:    "gatekeeper_request_duration_seconds",
+-			Help:    "End-to-end latency of requests handled by the gateway, including the proxied backend call.",
++			Help:    "End-to-end latency of requests handled by the gateway (rejections included), by route and status code, including the proxied backend call. WebSocket connections are excluded.",
+ 			Buckets: prometheus.DefBuckets,
+ 		}, []string{"route", "status"}),
+ 		ProxyRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
+diff --git a/internal/middleware/ratelimit.go b/internal/middleware/ratelimit.go
+index 4934269..8deaf88 100644
+--- a/internal/middleware/ratelimit.go
++++ b/internal/middleware/ratelimit.go
+@@ -1,6 +1,8 @@
+ package middleware
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
+ 	"log"
+ 	"math"
+ 	"net"
+@@ -60,8 +62,15 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
+ 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			client := clientKey(cfg, r)
+ 			tier := clientTier(cfg, client)
++			// label is how the client appears in metrics and logs: never
++			// a raw API key.
++			label := client
++			if cfg.Scope == "api_key" {
++				label = APIKeyFingerprint(client)
++			}
+ 			if id, ok := IdentityFrom(r.Context()); ok && (id.Method == config.AuthModeJWT || id.Method == config.AuthModeMTLS) {
+ 				client = id.Method + ":" + id.Client
++				label = client
+ 				tier = claimedTier(id.Tier, limiters)
+ 			}
+ 
+@@ -84,7 +93,7 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
+ 				// Fail open, as before; the span says so.
+ 				span.SetAttributes(tracing.AttrRateLimitAllowed.Bool(true), tracing.AttrRateLimitError.Bool(true))
+ 				span.End()
+-				log.Printf("ratelimiter: allow check failed for client %q, allowing request through: %v", client, err)
++				log.Printf("ratelimiter: allow check failed for client %q, allowing request through: %v", label, err)
+ 				next.ServeHTTP(w, r)
+ 				return
+ 			}
+@@ -100,22 +109,38 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
+ 
+ 			w.Header().Set("X-RateLimit-Limit", strconv.FormatInt(result.Limit, 10))
+ 			w.Header().Set("X-RateLimit-Remaining", strconv.FormatInt(result.Remaining, 10))
+-			m.LimiterRemaining.WithLabelValues(client, tier).Set(float64(result.Remaining))
++			m.LimiterRemaining.WithLabelValues(label, tier).Set(float64(result.Remaining))
+ 
+ 			if !result.Allowed {
+ 				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(result.RetryAfter.Seconds()))))
+-				m.RequestsRejected.WithLabelValues(client, tier).Inc()
++				m.RequestsRejected.WithLabelValues(label, tier).Inc()
+ 				websocket.RecordRejectionFor(r, m, websocket.RejectRateLimit)
+ 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+ 				return
+ 			}
+ 
+-			m.RequestsAllowed.WithLabelValues(client, tier).Inc()
++			m.RequestsAllowed.WithLabelValues(label, tier).Inc()
+ 			next.ServeHTTP(w, r)
+ 		})
+ 	}
+ }
+ 
++// APIKeyFingerprint is how an API key is identified in metrics and logs:
++// "key:" followed by the first 12 hex characters of its SHA-256. It's
++// stable across restarts and replicas (so Prometheus series continue), and
++// an operator can work out which key it is with
++//
++//	printf %s "$KEY" | sha256sum | cut -c1-12
++//
++// but the key itself never appears. An empty key (no key sent) stays "".
++func APIKeyFingerprint(key string) string {
++	if key == "" {
++		return ""
++	}
++	sum := sha256.Sum256([]byte(key))
++	return "key:" + hex.EncodeToString(sum[:])[:12]
++}
++
+ // RateLimitOption customises RateLimit.
+ type RateLimitOption func(*rateLimitOptions)
+ 
+diff --git a/internal/middleware/ratelimit_test.go b/internal/middleware/ratelimit_test.go
+index 4525aab..51c1b7c 100644
+--- a/internal/middleware/ratelimit_test.go
++++ b/internal/middleware/ratelimit_test.go
+@@ -118,3 +118,12 @@ func TestRateLimit_HeaderScopeUsesConfiguredHeader(t *testing.T) {
+ 	handler.ServeHTTP(rec2, req2)
+ 	assert.Equal(t, http.StatusOK, rec2.Code, "a different header value is a different client with its own allowance")
+ }
++
++func TestAPIKeyFingerprint(t *testing.T) {
++	assert.Equal(t, "", APIKeyFingerprint(""))
++	fp := APIKeyFingerprint("demo-free-key")
++	assert.Regexp(t, `^key:[0-9a-f]{12}$`, fp)
++	assert.Equal(t, fp, APIKeyFingerprint("demo-free-key"), "stable, so metrics series continue across restarts")
++	assert.NotEqual(t, fp, APIKeyFingerprint("demo-free-kez"))
++	assert.NotContains(t, fp, "demo")
++}
+diff --git a/internal/middleware/requestmetrics.go b/internal/middleware/requestmetrics.go
+new file mode 100644
+index 0000000..7ed2ca2
+--- /dev/null
++++ b/internal/middleware/requestmetrics.go
+@@ -0,0 +1,75 @@
++package middleware
++
++import (
++	"bufio"
++	"net"
++	"net/http"
++	"strconv"
++	"time"
++
++	"gatekeeper/internal/metrics"
++)
++
++// unmatchedRoute labels requests that matched no route.
++const unmatchedRoute = "unmatched"
++
++// RequestMetrics records every request's end-to-end latency ÔÇö auth, rate
++// limiting, cache, and the proxied backend call, rejections included ÔÇö
++// in gatekeeper_request_duration_seconds, by route (as resolved by
++// routeFor, normally the router's RouteLabelFor) and status code.
++//
++// Upgraded WebSocket connections are left out: the handler runs for the
++// connection's whole lifetime, which would swamp the latency histogram;
++// they have gatekeeper_websocket_connection_duration_seconds instead.
++func RequestMetrics(m *metrics.Metrics, routeFor func(*http.Request) (string, bool)) Middleware {
++	return func(next http.Handler) http.Handler {
++		if m == nil {
++			return next
++		}
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			start := time.Now()
++			route := unmatchedRoute
++			if routeFor != nil {
++				if label, ok := routeFor(r); ok {
++					route = label
++				}
++			}
++			rec := &durationRecorder{ResponseWriter: w, status: http.StatusOK}
++			next.ServeHTTP(rec, r)
++			if rec.hijacked {
++				return
++			}
++			m.RequestDuration.WithLabelValues(route, strconv.Itoa(rec.status)).Observe(time.Since(start).Seconds())
++		})
++	}
++}
++
++// durationRecorder captures the status code and whether the connection
++// was hijacked (a WebSocket upgrade).
++type durationRecorder struct {
++	http.ResponseWriter
++	status      int
++	wroteHeader bool
++	hijacked    bool
++}
++
++func (r *durationRecorder) WriteHeader(status int) {
++	if !r.wroteHeader {
++		r.status = status
++		r.wroteHeader = true
++	}
++	r.ResponseWriter.WriteHeader(status)
++}
++
++func (r *durationRecorder) Write(b []byte) (int, error) {
++	r.wroteHeader = true
++	return r.ResponseWriter.Write(b)
++}
++
++func (r *durationRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++	conn, brw, err := http.NewResponseController(r.ResponseWriter).Hijack()
++	if err == nil {
++		r.hijacked = true
++	}
++	return conn, brw, err
++}
