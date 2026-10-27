@@ -2,7 +2,10 @@
 
 # ---- Builder ----------------------------------------------------------
 # go.mod pins `go 1.26.5`, so the builder image must match or exceed it.
-FROM golang:1.26-alpine AS builder
+# The builder always runs on the build host's platform and cross-compiles
+# for the target one (CGO is off), so multi-arch builds don't need to run
+# the Go toolchain under emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
@@ -12,7 +15,19 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+# Set by docker buildx / BuildKit for the platform being built.
+ARG TARGETOS
+ARG TARGETARCH
+
+# Build metadata reported by `gatekeeper -version`. The release workflow
+# passes these; a plain `docker build` / `docker compose build` keeps the
+# defaults.
+ARG VERSION=dev
+ARG COMMIT=none
+ARG DATE=unknown
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
+    -ldflags="-s -w -X gatekeeper/internal/version.Version=${VERSION} -X gatekeeper/internal/version.Commit=${COMMIT} -X gatekeeper/internal/version.Date=${DATE}" \
     -o /out/gatekeeper ./cmd/gatekeeper
 
 # ---- Final image --------------------------------------------------------

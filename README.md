@@ -5,6 +5,9 @@
 # Gatekeeper
 
 [![CI](https://github.com/Deipedra34/Gatekeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/Deipedra34/Gatekeeper/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Deipedra34/Gatekeeper)](https://github.com/Deipedra34/Gatekeeper/releases/latest)
+[![Go version](https://img.shields.io/github/go-mod/go-version/Deipedra34/Gatekeeper)](go.mod)
+[![License](https://img.shields.io/github/license/Deipedra34/Gatekeeper)](LICENSE)
 
 Gatekeeper is a rate limiter and API gateway written in Go. It sits in front of your backend services, decides which requests get through based on per-client limits, and proxies the rest to wherever they're supposed to go. Metrics and graceful degradation come standard, not bolted on afterward.
 
@@ -28,6 +31,75 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Load balancing and health checks.** A route can spread traffic over several backends with round robin, weighted round robin, least connections, random, or sticky IP / header hashing. Active and passive health checks take failing backends out of rotation and bring them back. Circuit breakers are per backend, retries fail over to a different backend, and backends removed by a reload drain gracefully. A single `target` still works exactly as before.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
+
+## Installation
+
+Every [GitHub Release](https://github.com/Deipedra34/Gatekeeper/releases) has prebuilt binaries for Linux, macOS, and Windows on amd64 and arm64, plus a SHA256 checksums file, and a multi-arch Docker image is published to GitHub Container Registry. To build from source instead, see [Setup](#setup).
+
+### Prebuilt binaries
+
+Archives are named `gatekeeper_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), where `<os>` is `linux`, `darwin`, or `windows` and `<arch>` is `amd64` or `arm64`. Each one contains the `gatekeeper` binary, this README, the LICENSE, and the example [`configs/config.yaml`](configs/config.yaml).
+
+Linux / macOS:
+
+```bash
+VERSION=2.5.0
+OS=linux     # or darwin
+ARCH=amd64   # or arm64
+BASE="https://github.com/Deipedra34/Gatekeeper/releases/download/v${VERSION}"
+
+curl -LO "${BASE}/gatekeeper_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -LO "${BASE}/gatekeeper_${VERSION}_checksums.txt"
+sha256sum --ignore-missing -c "gatekeeper_${VERSION}_checksums.txt"   # macOS: shasum -a 256 --ignore-missing -c ...
+
+tar xzf "gatekeeper_${VERSION}_${OS}_${ARCH}.tar.gz"
+./gatekeeper -version
+./gatekeeper -config configs/config.yaml
+```
+
+The macOS binaries aren't notarized. If you downloaded one with a browser rather than `curl`, clear the quarantine flag first: `xattr -d com.apple.quarantine ./gatekeeper`.
+
+Windows (PowerShell):
+
+```powershell
+$Version = "2.5.0"
+$Zip = "gatekeeper_${Version}_windows_amd64.zip"   # or windows_arm64
+$Base = "https://github.com/Deipedra34/Gatekeeper/releases/download/v$Version"
+
+Invoke-WebRequest "$Base/$Zip" -OutFile $Zip
+Invoke-WebRequest "$Base/gatekeeper_${Version}_checksums.txt" -OutFile checksums.txt
+$Expected = (Select-String checksums.txt -Pattern " $Zip" -SimpleMatch).Line.Split(" ")[0]
+if ((Get-FileHash $Zip -Algorithm SHA256).Hash -eq $Expected) { "checksum OK" } else { throw "checksum MISMATCH" }
+
+Expand-Archive $Zip -DestinationPath gatekeeper
+cd gatekeeper
+.\gatekeeper.exe -config configs\config.yaml
+```
+
+`gatekeeper -version` prints what you're running:
+
+```
+gatekeeper 2.5.0
+commit: 0e34e8b5781eeaf1099bd8102835049698741049
+built: 2026-10-27T12:00:00Z
+go: go1.26.5 linux/amd64
+```
+
+A local `go build` reports `dev` / `none` / `unknown` instead.
+
+To try the example config without any real services, also download `gatekeeper-mockbackend_<version>_<os>_<arch>` from the same release. It's the stand-in backend from the [Docker Compose stack](#run-the-full-stack-with-docker-compose). Run `./mockbackend` next to the gateway: it listens on `:9000`, where the example config's catch-all `/` route points, so `curl -i http://localhost:8080/api/ping -H "X-API-Key: demo-free-key"` goes all the way through.
+
+### Docker image
+
+Images are published for `linux/amd64` and `linux/arm64`, tagged with the release version and `latest`:
+
+```bash
+docker pull ghcr.io/deipedra34/gatekeeper:latest     # or a specific version, e.g. :2.5.0
+docker run --rm ghcr.io/deipedra34/gatekeeper:latest -version
+docker run --rm -p 8080:8080 ghcr.io/deipedra34/gatekeeper:latest
+```
+
+The image runs the example `configs/config.yaml` by default. Mounting your own config works the same as for a locally built image; see [Run with Docker](#run-with-docker).
 
 ## Architecture
 
@@ -881,7 +953,7 @@ Edit [`configs/config.yaml`](configs/config.yaml) so `routes` points at your act
 ./bin/gatekeeper -config configs/config.yaml
 ```
 
-By default Gatekeeper listens on `:8080` and exposes metrics on `/metrics`.
+By default Gatekeeper listens on `:8080` and exposes metrics on `/metrics`. `./bin/gatekeeper -version` prints the version, commit, build date, and Go version.
 
 ### Windows launchers
 
@@ -934,6 +1006,8 @@ Build the image:
 ```bash
 docker build -t gatekeeper .
 ```
+
+The binary reports `dev` from `-version` unless you pass build metadata, as the release workflow does: `--build-arg VERSION=2.5.0 --build-arg COMMIT=$(git rev-parse HEAD) --build-arg DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)`.
 
 Run it with the bundled config:
 

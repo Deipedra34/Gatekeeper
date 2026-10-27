@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+#
+# Release builds for Gatekeeper. Run by .github/workflows/release.yml when
+# a v* tag is pushed; try it locally with:
+#
+#   goreleaser check
+#   goreleaser release --snapshot --clean   # output in dist/
+version: 2
+
+project_name: gatekeeper
+
+builds:
+  - id: gatekeeper
+    main: ./cmd/gatekeeper
+    binary: gatekeeper
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, windows, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X gatekeeper/internal/version.Version={{ .Version }}
+      - -X gatekeeper/internal/version.Commit={{ .FullCommit }}
+      - -X gatekeeper/internal/version.Date={{ .Date }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+  # The stand-in upstream from docker-compose.yml, shipped separately so
+  # the example config (routes on localhost:9000) can be tried out from a
+  # download, without Go or Docker. It's its own Go module.
+  - id: mockbackend
+    dir: mockbackend
+    main: .
+    binary: mockbackend
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, windows, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: gatekeeper
+    ids: [gatekeeper]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+      - configs/config.yaml
+
+  - id: mockbackend
+    ids: [mockbackend]
+    name_template: "{{ .ProjectName }}-mockbackend_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '(?i)^(docs?|tests?|chore|ci|style)\b'
+      - '(?i)^(update|tweak|polish|reword)\s+(the\s+)?(readme|docs?|documentation|changelog)\b'
+      - '(?i)^merge (pull request|branch|remote-tracking branch)\b'
+      - '(?i)^(typo|fix typos?)\b'
+  groups:
+    - title: Features
+      regexp: '(?i)^(feat|feature|add|adds|added|introduce|implement|support)\b'
+      order: 0
+    - title: Bug fixes
+      regexp: '(?i)^(fix|fixes|fixed|bugfix|hotfix)\b'
+      order: 1
+    - title: Other changes
+      order: 999
+
+release:
+  # Never fail on, or overwrite the notes of, a GitHub Release that
+  # already exists for the tag (e.g. one drafted by hand): keep its notes
+  # and just attach the archives and checksums.
+  mode: keep-existing
+  replace_existing_artifacts: true
+  prerelease: auto
+  footer: |
+    **Docker image:** `docker pull ghcr.io/deipedra34/gatekeeper:{{ .Version }}`
+
+    Verify a download with `sha256sum --ignore-missing -c {{ .ProjectName }}_{{ .Version }}_checksums.txt`.

@@ -36,6 +36,7 @@ import (
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/ratelimiter/store"
 	"gatekeeper/internal/server"
+	"gatekeeper/internal/version"
 )
 
 // redisHealthCheckInterval controls how often FallbackStore re-probes a
@@ -45,7 +46,13 @@ const redisHealthCheckInterval = 5 * time.Second
 func main() {
 	configPath := flag.String("config", "configs/config.yaml", "path to YAML config file")
 	enableDashboard := flag.Bool("dashboard", false, "serve an interactive HTML dashboard at /_dashboard for local testing/demos")
+	showVersion := flag.Bool("version", false, "print version, commit, build date and Go version, then exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.String())
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
