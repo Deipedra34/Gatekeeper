@@ -19,13 +19,16 @@ import (
 // metricsYAML: API key auth with api_key-scoped limits (burst 2), one
 // plain route and one WebSocket route.
 func metricsYAML(httpBackend, wsBackend string, burst int) string {
+	// A token bucket that takes 100s+ to refill, so exactly `burst`
+	// requests get through however the test is timed (a fixed window
+	// resets on wall-clock second boundaries).
 	return fmt.Sprintf(`
 storage: {backend: memory}
 rate_limit:
-  algorithm: fixed_window
+  algorithm: token_bucket
   scope: api_key
   tiers:
-    default: {requests_per_second: 1, burst: %d}
+    default: {requests_per_second: 0.01, burst: %d}
 auth:
   enabled: true
   api_keys: ["sk-live-0123456789abcdef"]

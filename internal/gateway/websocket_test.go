@@ -172,8 +172,28 @@ routes:
 
 func TestGateway_WebSocketHandshakeIsRateLimitedNotFrames(t *testing.T) {
 	wsBackend, plain := echoServers(t)
-	// Burst 1: exactly one handshake per second per client.
-	base, _, m := startWSGateway(t, wsGatewayConfig(wsBackend.URL, plain.URL, 1, ""))
+	// Burst 1 with a token bucket that takes 100s to refill: exactly one
+	// handshake per client for the life of the test. (A fixed window
+	// resets on wall-clock second boundaries, so a second handshake a few
+	// milliseconds later could land in a fresh window and get through.)
+	base, _, m := startWSGateway(t, fmt.Sprintf(`
+storage:
+  backend: memory
+rate_limit:
+  algorithm: token_bucket
+  scope: api_key
+  tiers:
+    default: {requests_per_second: 0.01, burst: 1}
+auth:
+  enabled: true
+  header: "X-API-Key"
+  api_keys: ["key-alice", "key-bob"]
+routes:
+  - path_prefix: "/ws"
+    target: "%s"
+  - path_prefix: "/"
+    target: "%s"
+`, wsBackend.URL, plain.URL))
 
 	c, _, err := wstest.Dial(base+"/ws", keyHeader("key-alice"))
 	require.NoError(t, err)
