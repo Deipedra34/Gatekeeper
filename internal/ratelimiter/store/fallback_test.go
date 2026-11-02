@@ -24,8 +24,9 @@ func (brokenStore) Load(context.Context, string) ([]byte, error) {
 func (brokenStore) CompareAndSwap(context.Context, string, []byte, []byte, time.Duration) (bool, error) {
 	return false, errors.New("connection refused")
 }
-func (brokenStore) Ping(context.Context) error { return errors.New("connection refused") }
-func (brokenStore) Close() error               { return nil }
+func (brokenStore) Delete(context.Context, string) error { return errors.New("connection refused") }
+func (brokenStore) Ping(context.Context) error           { return errors.New("connection refused") }
+func (brokenStore) Close() error                         { return nil }
 
 func TestFallbackStore_FallsBackWhenPrimaryErrors(t *testing.T) {
 	fs := NewFallbackStore(brokenStore{}, NewMemoryStore(), time.Hour, log.Default())
@@ -99,6 +100,14 @@ func (s *toggleStore) CompareAndSwap(context.Context, string, []byte, []byte, ti
 		return false, errors.New("down")
 	}
 	return true, nil
+}
+func (s *toggleStore) Delete(context.Context, string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.healthy {
+		return errors.New("down")
+	}
+	return nil
 }
 func (s *toggleStore) Ping(context.Context) error {
 	s.mu.Lock()

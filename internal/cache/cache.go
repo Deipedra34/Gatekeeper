@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gatekeeper/internal/ratelimiter/store"
@@ -48,16 +50,40 @@ type Entry struct {
 // store error to a caller that can't sensibly handle one — Get and Set
 // both report failure so the caller can fail open (treat it as a miss,
 // go to the backend) instead of crashing when Redis is unreachable.
+//
+// Cache also keeps an index of the entries this process wrote — route,
+// request URI, and expiry, never the response — since keys are hashes
+// and can't be matched against a route or URL prefix after the fact.
+// That index is what admin purges and stats work from.
 type Cache struct {
 	store store.Store
+
+	mu    sync.Mutex
+	index map[string]Meta
+	sets  int // Set calls since the index was last pruned
+
+	hits, misses, writes, purged atomic.Int64
 }
+
+// Meta describes a cached entry for the admin API: the route that cached
+// it and the request URI (path and query) it answers.
+type Meta struct {
+	Route string
+	URI   string
+
+	expiresAt time.Time
+}
+
+// pruneEvery is how many writes go by between sweeps of expired entries
+// out of the index, so it stays bounded by what's live in the store.
+const pruneEvery = 1024
 
 // New creates a Cache backed by st. st is typically the same store the
 // rate limiter uses (including a FallbackStore, if storage.backend is
 // "redis"), so a Redis outage degrades caching the same way it degrades
 // rate limiting.
 func New(st store.Store) *Cache {
-	return &Cache{store: st}
+	return &Cache{store: st, index: map[string]Meta{}}
 }
 
 // Key builds the cache key for a request served by the route identified
@@ -105,6 +131,7 @@ func Storable(header http.Header) bool {
 func (c *Cache) Get(ctx context.Context, key string) (*Entry, bool, error) {
 	raw, err := c.store.Load(ctx, key)
 	if err == store.ErrNotFound {
+		c.misses.Add(1)
 		return nil, false, nil
 	}
 	if err != nil {
@@ -114,6 +141,7 @@ func (c *Cache) Get(ctx context.Context, key string) (*Entry, bool, error) {
 	if err := json.Unmarshal(raw, &e); err != nil {
 		return nil, false, err
 	}
+	c.hits.Add(1)
 	return &e, true, nil
 }
 
@@ -122,6 +150,12 @@ func (c *Cache) Get(ctx context.Context, key string) (*Entry, bool, error) {
 // write in place rather than retrying, since both requests are caching
 // the same backend response anyway.
 func (c *Cache) Set(ctx context.Context, key string, entry *Entry, ttl time.Duration) error {
+	return c.SetFor(ctx, key, Meta{}, entry, ttl)
+}
+
+// SetFor is Set, also recording meta in the index so the entry can later
+// be purged by route or URL prefix.
+func (c *Cache) SetFor(ctx context.Context, key string, meta Meta, entry *Entry, ttl time.Duration) error {
 	newVal, err := json.Marshal(entry)
 	if err != nil {
 		return err
@@ -135,6 +169,108 @@ func (c *Cache) Set(ctx context.Context, key string, entry *Entry, ttl time.Dura
 		old = nil
 	}
 
-	_, err = c.store.CompareAndSwap(ctx, key, old, newVal, ttl)
-	return err
+	ok, err := c.store.CompareAndSwap(ctx, key, old, newVal, ttl)
+	if err != nil || !ok {
+		return err
+	}
+	c.writes.Add(1)
+	meta.expiresAt = time.Now().Add(ttl)
+	c.mu.Lock()
+	c.index[key] = meta
+	if c.sets++; c.sets >= pruneEvery {
+		c.pruneLocked(time.Now())
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Cache) pruneLocked(now time.Time) {
+	c.sets = 0
+	for k, m := range c.index {
+		if now.After(m.expiresAt) {
+			delete(c.index, k)
+		}
+	}
+}
+
+// PurgeFilter selects the entries Purge removes. Both fields empty means
+// every entry; when both are set an entry must match both.
+type PurgeFilter struct {
+	// Route matches the route label exactly (its path prefix, or its
+	// host for a host route).
+	Route string
+	// URLPrefix matches the start of the cached request URI.
+	URLPrefix string
+}
+
+func (f PurgeFilter) matches(m Meta) bool {
+	if f.Route != "" && m.Route != f.Route {
+		return false
+	}
+	return f.URLPrefix == "" || strings.HasPrefix(m.URI, f.URLPrefix)
+}
+
+// Purge deletes the indexed entries matching f and returns how many it
+// removed — or, with dryRun, how many it would remove, touching nothing.
+//
+// It only knows about entries this process cached. With a Redis store
+// shared by several gateways, run it against each one; entries another
+// instance cached expire on their own TTL.
+func (c *Cache) Purge(ctx context.Context, f PurgeFilter, dryRun bool) (int, error) {
+	c.mu.Lock()
+	c.pruneLocked(time.Now())
+	var keys []string
+	for k, m := range c.index {
+		if f.matches(m) {
+			keys = append(keys, k)
+		}
+	}
+	c.mu.Unlock()
+	if dryRun {
+		return len(keys), nil
+	}
+
+	n := 0
+	for _, k := range keys {
+		if err := c.store.Delete(ctx, k); err != nil {
+			return n, err
+		}
+		c.mu.Lock()
+		delete(c.index, k)
+		c.mu.Unlock()
+		n++
+	}
+	c.purged.Add(int64(n))
+	return n, nil
+}
+
+// Stats is a point-in-time summary of the cache, for the admin API.
+type Stats struct {
+	// Entries counts the unexpired entries this process cached, in total
+	// and per route.
+	Entries        int            `json:"entries"`
+	EntriesByRoute map[string]int `json:"entries_by_route"`
+	// Hits, Misses, Writes, and Purged count since startup. Hits and
+	// Misses are lookups that found or didn't find an entry; a store
+	// error counts as neither.
+	Hits   int64 `json:"hits"`
+	Misses int64 `json:"misses"`
+	Writes int64 `json:"writes"`
+	Purged int64 `json:"purged"`
+}
+
+// Stats returns the cache's current Stats.
+func (c *Cache) Stats() Stats {
+	c.mu.Lock()
+	c.pruneLocked(time.Now())
+	byRoute := map[string]int{}
+	for _, m := range c.index {
+		byRoute[m.Route]++
+	}
+	entries := len(c.index)
+	c.mu.Unlock()
+	return Stats{
+		Entries: entries, EntriesByRoute: byRoute,
+		Hits: c.hits.Load(), Misses: c.misses.Load(), Writes: c.writes.Load(), Purged: c.purged.Load(),
+	}
 }

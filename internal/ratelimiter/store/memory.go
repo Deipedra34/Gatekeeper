@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -126,6 +127,14 @@ func (s *MemoryStore) CompareAndSwap(_ context.Context, key string, oldVal, newV
 	return true, nil
 }
 
+// Delete implements Store.
+func (s *MemoryStore) Delete(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data, key)
+	return nil
+}
+
 // Ping implements Store. The in-memory store is always reachable.
 func (s *MemoryStore) Ping(_ context.Context) error {
 	return nil
@@ -145,6 +154,17 @@ func encodeInt64(n int64) []byte {
 		byte(n >> 56), byte(n >> 48), byte(n >> 40), byte(n >> 32),
 		byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n),
 	}
+}
+
+// DecodeCounter reads a counter written by Increment, as returned by
+// Load: RedisStore keeps counters as decimal strings ("3"), MemoryStore
+// as 8 big-endian bytes. The two can't be confused — 8 bytes that all
+// happen to be ASCII digits would be a counter in the quadrillions.
+func DecodeCounter(b []byte) int64 {
+	if n, err := strconv.ParseInt(string(b), 10, 64); err == nil {
+		return n
+	}
+	return decodeInt64(b)
 }
 
 func decodeInt64(b []byte) int64 {

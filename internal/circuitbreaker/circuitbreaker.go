@@ -176,6 +176,18 @@ func (cb *CircuitBreaker) Report(success bool) {
 	}
 }
 
+// Reset forces the breaker back to Closed with its failure counts
+// cleared, whatever state it was in (an operator override from the admin
+// API). It returns the state it was in before.
+func (cb *CircuitBreaker) Reset() State {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.maybeExpireOpen(time.Now())
+	prev := cb.state
+	cb.toClosed()
+	return prev
+}
+
 // maybeExpireOpen lazily resolves an elapsed Open cooldown into
 // Half-Open, the same way MemoryStore lazily expires a stale entry only
 // when it's next touched, instead of running a background timer.

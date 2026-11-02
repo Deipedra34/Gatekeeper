@@ -113,6 +113,18 @@ func (fs *FallbackStore) CompareAndSwap(ctx context.Context, key string, oldVal,
 	return fs.secondary.CompareAndSwap(ctx, key, oldVal, newVal, ttl)
 }
 
+// Delete implements Store. The key is removed from the secondary too, so
+// state written there during an outage can't resurface the next time
+// the store falls back.
+func (fs *FallbackStore) Delete(ctx context.Context, key string) error {
+	if fs.healthy.Load() {
+		if err := fs.primary.Delete(ctx, key); err != nil {
+			fs.markUnhealthy(err)
+		}
+	}
+	return fs.secondary.Delete(ctx, key)
+}
+
 // Ping implements Store, reporting on whichever backend is currently
 // active.
 func (fs *FallbackStore) Ping(ctx context.Context) error {

@@ -84,3 +84,61 @@ func TestBypass(t *testing.T) {
 	r.Header.Set(BypassHeader, "1")
 	assert.True(t, Bypass(r))
 }
+
+func TestCache_PurgeByRouteAndURLPrefix(t *testing.T) {
+	c := New(store.NewMemoryStore())
+	ctx := context.Background()
+	entry := &Entry{StatusCode: http.StatusOK, Body: []byte("x")}
+	put := func(key, route, uri string) {
+		t.Helper()
+		require.NoError(t, c.SetFor(ctx, key, Meta{Route: route, URI: uri}, entry, time.Minute))
+	}
+	present := func(key string) bool {
+		_, hit, err := c.Get(ctx, key)
+		require.NoError(t, err)
+		return hit
+	}
+	put("u1", "/api/users", "/api/users/1")
+	put("u2", "/api/users", "/api/users/2?full=1")
+	put("o1", "/api/orders", "/api/orders/9")
+
+	n, err := c.Purge(ctx, PurgeFilter{Route: "/api/users"}, true)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "dry run reports what would go")
+	assert.True(t, present("u1"), "dry run deletes nothing")
+
+	n, err = c.Purge(ctx, PurgeFilter{URLPrefix: "/api/users/2"}, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	assert.False(t, present("u2"))
+	assert.True(t, present("u1"))
+
+	n, err = c.Purge(ctx, PurgeFilter{}, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "an empty filter purges everything")
+	assert.False(t, present("u1"))
+	assert.False(t, present("o1"))
+
+	stats := c.Stats()
+	assert.Equal(t, 0, stats.Entries)
+	assert.Equal(t, int64(3), stats.Writes)
+	assert.Equal(t, int64(3), stats.Purged)
+}
+
+func TestCache_StatsCountHitsMissesAndEntriesByRoute(t *testing.T) {
+	c := New(store.NewMemoryStore())
+	ctx := context.Background()
+	entry := &Entry{StatusCode: http.StatusOK}
+	require.NoError(t, c.SetFor(ctx, "a", Meta{Route: "/a", URI: "/a/1"}, entry, time.Minute))
+	require.NoError(t, c.SetFor(ctx, "b", Meta{Route: "/a", URI: "/a/2"}, entry, time.Minute))
+	require.NoError(t, c.SetFor(ctx, "c", Meta{Route: "/b", URI: "/b"}, entry, time.Minute))
+
+	_, _, _ = c.Get(ctx, "a")
+	_, _, _ = c.Get(ctx, "missing")
+
+	stats := c.Stats()
+	assert.Equal(t, 3, stats.Entries)
+	assert.Equal(t, map[string]int{"/a": 2, "/b": 1}, stats.EntriesByRoute)
+	assert.Equal(t, int64(1), stats.Hits)
+	assert.Equal(t, int64(1), stats.Misses)
+}

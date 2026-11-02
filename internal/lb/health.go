@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -151,6 +152,24 @@ func (r *Registry) remove(b *Backend) {
 	r.mu.Lock()
 	delete(r.backends, b)
 	r.mu.Unlock()
+}
+
+// Backends returns every registered backend — including any still
+// draining after a reload removed them — sorted by route, then label.
+func (r *Registry) Backends() []*Backend {
+	r.mu.Lock()
+	out := make([]*Backend, 0, len(r.backends))
+	for b := range r.backends {
+		out = append(out, b)
+	}
+	r.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Route() != out[j].Route() {
+			return out[i].Route() < out[j].Route()
+		}
+		return out[i].Label() < out[j].Label()
+	})
+	return out
 }
 
 // Snapshot reports every registered backend's state. Two entries for the

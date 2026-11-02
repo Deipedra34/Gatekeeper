@@ -86,6 +86,9 @@ const (
 	AttrAttempt = attribute.Key("gatekeeper.backend.attempt")
 	AttrRetry   = attribute.Key("gatekeeper.backend.retry")
 
+	AttrAdminIdentity = attribute.Key("gatekeeper.admin.identity")
+	AttrAdminResult   = attribute.Key("gatekeeper.admin.result")
+
 	AttrWSRejectReason = attribute.Key("gatekeeper.websocket.reject_reason")
 	AttrWSCloseReason  = attribute.Key("gatekeeper.websocket.close_reason")
 )

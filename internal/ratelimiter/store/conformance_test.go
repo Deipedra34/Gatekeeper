@@ -154,6 +154,41 @@ func testStoreConformance(t *testing.T, newStore func() (Store, func(time.Durati
 		assert.Equal(t, int64(1), successes, "exactly one concurrent CAS from the same base value should succeed")
 	})
 
+	t.Run("Delete removes a key and tolerates a missing one", func(t *testing.T) {
+		s, _ := newStore()
+		defer s.Close()
+		ctx := context.Background()
+
+		ok, err := s.CompareAndSwap(ctx, "del-key", nil, []byte("v"), time.Minute)
+		require.NoError(t, err)
+		require.True(t, ok)
+		_, err = s.Increment(ctx, "del-counter", time.Minute)
+		require.NoError(t, err)
+
+		require.NoError(t, s.Delete(ctx, "del-key"))
+		require.NoError(t, s.Delete(ctx, "del-counter"))
+		require.NoError(t, s.Delete(ctx, "never-existed"))
+
+		_, err = s.Load(ctx, "del-key")
+		assert.ErrorIs(t, err, ErrNotFound)
+		n, err := s.Increment(ctx, "del-counter", time.Minute)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), n, "a deleted counter starts over")
+	})
+
+	t.Run("DecodeCounter reads what Increment stored", func(t *testing.T) {
+		s, _ := newStore()
+		defer s.Close()
+		ctx := context.Background()
+		for i := 0; i < 3; i++ {
+			_, err := s.Increment(ctx, "decode-counter", time.Minute)
+			require.NoError(t, err)
+		}
+		raw, err := s.Load(ctx, "decode-counter")
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), DecodeCounter(raw))
+	})
+
 	t.Run("Ping succeeds", func(t *testing.T) {
 		s, _ := newStore()
 		defer s.Close()

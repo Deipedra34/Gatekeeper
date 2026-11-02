@@ -256,10 +256,7 @@ func (r *Router) Close() { r.backends.Close() }
 // routeLabel identifies a route for metrics purposes: its path prefix,
 // or its host if it has no path prefix.
 func routeLabel(rt config.Route) string {
-	if rt.PathPrefix != "" {
-		return rt.PathPrefix
-	}
-	return rt.Host
+	return rt.Label()
 }
 
 // newBreaker returns the circuit breaker for one of rt's backends (nil
@@ -443,7 +440,8 @@ func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, rt *ro
 			Header:     rec.Header().Clone(),
 			Body:       rec.body,
 		}
-		if err := r.cache.Set(ctx, key, fresh, rt.cacheTTL); err != nil {
+		meta := cache.Meta{Route: rt.label, URI: req.URL.RequestURI()}
+		if err := r.cache.SetFor(ctx, key, meta, fresh, rt.cacheTTL); err != nil {
 			log.Printf("cache: write failed for route %s: %v", rt.label, err)
 		}
 	}

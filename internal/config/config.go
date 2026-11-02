@@ -17,6 +17,12 @@ type Duration struct {
 	time.Duration
 }
 
+// MarshalYAML implements yaml.Marshaler, writing the same "5s" form
+// UnmarshalYAML reads.
+func (d Duration) MarshalYAML() (any, error) {
+	return d.String(), nil
+}
+
 // UnmarshalYAML implements yaml.Unmarshaler.
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	var s string
@@ -43,6 +49,7 @@ type Config struct {
 	Proxy     ProxyConfig     `yaml:"proxy"`
 	TLS       TLSConfig       `yaml:"tls"`
 	Tracing   TracingConfig   `yaml:"tracing"`
+	Admin     AdminConfig     `yaml:"admin"`
 }
 
 // ServerConfig controls the HTTP listener Gatekeeper itself exposes.
@@ -288,6 +295,15 @@ func (r Route) EffectiveWSIdleTimeout() time.Duration {
 	return r.WSIdleTimeout.Duration
 }
 
+// Label identifies the route in metrics, logs, and the admin API: its
+// path prefix, or its host if it has no path prefix.
+func (r Route) Label() string {
+	if r.PathPrefix != "" {
+		return r.PathPrefix
+	}
+	return r.Host
+}
+
 // EffectiveAuthMode returns the route's auth mode, applying the
 // "api_key by default" rule for a route built without going through
 // Load/applyDefaults (e.g. constructed directly in tests).
@@ -461,6 +477,7 @@ func (c *Config) applyDefaults() {
 	c.Auth.MTLS.applyDefaults()
 	c.TLS.applyDefaults()
 	c.Tracing.applyDefaults()
+	c.Admin.applyDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -605,6 +622,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.Tracing.validate(); err != nil {
+		return err
+	}
+	if err := c.Admin.validate(c.Server, c.TLS); err != nil {
 		return err
 	}
 

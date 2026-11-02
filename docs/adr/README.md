@@ -9,3 +9,4 @@ format: Title, Status, Context, Decision, Consequences.
 4. [FallbackStore for graceful degradation when Redis is unreachable](0004-fallback-store-graceful-degradation.md)
 5. [OpenTelemetry with OTLP for distributed tracing](0005-opentelemetry-otlp-tracing.md)
 6. [Load balancing: per-backend state, per-attempt selection, and drain-on-reload](0006-load-balancing.md)
+7. [Admin API on a separate, authenticated listener](0007-admin-api-separate-listener.md)

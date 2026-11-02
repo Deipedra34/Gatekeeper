@@ -1,0 +1,558 @@
+openapi: 3.1.0
+info:
+  title: Gatekeeper Admin API
+  version: "1"
+  description: |
+    Operator API for a running Gatekeeper gateway. It is served on its own
+    listener (admin.listen, default 127.0.0.1:9090), never on the public
+    proxy port, and is disabled unless admin.enabled is true.
+
+    Every endpoint requires authentication: a bearer token (configured as
+    its SHA-256 hash) or a verified client certificate when admin.mtls is
+    enabled. Requests may additionally be restricted by admin.allowed_cidrs,
+    and a source IP is locked out (429) after too many failed attempts.
+
+    Endpoints marked `x-destructive: true` change what clients experience.
+    Most actions accept `dry_run=true` to report what they would do
+    without doing it.
+
+    Every non-2xx response uses the Error schema.
+  license:
+    name: MIT
+servers:
+  - url: http://127.0.0.1:9090
+    description: Default admin listener (loopback only)
+security:
+  - bearerToken: []
+  - clientCertificate: []
+
+tags:
+  - name: read
+    description: Read-only views of the running gateway
+  - name: actions
+    description: Operations that change gateway state
+
+paths:
+  /admin/v1/status:
+    get:
+      tags: [read]
+      summary: Version, uptime and config load time
+      operationId: getStatus
+      responses:
+        "200":
+          description: Gateway status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/config:
+    get:
+      tags: [read]
+      summary: The running config, with every secret redacted
+      description: |
+        Same keys as the YAML config file. API keys (auth.api_keys, and
+        rate_limit.clients keys under scope api_key) are replaced by their
+        "key:<12 hex>" fingerprints; auth.jwt.secret, storage.redis.password
+        and admin token hashes become "[REDACTED]"; credentials embedded in
+        URLs are removed. File paths are shown, file contents never are.
+      operationId: getConfig
+      responses:
+        "200":
+          description: Redacted config
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/routes:
+    get:
+      tags: [read]
+      summary: Configured routes and their backends
+      operationId: listRoutes
+      responses:
+        "200":
+          description: Routes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  routes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Route" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/backends:
+    get:
+      tags: [read]
+      summary: Live state of every backend
+      description: Includes backends a reload removed that are still draining.
+      operationId: listBackends
+      responses:
+        "200":
+          description: Backends
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backends:
+                    type: array
+                    items: { $ref: "#/components/schemas/Backend" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/ratelimits/{client}:
+    get:
+      tags: [read]
+      summary: A client's current quota, without consuming any
+      operationId: getRateLimit
+      parameters:
+        - $ref: "#/components/parameters/Client"
+        - $ref: "#/components/parameters/Tier"
+      responses:
+        "200":
+          description: Quota state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quota" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/cache/stats:
+    get:
+      tags: [read]
+      summary: Response cache statistics
+      description: Counts entries cached by this instance; hits, misses, writes and purges since startup.
+      operationId: getCacheStats
+      responses:
+        "200":
+          description: Cache statistics
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CacheStats" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/reload:
+    post:
+      tags: [actions]
+      summary: Reload the config file (same as SIGHUP)
+      description: |
+        Re-reads and validates the config file and swaps it in atomically,
+        along with the TLS certificates. If the new config is invalid the
+        previous one stays active and 422 is returned with the validation
+        error. With dry_run=true the file is only validated.
+      operationId: reload
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: Reloaded (or, with dry_run, valid)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReloadResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422":
+          description: The new config is invalid; the previous config is still active
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/cache/purge:
+    post:
+      tags: [actions]
+      summary: Purge cached responses
+      x-destructive: true
+      description: |
+        Removes cached responses by route, by request URL prefix, or all of
+        them. Purging everything must be requested explicitly with
+        {"all": true}; an empty body is rejected. Only entries cached by
+        this instance are known; with a shared Redis store, purge each
+        instance.
+      operationId: purgeCache
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PurgeRequest" }
+            examples:
+              route: { value: { route: "/api/users" } }
+              prefix: { value: { url_prefix: "/api/users/42" } }
+              all: { value: { all: true } }
+      responses:
+        "200":
+          description: Purged (or, with dry_run, would purge) this many entries
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PurgeResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413":
+          description: Request body larger than admin.max_body_bytes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+        "502": { $ref: "#/components/responses/StoreError" }
+
+  /admin/v1/ratelimits/{client}/reset:
+    post:
+      tags: [actions]
+      summary: Give a client its full allowance back
+      x-destructive: true
+      operationId: resetRateLimit
+      parameters:
+        - $ref: "#/components/parameters/Client"
+        - $ref: "#/components/parameters/Tier"
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: The client's quota after the reset (or, with dry_run, unchanged)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Quota"
+                  - $ref: "#/components/schemas/ActionResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+        "502": { $ref: "#/components/responses/StoreError" }
+
+  /admin/v1/backends/{id}/drain:
+    post:
+      tags: [actions]
+      summary: Take a backend out of rotation
+      x-destructive: true
+      description: |
+        New requests stop going to the backend; requests already in flight
+        finish normally. Health checks keep running. The backend stays out
+        of rotation until enabled again or the process restarts, including
+        across reloads that keep it. Draining a route's last backend in
+        rotation is refused (409) unless force=true.
+      operationId: drainBackend
+      parameters:
+        - $ref: "#/components/parameters/BackendID"
+        - $ref: "#/components/parameters/DryRun"
+        - name: force
+          in: query
+          description: Drain even the route's last backend in rotation.
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Drained (or, with dry_run, would be)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BackendActionResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/backends/{id}/enable:
+    post:
+      tags: [actions]
+      summary: Put a drained backend back in rotation
+      description: The backend receives traffic again once it is also healthy.
+      operationId: enableBackend
+      parameters:
+        - $ref: "#/components/parameters/BackendID"
+      responses:
+        "200":
+          description: Enabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BackendActionResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/circuit-breakers/{id}/reset:
+    post:
+      tags: [actions]
+      summary: Force a backend's circuit breaker closed
+      description: Circuit breakers are per backend, so {id} is the backend ID.
+      operationId: resetCircuitBreaker
+      parameters:
+        - $ref: "#/components/parameters/BackendID"
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: Reset (or, with dry_run, the current state)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BreakerResetResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The backend's circuit breaker is disabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: A token whose SHA-256 is listed in admin.tokens.
+    clientCertificate:
+      type: mutualTLS
+      description: |
+        A client certificate verified against admin.tls.client_ca_file,
+        with a CN in admin.mtls.allowed_cns when that list is set.
+
+  parameters:
+    DryRun:
+      name: dry_run
+      in: query
+      description: Report what would happen without changing anything.
+      schema: { type: boolean, default: false }
+    Client:
+      name: client
+      in: path
+      required: true
+      description: |
+        The client as named in /metrics: an API key by its fingerprint
+        "key:<12 hex>" (a raw key is rejected), "jwt:<id>", "mtls:<identity>",
+        or the IP / header value for ip and header scopes.
+      schema: { type: string }
+      example: "key:9f8cfdb17116"
+    Tier:
+      name: tier
+      in: query
+      description: Rate limit tier to use, for clients whose tier comes from their credential.
+      schema: { type: string }
+    BackendID:
+      name: id
+      in: path
+      required: true
+      description: Backend ID from /admin/v1/backends or /admin/v1/routes.
+      schema: { type: string, pattern: "^[0-9a-f]{12}$" }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Source address not in admin.allowed_cidrs
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    TooManyAuthFailures:
+      description: Too many failed authentication attempts from this address
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadRequest:
+      description: Invalid parameters or request body
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such client, backend or endpoint
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: The action would leave a route without backends; pass force=true
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    StoreError:
+      description: The rate limit / cache store could not be reached
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [unauthorized, forbidden, too_many_auth_failures, not_found, method_not_allowed,
+                     bad_request, body_too_large, invalid_config, conflict, internal_error]
+            message: { type: string }
+
+    Status:
+      type: object
+      properties:
+        version: { type: string, example: "2.6.0" }
+        commit: { type: string }
+        build_date: { type: string }
+        go_version: { type: string }
+        started_at: { type: string, format: date-time }
+        uptime_seconds: { type: number }
+        config_path: { type: string }
+        config_loaded_at: { type: string, format: date-time }
+        routes: { type: integer }
+        storage_backend: { type: string, enum: [memory, redis] }
+        rate_limit:
+          type: object
+          properties:
+            algorithm: { type: string }
+            scope: { type: string }
+        tracing_enabled: { type: boolean }
+        tls_enabled: { type: boolean }
+        admin_tls_enabled: { type: boolean }
+        backends_registered: { type: integer }
+
+    Route:
+      type: object
+      properties:
+        label: { type: string }
+        path_prefix: { type: string }
+        host: { type: string }
+        auth_mode: { type: string, enum: [api_key, jwt, mtls, either] }
+        lb_strategy: { type: string }
+        websocket: { type: boolean }
+        backends:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              target: { type: string }
+              weight: { type: integer }
+        cache:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            ttl: { type: string, example: "1m0s" }
+        circuit_breaker:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            failure_threshold: { type: integer }
+            open_duration: { type: string }
+
+    Backend:
+      type: object
+      properties:
+        id: { type: string, example: "3fa2c1d4e5b6" }
+        route: { type: string }
+        target: { type: string }
+        weight: { type: integer }
+        healthy: { type: boolean, description: Passing health checks and not ejected }
+        in_rotation: { type: boolean, description: Receiving new traffic }
+        disabled: { type: boolean, description: Drained through the admin API }
+        draining: { type: boolean, description: Removed by a reload, finishing in-flight work }
+        in_flight: { type: integer }
+        circuit_breaker: { type: string, enum: [closed, open, half_open, disabled] }
+
+    Quota:
+      type: object
+      properties:
+        client: { type: string }
+        tier: { type: string }
+        algorithm: { type: string }
+        limit: { type: integer }
+        remaining: { type: integer }
+        allowed: { type: boolean, description: Whether the next request would be allowed }
+        retry_after_seconds: { type: number }
+
+    CacheStats:
+      type: object
+      properties:
+        entries: { type: integer }
+        entries_by_route:
+          type: object
+          additionalProperties: { type: integer }
+        hits: { type: integer }
+        misses: { type: integer }
+        writes: { type: integer }
+        purged: { type: integer }
+
+    ActionResult:
+      type: object
+      properties:
+        action: { type: string }
+        dry_run: { type: boolean }
+
+    ReloadResult:
+      allOf:
+        - $ref: "#/components/schemas/ActionResult"
+        - type: object
+          properties:
+            reloaded: { type: boolean }
+            valid: { type: boolean, description: Set on dry runs }
+            config_loaded_at: { type: string, format: date-time }
+            routes: { type: integer }
+
+    PurgeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        all: { type: boolean, description: Purge everything. Can't be combined with route or url_prefix. }
+        route: { type: string, description: Route label (its path prefix, or host) }
+        url_prefix: { type: string, description: Prefix of the cached request URI (path and query) }
+
+    PurgeResult:
+      allOf:
+        - $ref: "#/components/schemas/ActionResult"
+        - type: object
+          properties:
+            purged: { type: integer }
+            filter: { $ref: "#/components/schemas/PurgeRequest" }
+
+    BackendActionResult:
+      allOf:
+        - $ref: "#/components/schemas/ActionResult"
+        - type: object
+          properties:
+            backend: { $ref: "#/components/schemas/Backend" }
+            route_backends_in_rotation:
+              type: integer
+              description: Other backends of the route still in rotation (drain only)
+            note: { type: string }
+
+    BreakerResetResult:
+      allOf:
+        - $ref: "#/components/schemas/ActionResult"
+        - type: object
+          properties:
+            id: { type: string }
+            route: { type: string }
+            target: { type: string }
+            previous_state: { type: string, enum: [closed, open, half_open] }
+            state: { type: string, enum: [closed] }

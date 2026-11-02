@@ -11,7 +11,9 @@ package lb
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"net/http"
 	"net/url"
 	"sync"
@@ -62,6 +64,9 @@ type Backend struct {
 	ejectedUntil    atomic.Int64 // unix nanos; 0 = not ejected
 
 	draining atomic.Bool
+	// disabled is set by an operator (the admin API) to keep the backend
+	// out of rotation regardless of its health.
+	disabled atomic.Bool
 	ctx      context.Context
 	cancel   context.CancelFunc
 }
@@ -84,6 +89,18 @@ func Label(target *url.URL) string {
 	u := *target
 	u.User = nil
 	return u.String()
+}
+
+// ID identifies the backend in the admin API: the first 12 hex
+// characters of the SHA-256 of its route and label. It's stable across
+// reloads and restarts as long as the route and target don't change, and
+// URL-safe, unlike the target itself.
+func (b *Backend) ID() string { return BackendID(b.route, b.label) }
+
+// BackendID computes the ID of the backend with this route and label.
+func BackendID(route, label string) string {
+	sum := sha256.Sum256([]byte(route + "\x00" + label))
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // Route returns the label of the route the backend belongs to.
@@ -149,7 +166,19 @@ func (b *Backend) Healthy() bool {
 func (b *Backend) Draining() bool { return b.draining.Load() }
 
 // Available reports whether the backend may receive new traffic.
-func (b *Backend) Available() bool { return !b.draining.Load() && b.Healthy() }
+func (b *Backend) Available() bool {
+	return !b.draining.Load() && !b.disabled.Load() && b.Healthy()
+}
+
+// SetDisabled takes the backend out of rotation (true) or puts it back
+// (false) by operator decision. Requests already in flight finish
+// normally; health checks keep running, so its health is current when
+// it's re-enabled. The setting survives config reloads that keep the
+// backend, but not a restart.
+func (b *Backend) SetDisabled(disabled bool) { b.disabled.Store(disabled) }
+
+// Disabled reports whether an operator took the backend out of rotation.
+func (b *Backend) Disabled() bool { return b.disabled.Load() }
 
 // Context is cancelled when a drain times out; work in flight on the
 // backend should stop when it's done.

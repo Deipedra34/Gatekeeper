@@ -13,6 +13,10 @@
 // certificates), and SIGHUP also reloads the server certificate and key;
 // they're additionally reloaded whenever their files change on disk.
 //
+// With admin.enabled an authenticated admin API is served on its own
+// listener (127.0.0.1:9090 by default); its POST /admin/v1/reload does
+// exactly what SIGHUP does.
+//
 // On SIGINT/SIGTERM the server stops accepting connections, finishes
 // in-flight requests, and closes proxied WebSocket connections with a
 // Close frame, all within a 10s shutdown window, then flushes any
@@ -99,28 +103,45 @@ func main() {
 		}
 	}()
 
-	// SIGHUP triggers an in-place config reload, plus a reload of the TLS
-	// certificate. server.*, storage.*, metrics.*, and tls.* (other than
-	// the certificate itself) are read only at startup; everything else
-	// swaps live.
+	// reload is what SIGHUP and POST /admin/v1/reload both do: an
+	// in-place config reload, plus a reload of the TLS certificate. (Each
+	// reloads the admin listener's certificate too.) server.*, storage.*,
+	// metrics.*, tls.*, and admin.* (other than the certificates
+	// themselves) are read only at startup; everything else swaps live.
+	reload := func() error {
+		certFile, keyFile := "", ""
+		err := gw.Reload()
+		if err != nil {
+			log.Printf("gatekeeper: config reload failed, keeping previous config: %v", err)
+		} else {
+			c := gw.Config()
+			log.Printf("gatekeeper: config reloaded (algorithm=%s scope=%s routes=%d)",
+				c.RateLimit.Algorithm, c.RateLimit.Scope, len(c.Routes))
+			if c.TLS.Enabled {
+				certFile, keyFile = c.TLS.CertFile, c.TLS.KeyFile
+			}
+		}
+		// Logged by the reloader; a failure keeps the old certificate.
+		_ = srv.ReloadCertificates(certFile, keyFile)
+		return err
+	}
+
+	// The admin API, when enabled, gets its own listener. Opening it here
+	// means a port clash or bad admin TLS setup stops startup.
+	adminSrv, err := startAdmin(cfg, gw, reload, m)
+	if err != nil {
+		log.Fatalf("gatekeeper: admin API: %v", err)
+	}
+
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
 			log.Println("gatekeeper: SIGHUP received, reloading config")
-			certFile, keyFile := "", ""
-			if err := gw.Reload(); err != nil {
-				log.Printf("gatekeeper: config reload failed, keeping previous config: %v", err)
-			} else {
-				c := gw.Config()
-				log.Printf("gatekeeper: config reloaded (algorithm=%s scope=%s routes=%d)",
-					c.RateLimit.Algorithm, c.RateLimit.Scope, len(c.Routes))
-				if c.TLS.Enabled {
-					certFile, keyFile = c.TLS.CertFile, c.TLS.KeyFile
-				}
+			_ = reload()
+			if adminSrv != nil {
+				_ = adminSrv.ReloadCertificates()
 			}
-			// Logged by the reloader; a failure keeps the old certificate.
-			_ = srv.ReloadCertificates(certFile, keyFile)
 		}
 	}()
 
@@ -138,8 +159,21 @@ func main() {
 	wsDone := make(chan error, 1)
 	go func() { wsDone <- gw.ShutdownWebSockets(shutdownCtx) }()
 
+	// The admin listener drains alongside the main one.
+	adminDone := make(chan error, 1)
+	go func() {
+		if adminSrv == nil {
+			adminDone <- nil
+			return
+		}
+		adminDone <- adminSrv.Shutdown(shutdownCtx)
+	}()
+
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("gatekeeper: shutdown error: %v", err)
+	}
+	if err := <-adminDone; err != nil {
+		log.Printf("gatekeeper: admin API shutdown error: %v", err)
 	}
 	if err := <-wsDone; err != nil {
 		log.Printf("gatekeeper: websocket connections did not close in time and were dropped: %v", err)

@@ -172,8 +172,9 @@ func (brokenStore) Load(context.Context, string) ([]byte, error) {
 func (brokenStore) CompareAndSwap(context.Context, string, []byte, []byte, time.Duration) (bool, error) {
 	return false, errors.New("connection refused")
 }
-func (brokenStore) Ping(context.Context) error { return errors.New("connection refused") }
-func (brokenStore) Close() error               { return nil }
+func (brokenStore) Delete(context.Context, string) error { return errors.New("connection refused") }
+func (brokenStore) Ping(context.Context) error           { return errors.New("connection refused") }
+func (brokenStore) Close() error                         { return nil }
 
 func TestRouter_CacheDegradesGracefullyWhenStoreIsDown(t *testing.T) {
 	backend, calls := countingBackend(t, nil)

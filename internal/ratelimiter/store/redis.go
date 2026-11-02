@@ -108,6 +108,11 @@ func (s *RedisStore) CompareAndSwap(ctx context.Context, key string, oldVal, new
 	return n == 1, nil
 }
 
+// Delete implements Store.
+func (s *RedisStore) Delete(ctx context.Context, key string) error {
+	return s.client.Del(ctx, key).Err()
+}
+
 // Ping implements Store.
 func (s *RedisStore) Ping(ctx context.Context) error {
 	return s.client.Ping(ctx).Err()

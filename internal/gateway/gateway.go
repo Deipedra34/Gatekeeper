@@ -59,6 +59,8 @@ type Gateway struct {
 	reloadMu sync.Mutex // serialises Reload against itself
 	pipeline atomic.Pointer[http.Handler]
 	current  atomic.Pointer[config.Config]
+	limiters atomic.Pointer[map[string]ratelimiter.Limiter]
+	loadedAt atomic.Pointer[time.Time] // when current was loaded
 
 	// tracer is the tracing pipeline the current request pipeline uses.
 	// It's rebuilt on Reload only when the tracing section changed.
@@ -112,7 +114,7 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 	if err != nil {
 		return nil, err
 	}
-	h, router, err := g.build(cfg, tp, nil)
+	h, router, limiters, err := g.build(cfg, tp, nil)
 	if err != nil {
 		_ = tp.Shutdown(context.Background())
 		return nil, err
@@ -120,7 +122,10 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 	g.pipeline.Store(&h)
 	g.router.Store(router)
 	g.current.Store(cfg)
+	g.limiters.Store(&limiters)
 	g.tracer.Store(tp)
+	now := time.Now()
+	g.loadedAt.Store(&now)
 	return g, nil
 }
 
@@ -142,6 +147,37 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) Config() *config.Config {
 	return g.current.Load()
 }
+
+// ConfigPath returns the path of the config file Reload reads.
+func (g *Gateway) ConfigPath() string { return g.configPath }
+
+// ConfigLoadedAt returns when the config currently served was loaded:
+// startup, or the last successful Reload.
+func (g *Gateway) ConfigLoadedAt() time.Time { return *g.loadedAt.Load() }
+
+// ValidateConfigFile loads and validates the config file Reload would
+// read, without applying it.
+func (g *Gateway) ValidateConfigFile() error {
+	_, err := config.Load(g.configPath)
+	return err
+}
+
+// Limiter returns the live rate limiter for tier.
+func (g *Gateway) Limiter(tier string) (ratelimiter.Limiter, bool) {
+	l, ok := (*g.limiters.Load())[tier]
+	return l, ok
+}
+
+// Cache returns the response cache, shared by every config.
+func (g *Gateway) Cache() *cache.Cache { return g.cache }
+
+// Backends returns every load-balanced backend, including any still
+// draining after a reload removed them.
+func (g *Gateway) Backends() []*lb.Backend { return g.backends.Backends() }
+
+// Tracer returns the tracing provider the current pipeline uses (a
+// disabled one when tracing is off).
+func (g *Gateway) Tracer() *tracing.Provider { return g.tracer.Load() }
 
 // ShutdownWebSockets closes every proxied WebSocket connection
 // gracefully — a Close frame to both sides, then up to ctx's deadline for
@@ -175,7 +211,7 @@ func (g *Gateway) Reload() error {
 		}
 	}
 	oldRouter := g.router.Load()
-	h, router, err := g.build(cfg, tp, oldRouter)
+	h, router, limiters, err := g.build(cfg, tp, oldRouter)
 	if err != nil {
 		if tp != old {
 			_ = tp.Shutdown(context.Background())
@@ -189,7 +225,10 @@ func (g *Gateway) Reload() error {
 	g.pipeline.Store(&h)
 	g.router.Store(router)
 	g.current.Store(cfg)
+	g.limiters.Store(&limiters)
 	g.tracer.Store(tp)
+	now := time.Now()
+	g.loadedAt.Store(&now)
 	oldRouter.Retire(router)
 	if tp != old {
 		g.retire(old)
@@ -252,26 +291,26 @@ func (g *Gateway) retire(p *tracing.Provider) {
 // prev, if non-nil, is the live router being replaced; the new router is
 // then built to share its unchanged backends and isn't live until
 // Activate. On error, nothing live has been touched.
-func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Router) (http.Handler, *proxy.Router, error) {
+func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Router) (http.Handler, *proxy.Router, map[string]ratelimiter.Limiter, error) {
 	opts := []proxy.Option{proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends)}
 	if prev != nil {
 		opts = append(opts, proxy.WithPrevious(prev))
 	}
 	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache, opts...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	limiters, err := buildLimiters(cfg, g.store)
 	if err != nil {
 		router.Discard()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	auth, err := middleware.Auth(cfg.Auth, router.AuthModeFor, g.metrics)
 	if err != nil {
 		router.Discard()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if !cfg.Auth.Enabled && routesAcceptJWT(cfg.Routes) {
 		g.logger.Printf("auth: auth.enabled is false, so routes with auth_mode jwt or either are NOT protected")
@@ -288,7 +327,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 	// Outermost, so the server span covers the whole request and every
 	// stage below can start its span from it. A no-op when disabled.
 	h = tp.Handler(h, router.RouteLabelFor)
-	return h, router, nil
+	return h, router, limiters, nil
 }
 
 func routesAcceptJWT(routes []config.Route) bool {

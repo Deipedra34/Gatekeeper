@@ -122,6 +122,17 @@ type Metrics struct {
 	// result ("success" or "failure").
 	HealthChecks *prometheus.CounterVec
 
+	// AdminRequests counts admin API requests by endpoint (the route
+	// pattern, e.g. "POST /admin/v1/reload", never a client or backend
+	// ID) and response status code.
+	AdminRequests *prometheus.CounterVec
+
+	// AdminAuthFailures counts admin requests refused before reaching an
+	// endpoint, by reason: "missing_credentials", "invalid_token",
+	// "certificate_not_allowed", "ip_not_allowed", or "rate_limited" (a
+	// source IP over its failed-authentication limit).
+	AdminAuthFailures *prometheus.CounterVec
+
 	backends *backendCollector
 }
 
@@ -340,6 +351,14 @@ func New() *Metrics {
 			Name: "gatekeeper_backend_health_checks_total",
 			Help: "Total number of active health check probes, by route, backend, and result (success or failure).",
 		}, []string{"route", "backend", "result"}),
+		AdminRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_admin_requests_total",
+			Help: "Total number of admin API requests, by endpoint and response status code.",
+		}, []string{"endpoint", "status"}),
+		AdminAuthFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_admin_auth_failures_total",
+			Help: "Total number of admin API requests refused before reaching an endpoint, by reason.",
+		}, []string{"reason"}),
 		backends: newBackendCollector(),
 		certExpiry: &certExpiryCollector{
 			desc: prometheus.NewDesc("gatekeeper_tls_certificate_expiry_seconds",
@@ -372,6 +391,8 @@ func New() *Metrics {
 		m.BackendRequests,
 		m.BackendEjections,
 		m.HealthChecks,
+		m.AdminRequests,
+		m.AdminAuthFailures,
 		m.backends,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),

@@ -308,3 +308,44 @@ tracing:
   #   service.version: "2.3.0"
   # Return each request's trace ID in this response header (default: off).
   # response_header: X-Trace-Id
+
+# Authenticated admin API on its own listener — never on the proxy port.
+# Off by default; with it off no admin port is opened at all. Read at
+# startup only (tokens included), like server.* and tls.*. See README.md's
+# "Admin API" section and docs/admin-openapi.yaml.
+admin:
+  enabled: false
+  # Loopback-only by default. Use a different port from server.listen_addr.
+  # listen: "127.0.0.1:9090"
+  # Bearer tokens, stored ONLY as the hex SHA-256 of the token. Generate a
+  # token and its hash as described in README.md. The id names the token
+  # in the audit log.
+  # tokens:
+  #   - id: ops
+  #     sha256: "<64 hex chars: printf %s \"$TOKEN\" | sha256sum>"
+  # Accept a verified client certificate instead of (or as well as) a
+  # token. Needs tls below with a verifying client_auth.
+  # mtls:
+  #   enabled: false
+  #   allowed_cns: ["ops-admin"]      # empty: any cert from client_ca_file
+  # Optional source address allowlist (CIDRs or single IPs).
+  # allowed_cidrs: ["127.0.0.1/32", "10.0.0.0/8"]
+  # HTTPS for the admin listener; same fields as the tls section above
+  # (except redirect_http_port). Strongly recommended off loopback.
+  # tls:
+  #   enabled: false
+  #   cert_file: "certs/server.pem"
+  #   key_file: "certs/server-key.pem"
+  #   client_auth: verify_if_given
+  #   client_ca_file: "certs/ca.pem"
+  # A source IP with max_failures failed logins within window is locked
+  # out (429) until the window ends.
+  # auth_failures: {max_failures: 5, window: 1m}
+  # Defaults: read 10s, write 30s, idle 60s; bodies up to 64 KiB.
+  # read_timeout: 10s
+  # write_timeout: 30s
+  # idle_timeout: 60s
+  # max_body_bytes: 65536
+  # JSON audit log file (created 0600). Empty: the process log, one
+  # "admin-audit: {...}" line per request.
+  # audit_log: "/var/log/gatekeeper/admin-audit.log"

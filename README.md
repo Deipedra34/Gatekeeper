@@ -30,6 +30,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Distributed tracing.** Optional OpenTelemetry traces with a span per pipeline stage and per backend attempt (retries are visible), W3C `traceparent` / `baggage` propagation in and out, OTLP gRPC/HTTP export, parent-based sampling, trace IDs in log lines and an optional response header. Secrets never reach spans, and a dead collector never slows a request.
 - **Load balancing and health checks.** A route can spread traffic over several backends with round robin, weighted round robin, least connections, random, or sticky IP / header hashing. Active and passive health checks take failing backends out of rotation and bring them back. Circuit breakers are per backend, retries fail over to a different backend, and backends removed by a reload drain gracefully. A single `target` still works exactly as before.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
+- **Authenticated admin API.** Optional, on its own listener (never the proxy port). It shows status, redacted config, routes, backend health, per-client rate limit state, and cache stats. It can reload the config, purge the cache, reset rate limits, drain and re-enable backends, and reset circuit breakers. Bearer tokens are stored as SHA-256 hashes; mTLS, a CIDR allowlist, failed-login lockout, a JSON audit log, tracing, and metrics are all included.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
 ## Installation
@@ -152,6 +153,7 @@ internal/cache/        the response cache: key derivation, Cache-Control handlin
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
 internal/server/       the listeners: plain HTTP or HTTPS (mTLS, certificate hot reload, HSTS), plus the HTTP→HTTPS redirect
 internal/lb/           load balancing: backend pools, strategies, consistent hashing, active/passive health checks, draining
+internal/admin/        the admin API: its own listener, token/mTLS auth, audit log, and the status/config/backends/cache/ratelimit endpoints
 internal/tracing/      OpenTelemetry setup (exporters, sampling, OTEL_* overrides), the server span, and span/propagation helpers
 internal/certgen/      throwaway CA / server / client certificate generation for tests and scripts/gencerts
 internal/websocket/    WebSocket upgrade detection, the frame relay, and the hub tracking open connections (limits, idle timeout, shutdown)
@@ -997,6 +999,203 @@ TLS certificate itself: `SIGHUP` also reloads the server certificate and
 key (see [Certificate hot reload](#certificate-hot-reload)). The `tracing`
 section is reloaded too (see [Distributed tracing](#distributed-tracing)).
 
+## Admin API
+
+An optional HTTP API for operating a running gateway. You can read its status, redacted config, routes, backend health, per-client rate limit state, and cache stats. You can also reload the config, purge the cache, reset a client's rate limit, drain or re-enable a backend, and reset a circuit breaker.
+
+It's **off by default**: without `admin.enabled: true`, no admin port is opened at all and Gatekeeper behaves exactly as before. When enabled, it has these protections:
+
+- **It runs on its own listener** (default `127.0.0.1:9090`), never on the proxy port. `/admin/...` on the public listener is just another path, proxied to whatever route matches it, so a backend route at `/admin` can never collide with it.
+- **Every endpoint requires authentication.** Use a bearer token, a verified client certificate, or either one. Enabling the API without either configured fails startup.
+- **Tokens are stored only as SHA-256 hashes.** They're compared in constant time and never logged.
+- **Optional source CIDR allowlist.**
+- **Per-IP lockout after repeated failed logins.**
+- **JSON audit log, tracing, and metrics.** Every request gets an audit line, an OpenTelemetry span, and a count in `/metrics`.
+
+[`docs/admin-openapi.yaml`](docs/admin-openapi.yaml) is the OpenAPI spec for every endpoint, and [ADR 0007](docs/adr/0007-admin-api-separate-listener.md) explains the design.
+
+### Enabling it
+
+1. Generate a token and its hash (below).
+2. Put **only the hash** in the config:
+
+```yaml
+admin:
+  enabled: true
+  listen: "127.0.0.1:9090"          # default; a different port from server.listen_addr
+  tokens:
+    - id: ops                        # names the token in the audit log
+      sha256: "e6759ea1f7d7023d335edbba46888a563e70f2646ab10aecd6bce95998e039e9"
+  # allowed_cidrs: ["10.0.0.0/8"]    # optional source allowlist
+  # audit_log: "/var/log/gatekeeper/admin-audit.log"   # default: the process log
+```
+
+The `admin` section is read at startup only, like `server.*` and `tls.*`. Adding, removing, or rotating a token needs a restart. Every field is documented in [`configs/config.yaml`](configs/config.yaml).
+
+### Generating a token and its SHA-256 hash
+
+Use a long random token (32 random bytes, hex-encoded). Give the token to whoever calls the API, put the hash in the config, and don't keep the token anywhere else.
+
+Linux / macOS:
+
+```bash
+TOKEN=$(openssl rand -hex 32)
+HASH=$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)   # macOS: shasum -a 256
+echo "token:  $TOKEN"
+echo "sha256: $HASH"
+```
+
+Windows PowerShell:
+
+```powershell
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$Token = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+$sha = [System.Security.Cryptography.SHA256]::Create()
+$Hash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Token)) | ForEach-Object { $_.ToString("x2") })
+"token:  $Token"
+"sha256: $Hash"
+```
+
+Both hash the token's exact bytes with no trailing newline. That's why the Linux version uses `printf %s` and not `echo`. Use `printf %s`, not `echo`, when hashing an existing token too.
+
+### Authentication and access control
+
+- **Bearer token.** Send `Authorization: Bearer <token>`. The token is hashed and compared against every configured hash with `crypto/subtle`.
+  - A missing or wrong token gets `401` with `WWW-Authenticate: Bearer`.
+  - The stored hash itself is not a valid credential.
+- **Client certificate (mTLS).** Serve the admin API over HTTPS and accept certificates from your CA, optionally only certain CNs. Tokens keep working alongside certificates unless you configure none.
+
+  ```yaml
+  admin:
+    enabled: true
+    mtls: { enabled: true, allowed_cns: ["ops-admin"] }
+    tls:
+      enabled: true
+      cert_file: "certs/server.pem"
+      key_file: "certs/server-key.pem"
+      client_auth: verify_if_given      # or require_and_verify (certificates only)
+      client_ca_file: "certs/ca.pem"
+  ```
+
+  `admin.tls` takes the same settings as the top-level `tls` section, and its certificate is hot-reloaded the same way. Don't put the admin API on a non-loopback address without TLS; Gatekeeper logs a warning if you do, because tokens would cross the network in plain text.
+- **IP allowlist.** `allowed_cidrs` takes CIDRs or single addresses. Anything else gets `403` before credentials are even looked at. The source is the TCP peer address; `X-Forwarded-For` is ignored.
+- **Failed-login lockout.** After `auth_failures.max_failures` failures (default 5) within `auth_failures.window` (default 1m), that source IP gets `429` with `Retry-After` until the window ends. This applies even if it then sends the correct token.
+- **Limits.** Request bodies are capped at `max_body_bytes` (64 KiB by default; larger bodies get `413`). The listener has its own read, write, and idle timeouts, and drains alongside the main listener on shutdown.
+
+### Endpoints
+
+All responses are JSON. Errors always have the same shape:
+
+```json
+{"error": {"code": "invalid_config", "message": "reload rejected, still serving the previous config: config: invalid: ..."}}
+```
+
+| Method & path | What it does |
+|---|---|
+| `GET /admin/v1/status` | Version, commit, build date, Go version, uptime, when the config was last loaded |
+| `GET /admin/v1/config` | The running config with every secret redacted |
+| `GET /admin/v1/routes` | Routes with their backends (and backend IDs), cache and circuit breaker settings |
+| `GET /admin/v1/backends` | Every backend: health, in rotation, drained, in-flight count, circuit breaker state |
+| `GET /admin/v1/ratelimits/{client}` | A client's current quota, without spending any of it |
+| `GET /admin/v1/cache/stats` | Cached entries (total and per route), hits, misses, writes, purges |
+| `POST /admin/v1/reload` | Same as `SIGHUP`. An invalid config gets `422` with the validation error, and the old config stays |
+| `POST /admin/v1/cache/purge` | **Destructive.** Purges by route, by URL prefix, or everything |
+| `POST /admin/v1/ratelimits/{client}/reset` | **Destructive.** Gives a client its full allowance back |
+| `POST /admin/v1/backends/{id}/drain` | **Destructive.** Takes a backend out of rotation; in-flight requests finish |
+| `POST /admin/v1/backends/{id}/enable` | Puts a drained backend back in rotation |
+| `POST /admin/v1/circuit-breakers/{id}/reset` | Forces a backend's circuit breaker closed |
+
+`reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, and `circuit-breakers/{id}/reset` accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
+
+**Identifiers:**
+
+- **`{id}`** is the 12-character backend ID shown by `GET /admin/v1/backends` and `GET /admin/v1/routes`. It stays the same across reloads and restarts as long as the route and target don't change. Circuit breakers are per backend, so they use the same ID.
+- **`{client}`** names a client the way `/metrics` does:
+  - An API key is named by its fingerprint, `key:<12 hex>`. Get it with `printf %s "$KEY" | sha256sum | cut -c1-12`. A raw key is refused, so keys never end up in URLs or logs.
+  - JWT and certificate clients are `jwt:<id>` and `mtls:<identity>`.
+  - With `ip` or `header` scope, use the IP or header value.
+  - Add `?tier=<name>` to pick the tier, for clients whose tier comes from their credential.
+
+### curl examples
+
+```bash
+ADMIN=http://127.0.0.1:9090
+AUTH="Authorization: Bearer $TOKEN"
+
+# Read-only
+curl -s -H "$AUTH" $ADMIN/admin/v1/status
+curl -s -H "$AUTH" $ADMIN/admin/v1/config
+curl -s -H "$AUTH" $ADMIN/admin/v1/routes
+curl -s -H "$AUTH" $ADMIN/admin/v1/backends
+curl -s -H "$AUTH" $ADMIN/admin/v1/ratelimits/key:9f8cfdb17116     # demo-free-key's fingerprint
+curl -s -H "$AUTH" "$ADMIN/admin/v1/ratelimits/jwt:alice?tier=premium"
+curl -s -H "$AUTH" $ADMIN/admin/v1/cache/stats
+
+# Reload the config file (validate first with a dry run)
+curl -s -X POST -H "$AUTH" "$ADMIN/admin/v1/reload?dry_run=true"
+curl -s -X POST -H "$AUTH" $ADMIN/admin/v1/reload
+
+# Purge the cache: by route, by URL prefix, or everything ("all" must be explicit)
+curl -s -X POST -H "$AUTH" -d '{"route": "/api/users"}' $ADMIN/admin/v1/cache/purge
+curl -s -X POST -H "$AUTH" -d '{"url_prefix": "/api/users/42"}' "$ADMIN/admin/v1/cache/purge?dry_run=true"
+curl -s -X POST -H "$AUTH" -d '{"all": true}' $ADMIN/admin/v1/cache/purge
+
+# Give a client its full allowance back
+curl -s -X POST -H "$AUTH" $ADMIN/admin/v1/ratelimits/key:9f8cfdb17116/reset
+
+# Take a backend out of rotation and back (IDs from /admin/v1/backends)
+curl -s -X POST -H "$AUTH" $ADMIN/admin/v1/backends/3fa2c1d4e5b6/drain
+curl -s -X POST -H "$AUTH" "$ADMIN/admin/v1/backends/3fa2c1d4e5b6/drain?force=true"   # even the route's last one
+curl -s -X POST -H "$AUTH" $ADMIN/admin/v1/backends/3fa2c1d4e5b6/enable
+
+# Close a backend's circuit breaker
+curl -s -X POST -H "$AUTH" $ADMIN/admin/v1/circuit-breakers/3fa2c1d4e5b6/reset
+```
+
+With admin TLS and a client certificate, add `--cacert certs/ca.pem --cert certs/client.pem --key certs/client-key.pem`, use `https://`, and drop the `Authorization` header.
+
+### Safety rails
+
+- **Purging needs a target.** A purge needs a `route`, a `url_prefix`, or `"all": true`. An empty body is a `400`, never "purge everything". Unknown JSON fields are rejected.
+- **The last backend needs `force`.** Draining a route's last in-rotation backend is refused with `409` unless you pass `force=true`.
+- **Drains last until re-enabled.** A drained backend stays drained until you re-enable it or the process restarts. That includes reloads that keep it.
+- **Enabled isn't the same as in rotation.** Re-enabling a backend that's failing health checks puts it back in the pool, but it only gets traffic once it's healthy again.
+- **Cache purge and stats are per instance.** Cache keys are hashes, so purges and stats work from an index of the entries *this* instance cached. With a Redis store shared by several gateways, purge each one; other instances' entries expire on their TTL.
+
+### Audit log
+
+Every admin request produces one JSON line. Without `admin.audit_log`, it goes to the process log behind `admin-audit: `; with it, to that file (created `0600`):
+
+```json
+{"time":"2026-11-02T10:15:04.123Z","event":"admin_request","source_ip":"127.0.0.1","identity":"token:ops","method":"POST","path":"/admin/v1/cache/purge","endpoint":"POST /admin/v1/cache/purge","status":200,"result":"success","dry_run":true,"duration_ms":0.41,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}
+```
+
+- **`identity`** is `token:<id>` or `cert:<CN>`, and empty for requests that failed authentication.
+- **`result`** is `success`, `denied` (with `reason`: `missing_credentials`, `invalid_token`, `certificate_not_allowed`, `ip_not_allowed`, `rate_limited`), or `error` (with the error code).
+- **`trace_id`** is present when tracing is on. Each admin call is also an OpenTelemetry span named after its endpoint, with the caller's identity attached.
+- **What's never logged:** request bodies, headers, and tokens. A `{client}` in a path is logged only in a non-secret form (fingerprint, `jwt:`, `mtls:`, or an IP). Anything else becomes `[redacted]`.
+
+### Admin metrics
+
+Two counters are added to the existing `/metrics` endpoint:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gatekeeper_admin_requests_total` | `endpoint`, `status` | Admin requests by endpoint pattern (e.g. `POST /admin/v1/reload`, or `unmatched`) and status code |
+| `gatekeeper_admin_auth_failures_total` | `reason` | Requests refused before reaching an endpoint: `missing_credentials`, `invalid_token`, `certificate_not_allowed`, `ip_not_allowed`, `rate_limited` |
+
+### What `/admin/v1/config` hides
+
+`/admin/v1/config` returns the config with the same keys as the YAML file. Before it's returned:
+
+- **API keys** are replaced by their `key:` fingerprints. That covers `auth.api_keys`, and the keys of `rate_limit.clients` when the scope is `api_key`.
+- **Other secrets** become `[REDACTED]`: `auth.jwt.secret`, `storage.redis.password`, and every admin token hash.
+- **Credentials in URLs** (`user:password@` in backend targets or the tracing endpoint) are removed.
+- **Safety net:** any other value that contains one of those secrets is redacted too.
+
+File paths (TLS keys, CA bundles) are shown; their contents never are. Redaction works on a copy, and the running config is untouched.
+
 ## Run with Docker
 
 A multi-stage [`Dockerfile`](Dockerfile) is included: it builds the `gatekeeper` binary in a `golang:1.26-alpine` stage, then copies just the binary and `configs/config.yaml` into a minimal `alpine` runtime image.
@@ -1145,7 +1344,7 @@ gatekeeper_tls_certificate_reloads_total{result="success"} 2
 
 The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
-Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics).
+Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics).
 
 **Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
 
@@ -1226,6 +1425,15 @@ What's covered:
   - An unreachable OTLP collector (gRPC and HTTP) not slowing requests or hanging shutdown.
   - `SIGHUP` turning tracing on and off.
   - `OTEL_*` overrides, and the rate-limited exporter error log.
+- Admin API (`internal/admin`, `internal/config/admin_test.go`, `cmd/gatekeeper/admin_test.go`), against a real gateway and a real admin listener:
+  - Off by default with no port opened, and startup failing when it's enabled without authentication.
+  - Missing, wrong, and valid tokens. The token check compares every configured hash with `crypto/subtle`, whether or not one matches.
+  - The IP allowlist, mTLS (allowed CN, disallowed CN, untrusted CA), and the per-IP lockout after failed logins.
+  - `/admin/v1/config` never returning known secret strings, and redaction leaving the running config untouched.
+  - Reload with a valid and an invalid config, including dry runs.
+  - Cache purge by route, URL prefix, and everything; rate limit inspect and reset; backend drain and enable shifting real traffic; circuit breaker reset.
+  - Audit log lines (with trace IDs, without secrets or bodies), one span per call, metrics, JSON errors, body size limit, and shutdown.
+  - `/admin/...` on the public listener reaching the backend, never the admin API.
 - A full end-to-end test (`TestGateway_EndToEnd`) that wires config → storage → limiters → the whole middleware chain → the proxy, then drives it through auth, CORS, per-tier rate limiting, and routing together, not in isolation.
 
 ## Load testing
@@ -1306,7 +1514,7 @@ The Redis numbers tell a second, independent story: every algorithm gets roughly
 
 ## Architecture Decisions
 
-Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists — live in [`docs/adr/`](docs/adr/).
+Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener — live in [`docs/adr/`](docs/adr/).
 
 ## Configuration reference
 
@@ -1323,6 +1531,7 @@ metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
 tracing:     { enabled, exporter: otlp_grpc|otlp_http|stdout, endpoint, insecure, service_name, sample_ratio, resource_attributes: {...}, response_header }
 tls:         { enabled, cert_file, key_file, min_version: "1.2"|"1.3", cipher_suites: [...], client_auth: none|request|require|verify_if_given|require_and_verify, client_ca_file, reload_interval, redirect_http_port, hsts: { enabled, max_age, include_subdomains, preload } }
+admin:       { enabled, listen, tokens: [ { id, sha256 } ], mtls: { enabled, allowed_cns: [...] }, allowed_cidrs: [...], tls: { ...same as tls... }, auth_failures: { max_failures, window }, read_timeout, write_timeout, idle_timeout, max_body_bytes, audit_log }
 ```
 
 ---

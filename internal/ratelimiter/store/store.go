@@ -44,6 +44,11 @@ type Store interface {
 	// there first and the caller should reload and retry.
 	CompareAndSwap(ctx context.Context, key string, oldVal, newVal []byte, ttl time.Duration) (bool, error)
 
+	// Delete removes key. Deleting a key that doesn't exist is not an
+	// error. Used by admin operations (resetting a client's rate limit,
+	// purging cached responses), never on the request path.
+	Delete(ctx context.Context, key string) error
+
 	// Close releases whatever resources the store is holding — connections,
 	// background goroutines, that sort of thing.
 	Close() error
