@@ -29,6 +29,7 @@ import (
 	"gatekeeper/internal/lb"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/tracing"
+	"gatekeeper/internal/transform"
 	"gatekeeper/internal/websocket"
 )
 
@@ -55,6 +56,11 @@ type route struct {
 
 	authMode string
 
+	// reqTransform and respTransform are the route's transformations;
+	// nil when it has none in that direction.
+	reqTransform  *transform.Request
+	respTransform *transform.Response
+
 	// handshakeTimeout bounds the WebSocket handshake with the backend
 	// (dial + upgrade request + 101 response): proxy.timeout, applied
 	// once, since an upgrade is never retried.
@@ -73,6 +79,8 @@ type Router struct {
 	registry *lb.Registry
 	backends *lb.Set
 	prev     *Router
+
+	transformCfg config.TransformConfig
 }
 
 // Option customises a Router built by NewRouter.
@@ -149,6 +157,11 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			r.backends.Discard()
 			return nil, err
 		}
+		reqT, respT, err := transform.Compile(rt, r.transformCfg)
+		if err != nil {
+			r.backends.Discard()
+			return nil, fmt.Errorf("proxy: route %s: transform: %w", label, err)
+		}
 		proxy := &httputil.ReverseProxy{
 			Director:     director,
 			ErrorHandler: errorHandler(label),
@@ -164,6 +177,8 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			cacheEnabled:     rt.Cache.IsEnabled(),
 			cacheTTL:         rt.Cache.TTL.Duration,
 			authMode:         rt.EffectiveAuthMode(),
+			reqTransform:     reqT,
+			respTransform:    respT,
 			handshakeTimeout: proxyCfg.Timeout.Duration,
 			ws:               newWSSettings(rt),
 		})
@@ -362,15 +377,17 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	w, req, vars := r.prepare(rt, w, req)
+
 	// Checked before caching and before the retry transport: an upgrade
 	// is never served from (or stored in) the cache and never retried.
 	if websocket.IsUpgrade(req) {
-		r.serveWebSocket(w, req, rt)
+		r.serveWebSocket(w, req, rt, vars)
 		return
 	}
 
 	if r.cacheableRequest(rt, req) {
-		r.serveWithCache(w, req, rt)
+		r.serveWithCache(w, req, rt, rt.reqTransform.CacheVary(req, vars))
 		return
 	}
 	rt.proxy.ServeHTTP(w, req)
@@ -411,9 +428,12 @@ func (r *Router) cacheableRequest(rt *route, req *http.Request) bool {
 // problem degrades to "always go to the backend", never to a crash) and
 // storing the fresh response for next time, unless the backend marked it
 // Cache-Control: no-store.
-func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, rt *route) {
+//
+// vary are the request transform's headers, which the key includes (the
+// path and query in the key are already the transformed ones).
+func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, rt *route, vary []string) {
 	ctx := req.Context()
-	key := cache.Key(rt.label, rt.cacheTarget, req)
+	key := cache.Key(rt.label, rt.cacheTarget, req, vary...)
 
 	_, span := tracing.Start(ctx, tracing.SpanCacheLookup, trace.WithAttributes(tracing.AttrHTTPRoute.String(rt.label)))
 	entry, hit, err := r.cache.Get(ctx, key)

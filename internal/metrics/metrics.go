@@ -122,6 +122,12 @@ type Metrics struct {
 	// result ("success" or "failure").
 	HealthChecks *prometheus.CounterVec
 
+	// TransformsApplied counts requests a route's transformation changed,
+	// by route and kind: "path" (strip_prefix or rewrite changed the
+	// path), "query", "request_headers", or "response_headers". A
+	// request counts once per kind.
+	TransformsApplied *prometheus.CounterVec
+
 	// AdminRequests counts admin API requests by endpoint (the route
 	// pattern, e.g. "POST /admin/v1/reload", never a client or backend
 	// ID) and response status code.
@@ -351,6 +357,10 @@ func New() *Metrics {
 			Name: "gatekeeper_backend_health_checks_total",
 			Help: "Total number of active health check probes, by route, backend, and result (success or failure).",
 		}, []string{"route", "backend", "result"}),
+		TransformsApplied: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_transforms_applied_total",
+			Help: "Total number of requests a route transformation changed, by route and kind (path, query, request_headers, response_headers).",
+		}, []string{"route", "kind"}),
 		AdminRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gatekeeper_admin_requests_total",
 			Help: "Total number of admin API requests, by endpoint and response status code.",
@@ -391,6 +401,7 @@ func New() *Metrics {
 		m.BackendRequests,
 		m.BackendEjections,
 		m.HealthChecks,
+		m.TransformsApplied,
 		m.AdminRequests,
 		m.AdminAuthFailures,
 		m.backends,

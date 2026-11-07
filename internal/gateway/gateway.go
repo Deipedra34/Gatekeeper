@@ -292,7 +292,9 @@ func (g *Gateway) retire(p *tracing.Provider) {
 // then built to share its unchanged backends and isn't live until
 // Activate. On error, nothing live has been touched.
 func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Router) (http.Handler, *proxy.Router, map[string]ratelimiter.Limiter, error) {
-	opts := []proxy.Option{proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends)}
+	opts := []proxy.Option{
+		proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends), proxy.WithTransformConfig(cfg.Transform),
+	}
 	if prev != nil {
 		opts = append(opts, proxy.WithPrevious(prev))
 	}
@@ -318,6 +320,8 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 
 	h := middleware.Chain(router,
 		middleware.RequestMetrics(g.metrics, router.RouteLabelFor),
+		// Early, so every response — 401s and 429s included — carries it.
+		middleware.RequestID(cfg.Transform.RequestID),
 		middleware.RequestLogger(g.logger),
 		middleware.WebSocketHandshake(router.RouteLabelFor),
 		middleware.CORS(cfg.CORS),

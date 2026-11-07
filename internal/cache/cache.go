@@ -90,7 +90,12 @@ func New(st store.Store) *Cache {
 // by routeLabel and target. Including target means a config reload that
 // repoints a route at a different backend can never serve a stale entry
 // cached under the old backend.
-func Key(routeLabel, target string, r *http.Request) string {
+//
+// extra are further parts the response may vary on — the headers a
+// route's request transform sets — so requests forwarded differently
+// never share an entry. Without extra the key is exactly what it always
+// was, so existing entries stay valid.
+func Key(routeLabel, target string, r *http.Request, extra ...string) string {
 	h := sha256.New()
 	writePart := func(s string) {
 		h.Write([]byte(s))
@@ -102,6 +107,9 @@ func Key(routeLabel, target string, r *http.Request) string {
 	writePart(r.URL.RequestURI())
 	for _, name := range varyHeaders {
 		writePart(name + "=" + r.Header.Get(name))
+	}
+	for _, part := range extra {
+		writePart("transform:" + part)
 	}
 	return keyPrefix + hex.EncodeToString(h.Sum(nil))
 }

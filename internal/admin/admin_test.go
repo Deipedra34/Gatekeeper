@@ -382,6 +382,7 @@ func TestAdmin_ConfigNeverLeaksSecrets(t *testing.T) {
 		jwtSecret     = "jwt-SECRET-33333-0123456789abcdefghijkl"
 		targetSecret  = "target-pass-SECRET-44444"
 		otelSecret    = "otel-pass-SECRET-55555"
+		backendCred   = "backend-cred-SECRET-66666"
 	)
 	target := strings.Replace(backend.URL, "http://", "http://svc:"+targetSecret+"@", 1)
 	yaml := fmt.Sprintf(`
@@ -405,21 +406,25 @@ auth:
 routes:
   - path_prefix: "/"
     target: %q
+    transform:
+      request:
+        set_headers: {Authorization: "Bearer %s", X-Gateway: "visible"}
 tracing:
   enabled: false
   endpoint: "http://collector:%s@otel.example:4318"
-`, redisPassword, apiKey, apiKey, jwtSecret, target, otelSecret)
+`, redisPassword, apiKey, apiKey, jwtSecret, target, backendCred, otelSecret)
 	h := start(t, yaml, harnessOptions{})
 
 	resp := h.call(http.MethodGet, "/admin/v1/config", adminToken, "")
 	require.Equal(t, http.StatusOK, resp.status, resp.raw)
-	for _, secret := range []string{redisPassword, apiKey, jwtSecret, targetSecret, otelSecret, adminToken, sha256Hex(adminToken)} {
+	for _, secret := range []string{redisPassword, apiKey, jwtSecret, targetSecret, otelSecret, backendCred, adminToken, sha256Hex(adminToken)} {
 		assert.NotContains(t, resp.raw, secret)
 	}
 	fp := middleware.APIKeyFingerprint(apiKey)
 	assert.Contains(t, resp.raw, fp, "API keys appear as their fingerprints, as in /metrics")
 	assert.Contains(t, resp.raw, "[REDACTED]")
 	assert.Contains(t, resp.raw, `"id": "ops"`, "token IDs are not secret")
+	assert.Contains(t, resp.raw, `"X-Gateway": "visible"`, "ordinary transform headers are shown")
 
 	auth := resp.json["auth"].(map[string]any)
 	assert.Equal(t, []any{fp}, auth["api_keys"])

@@ -214,6 +214,30 @@ cors:
 #   drain_timeout: 30s              # for backends a reload removes (default 30s)
 # Circuit breakers are per backend; a single target behaves exactly as
 # before.
+#
+# A route can rewrite the request it forwards and the response it returns
+# (see README.md's "Request and response transformation"). A route
+# without transform is forwarded exactly as before. Auth and rate limiting
+# see the request as the client sent it; the cache key, retries, and
+# WebSocket upgrades use the transformed one.
+#   transform:
+#     request:
+#       strip_prefix: true                 # /api/users -> /users
+#       rewrite:                           # RE2 regex on the path, after strip_prefix
+#         pattern: "^/v1/(.*)$"
+#         replacement: "/v2/$1"            # $1 or ${name} capture groups
+#       add_headers: {X-Gateway: "gatekeeper"}         # only if the client didn't send it
+#       set_headers: {X-Client-ID: "${client_id}"}     # replaces the client's value
+#       remove_headers: ["X-Debug"]
+#       add_query_params: {source: "gateway"}          # replaces the client's value
+#       remove_query_params: ["debug"]
+#     response:
+#       remove_headers: ["Server", "X-Powered-By"]
+#       set_headers: {X-Served-By: "gatekeeper"}
+#       add_headers: {Cache-Control: "no-store"}       # only if the backend didn't set it
+#       security_headers: {enabled: true}              # overrides transform.security_headers
+# Values may use ${client_ip}, ${request_id}, ${client_id}, ${client_tier},
+# ${route}, and ${trace_id}; anything else fails config validation.
 routes:
   - path_prefix: "/ws"
     target: "http://localhost:9000"
@@ -349,3 +373,24 @@ admin:
   # JSON audit log file (created 0600). Empty: the process log, one
   # "admin-audit: {...}" line per request.
   # audit_log: "/var/log/gatekeeper/admin-audit.log"
+
+# Settings shared by every route's transform (see above), plus forwarding
+# headers and request IDs. Reloaded on SIGHUP.
+transform:
+  # false (default): client-supplied X-Forwarded-For/-Host/-Proto/-Port/
+  # -Prefix, Forwarded, and X-Real-IP are dropped and set from the
+  # connection. true: they're passed through (X-Forwarded-For with the
+  # peer appended), as in earlier versions; only behind a proxy you trust.
+  trust_forwarded_headers: false
+  # Give every request an ID (the client's if valid, otherwise a new UUID),
+  # forwarded to the backend and returned to the client. Off by default.
+  request_id:
+    enabled: false
+    # header: X-Request-ID
+  # Default security response headers for every route, added when the
+  # response doesn't already have them. Off by default.
+  security_headers:
+    enabled: false
+    # content_type_options: nosniff
+    # frame_options: DENY             # DENY or SAMEORIGIN
+    # referrer_policy: no-referrer

@@ -28,6 +28,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **WebSocket proxying.** `Upgrade: websocket` requests are routed like any other request and pass through CORS, auth, and the rate limiter (one token per connection attempt). After that, frames are relayed transparently in both directions. Per-route idle timeouts, connection caps per route and per client, `Origin` allow-lists, metrics, and graceful close on shutdown are all included.
 - **TLS and mTLS.** An optional HTTPS listener with TLS 1.2+ by default, hot-reloaded certificates (on `SIGHUP` or file change), client certificate verification, an `mtls` route auth mode with certificate-based client identity and tiers, HSTS, an HTTP→HTTPS redirect, and TLS / mTLS to backends.
 - **Distributed tracing.** Optional OpenTelemetry traces with a span per pipeline stage and per backend attempt (retries are visible), W3C `traceparent` / `baggage` propagation in and out, OTLP gRPC/HTTP export, parent-based sampling, trace IDs in log lines and an optional response header. Secrets never reach spans, and a dead collector never slows a request.
+- **Request and response transformation.** Per route, a request can have its prefix stripped, its path rewritten with a regex, and headers and query parameters added, set, or removed. Responses can have headers changed, plus optional security headers. Values use a small whitelist of variables (`${client_id}`, `${request_id}`, ...) that can't leak credentials. There are request IDs, forwarding headers set from the real connection, and cache keys that follow the forwarded request.
 - **Load balancing and health checks.** A route can spread traffic over several backends with round robin, weighted round robin, least connections, random, or sticky IP / header hashing. Active and passive health checks take failing backends out of rotation and bring them back. Circuit breakers are per backend, retries fail over to a different backend, and backends removed by a reload drain gracefully. A single `target` still works exactly as before.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Authenticated admin API.** Optional, on its own listener (never the proxy port). It shows status, redacted config, routes, backend health, per-client rate limit state, and cache stats. It can reload the config, purge the cache, reset rate limits, drain and re-enable backends, and reset circuit breakers. Bearer tokens are stored as SHA-256 hashes; mTLS, a CIDR allowlist, failed-login lockout, a JSON audit log, tracing, and metrics are all included.
@@ -148,6 +149,7 @@ internal/gateway/      assembles the request pipeline from config; rebuilds and 
 internal/config/       YAML config loading, defaults, and validation
 internal/ratelimiter/  the three algorithms + the Store abstraction they share
   └─ store/            MemoryStore, RedisStore, and FallbackStore (Redis → memory failover)
+internal/transform/    per-route request/response transformation: prefix stripping, regex rewrites, header and query changes, ${...} variables, forwarding headers
 internal/proxy/        the reverse-proxy router (path prefix / hostname matching), backend timeout + retry/backoff, GET response caching, circuit breaker integration
 internal/cache/        the response cache: key derivation, Cache-Control handling, Store-backed get/set
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
@@ -504,6 +506,177 @@ closed cleanly (1000)
 You can do the same without Docker: run the mock backend with `cd mockbackend && go run .` (it listens on `:9000`), then run the gateway with the default `configs/config.yaml`, which also routes `/ws` to `localhost:9000`.
 
 > **Browser clients:** the browser `WebSocket` API can't set custom headers, so it can't send `X-API-Key` or `Authorization`. Browser apps on an authenticated route need to get their credential onto the handshake some other way, for example with a same-origin cookie checked by a JWT-issuing proxy in front of Gatekeeper. Alternatively, use a non-browser client.
+
+## Request and response transformation
+
+A route can change the request it forwards to the backend and the response it returns to the client. A route without a `transform` section is forwarded exactly as before.
+
+**Where it runs:**
+
+- **Before:** auth and the rate limiter see the request as the client sent it.
+- **After:** everything else uses the transformed request. That covers the response cache key, retries, load balancing, circuit breakers, and WebSocket upgrades.
+
+**Order of steps:**
+
+- **Request:** `strip_prefix` → `rewrite` → query parameters → headers (remove, set, add).
+- **Response:** remove → set → add → security headers.
+
+The rationale is in [ADR 0008](docs/adr/0008-request-response-transformation.md).
+
+### Strip a prefix
+
+```yaml
+routes:
+  - path_prefix: "/api"
+    target: "http://users-service:9001"
+    transform:
+      request:
+        strip_prefix: true      # /api/users/42 -> /users/42, /api -> /
+```
+
+### Rewrite the path with a regex
+
+```yaml
+    transform:
+      request:
+        rewrite:
+          pattern: "^/api/v1/(.*)$"
+          replacement: "/v2/$1"                 # /api/v1/orders/7 -> /v2/orders/7
+        # Named groups work too:
+        # rewrite: {pattern: "^/u/(?P<id>\\d+)$", replacement: "/users/${id}"}
+```
+
+**How rewrites behave:**
+
+- The pattern is matched against the path only, never the query string. The query is forwarded unchanged.
+- A path that doesn't match is left alone.
+- The result is made absolute, and any `..` segments are removed.
+- **Rejected at config load:**
+  - Invalid patterns.
+  - Patterns longer than 1024 characters.
+  - Replacements that reference a capture group the pattern doesn't have (Go would silently turn those into empty strings).
+  - Replacements containing `?` or `#`. Use `add_query_params` for query parameters.
+
+Patterns are Go [RE2](https://github.com/google/re2/wiki/Syntax) expressions, which match in time linear in the input. There's no backtracking, so a rewrite rule can't be turned into a catastrophic-backtracking denial of service. Backreferences and lookaround aren't available for the same reason.
+
+### Add, set, and remove headers and query parameters
+
+```yaml
+    transform:
+      request:
+        add_headers:    {X-Gateway: "gatekeeper"}          # only if the client didn't send it
+        set_headers:    {X-Client-ID: "${client_id}"}      # replaces whatever the client sent
+        remove_headers: ["X-Debug", "Cookie"]
+        add_query_params:    {source: "gateway"}            # replaces the client's value, too
+        remove_query_params: ["debug"]
+      response:
+        remove_headers: ["Server", "X-Powered-By"]          # don't advertise the backend stack
+        set_headers:    {X-Served-By: "gatekeeper"}
+        add_headers:    {Cache-Control: "no-store"}         # only if the backend didn't set it
+```
+
+Use `set_headers` for anything the backend trusts: with `add_headers`, a client that sends the header itself keeps its own value.
+
+Response transforms apply to every response on the route. That covers backend responses, cached responses, the gateway's own `502`/`503`s, and the `101` of a WebSocket upgrade. A reload takes effect immediately, even for responses already in the cache.
+
+### Variables
+
+Header and query parameter values can use these variables, and only these. Anything else, such as `${header.authorization}` or `${env}`, fails config validation:
+
+| Variable | Value |
+|---|---|
+| `${client_ip}` | The client's address. It's the peer address unless `trust_forwarded_headers` is on, in which case it's the first `X-Forwarded-For` address. |
+| `${request_id}` | The request ID. Needs `transform.request_id.enabled: true`. |
+| `${client_id}` | The client as the rate limiter and `/metrics` see it: `key:<fingerprint>` for an API key (never the key itself), `jwt:<id>`, `mtls:<id>`, or the IP or header value. |
+| `${client_tier}` | The client's rate limit tier. |
+| `${route}` | The route label, meaning its path prefix or host. |
+| `${trace_id}` | The trace ID, or empty when tracing is off. |
+
+There is deliberately no way to copy an arbitrary request header into another header. A transform can't forward a client's API key or JWT anywhere the client didn't already send it. Control characters are stripped from variable values, so a value can never split a header.
+
+### Request IDs
+
+```yaml
+transform:
+  request_id:
+    enabled: true            # off by default
+    header: X-Request-ID     # default
+```
+
+**How request IDs work:**
+
+- **Which ID is used.** The client's ID is kept when it's valid: up to 128 characters from `A-Z a-z 0-9 - _ . : / + = @`. Otherwise, or when there's none, the gateway generates a random UUID.
+- **Where it goes.** The ID is forwarded to the backend and returned to the client on every response, including `401` and `429`. If the backend's response has its own value, the gateway's replaces it.
+- **Using it in a transform.** It's also available as `${request_id}`, for example `set_headers: {X-Correlation-ID: "${request_id}"}`.
+
+### Forwarding headers
+
+```yaml
+transform:
+  trust_forwarded_headers: false   # default
+```
+
+**With `false` (the default):**
+
+- Client-supplied `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `X-Forwarded-Prefix`, `Forwarded`, and `X-Real-IP` are dropped.
+- They're set from the connection instead:
+  - `X-Forwarded-For` and `X-Real-IP` are the peer address.
+  - `X-Forwarded-Proto` is `http` or `https`.
+  - `X-Forwarded-Host` is the request's `Host`.
+- So a client can't spoof its address to a backend.
+
+**With `true`:** these headers pass through as in earlier versions, with the peer appended to `X-Forwarded-For`. Use this only when Gatekeeper sits behind a proxy you trust to set them.
+
+> **Upgrading:** earlier versions passed client `X-Forwarded-For` through and appended the peer. If Gatekeeper runs behind a load balancer whose `X-Forwarded-For` your backends rely on, set `trust_forwarded_headers: true` to keep that behaviour. This setting doesn't change how `rate_limit.scope: ip` identifies clients.
+
+### Security headers
+
+```yaml
+transform:
+  security_headers:          # default for every route; off by default
+    enabled: true
+    content_type_options: nosniff        # X-Content-Type-Options (default)
+    frame_options: DENY                  # X-Frame-Options: DENY (default) or SAMEORIGIN
+    referrer_policy: no-referrer         # Referrer-Policy (default)
+
+routes:
+  - path_prefix: "/embed"
+    target: "http://widgets:9000"
+    transform:
+      response:
+        security_headers: {enabled: true, frame_options: SAMEORIGIN}   # override per route
+  - path_prefix: "/raw"
+    target: "http://files:9000"
+    transform:
+      response:
+        security_headers: {enabled: false}                             # opt this route out
+```
+
+They're added only when the response doesn't already have them, so a backend's own value always wins. They apply to responses on matched routes. Responses the gateway answers before routing, such as `401`, `429`, and unmatched paths, don't get them.
+
+### Headers a transform can't touch
+
+These headers are rejected at config load, because another part of the gateway owns them:
+
+- **Both directions:**
+  - Hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`, `Proxy-*`).
+  - `Content-Length`, `Sec-WebSocket-*`, and the request ID header.
+- **Requests:**
+  - `Host`.
+  - The forwarding headers. These are governed by `trust_forwarded_headers`.
+- **Responses:**
+  - `Content-Encoding`.
+  - `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After`.
+  - `X-Cache`, `Strict-Transport-Security`, and the configured `tracing.response_header`.
+
+Hop-by-hop headers are still stripped as before, in both directions, including any header a client or backend names in its `Connection` header. One exception: a header the gateway itself sets is taken off the client's `Connection` list first, so a client can't get it stripped.
+
+### Caching, tracing, and metrics
+
+- **Cache keys** use the forwarded path and query. Two URLs that rewrite to the same backend request share an entry. The key also includes the value of every header the transform sets, so `X-Tenant: ${client_id}` keeps tenants' responses apart. `${request_id}` and `${trace_id}` are left out of the key, so a correlation header doesn't make every request a miss. Using either of them in `add_query_params` on a cached route is rejected for the same reason.
+- **Tracing:** when `strip_prefix` or `rewrite` changes the path, the request's span gets `gatekeeper.transform.path` with the forwarded path. The query string is never recorded.
+- **Metrics:** `gatekeeper_transforms_applied_total{route, kind}` counts requests a transform changed. `kind` is `path`, `query`, `request_headers`, or `response_headers`. Each request counts once per kind, however many retries it takes.
+- **Admin API:** `/admin/v1/config` redacts transform header and query values whose names look like credentials (containing `auth`, `token`, `secret`, `key`, `cookie`, `password`, …). A backend credential set with `set_headers: {Authorization: ...}` is never shown.
 
 ## TLS and mTLS
 
@@ -1192,6 +1365,7 @@ Two counters are added to the existing `/metrics` endpoint:
 - **API keys** are replaced by their `key:` fingerprints. That covers `auth.api_keys`, and the keys of `rate_limit.clients` when the scope is `api_key`.
 - **Other secrets** become `[REDACTED]`: `auth.jwt.secret`, `storage.redis.password`, and every admin token hash.
 - **Credentials in URLs** (`user:password@` in backend targets or the tracing endpoint) are removed.
+- **Transform credentials:** header and query values in route `transform` sections whose names look like credentials (`Authorization`, `X-Api-Token`, ...) become `[REDACTED]`.
 - **Safety net:** any other value that contains one of those secrets is redacted too.
 
 File paths (TLS keys, CA bundles) are shown; their contents never are. Redaction works on a copy, and the running config is untouched.
@@ -1344,7 +1518,7 @@ gatekeeper_tls_certificate_reloads_total{result="success"} 2
 
 The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
-Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics).
+Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
 
 **Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
 
@@ -1425,6 +1599,15 @@ What's covered:
   - An unreachable OTLP collector (gRPC and HTTP) not slowing requests or hanging shutdown.
   - `SIGHUP` turning tracing on and off.
   - `OTEL_*` overrides, and the rate-limited exporter error log.
+- Request and response transformation (`internal/transform`, `internal/config/transform_test.go`, `internal/gateway/transform_test.go`, the last through a real gateway on a real listener):
+  - Prefix stripping, regex rewrites with numbered and named capture groups, and invalid regexes and bad replacements rejected at load.
+  - Request and response header add, set, and remove; query parameter changes; security headers, including on the gateway's own errors.
+  - Unknown variables rejected at validation; `${client_id}` being an API key's fingerprint, never the key.
+  - Request ID generation and propagation, including on `401`s.
+  - `trust_forwarded_headers` on and off, and hop-by-hop headers stripped both ways without letting a client strip headers the gateway sets.
+  - Cache keys following rewrites and per-client headers, without request IDs splitting the cache.
+  - A rewritten WebSocket route; retries and load balancing forwarding the transformed request.
+  - Reloads applying new transforms; tracing recording the rewritten path but never the query; routes without a transform forwarded byte for byte.
 - Admin API (`internal/admin`, `internal/config/admin_test.go`, `cmd/gatekeeper/admin_test.go`), against a real gateway and a real admin listener:
   - Off by default with no port opened, and startup failing when it's enabled without authentication.
   - Missing, wrong, and valid tokens. The token check compares every configured hash with `crypto/subtle`, whether or not one matches.
@@ -1514,7 +1697,7 @@ The Redis numbers tell a second, independent story: every algorithm gets roughly
 
 ## Architecture Decisions
 
-Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener — live in [`docs/adr/`](docs/adr/).
+Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe — live in [`docs/adr/`](docs/adr/).
 
 ## Configuration reference
 
@@ -1531,6 +1714,8 @@ metrics:     { enabled, path }
 proxy:       { timeout, retry: { max_retries, base_backoff, max_backoff } }
 tracing:     { enabled, exporter: otlp_grpc|otlp_http|stdout, endpoint, insecure, service_name, sample_ratio, resource_attributes: {...}, response_header }
 tls:         { enabled, cert_file, key_file, min_version: "1.2"|"1.3", cipher_suites: [...], client_auth: none|request|require|verify_if_given|require_and_verify, client_ca_file, reload_interval, redirect_http_port, hsts: { enabled, max_age, include_subdomains, preload } }
+transform:   { trust_forwarded_headers, request_id: { enabled, header }, security_headers: { enabled, content_type_options, frame_options, referrer_policy } }
+             # per route: transform: { request: { strip_prefix, rewrite: { pattern, replacement }, add_headers, set_headers, remove_headers, add_query_params, remove_query_params }, response: { add_headers, set_headers, remove_headers, security_headers } }
 admin:       { enabled, listen, tokens: [ { id, sha256 } ], mtls: { enabled, allowed_cns: [...] }, allowed_cidrs: [...], tls: { ...same as tls... }, auth_failures: { max_failures, window }, read_timeout, write_timeout, idle_timeout, max_body_bytes, audit_log }
 ```
 

@@ -81,6 +81,9 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 			if hs, ok := websocket.HandshakeFrom(r.Context()); ok {
 				hs.SetClient(client)
 			}
+			// Recorded for request transforms (${client_id},
+			// ${client_tier}): the label, never a raw API key.
+			r = withClientInfo(r, ClientInfo{Label: label, Tier: tier})
 
 			ctx, span := tracing.Start(r.Context(), tracing.SpanRateLimit, trace.WithAttributes(
 				tracing.AttrRateLimitAlgorithm.String(cfg.Algorithm),

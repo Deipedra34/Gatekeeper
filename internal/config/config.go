@@ -50,6 +50,7 @@ type Config struct {
 	TLS       TLSConfig       `yaml:"tls"`
 	Tracing   TracingConfig   `yaml:"tracing"`
 	Admin     AdminConfig     `yaml:"admin"`
+	Transform TransformConfig `yaml:"transform"`
 }
 
 // ServerConfig controls the HTTP listener Gatekeeper itself exposes.
@@ -272,6 +273,10 @@ type Route struct {
 	// allows any origin. A request without an Origin header (a non-browser
 	// client) is not affected.
 	WSAllowedOrigins []string `yaml:"ws_allowed_origins"`
+
+	// Transform rewrites the request forwarded to the backend and the
+	// response returned to the client. Unset means no change.
+	Transform RouteTransform `yaml:"transform"`
 }
 
 // DefaultWSIdleTimeout is the WebSocket idle timeout applied to a route
@@ -478,6 +483,7 @@ func (c *Config) applyDefaults() {
 	c.TLS.applyDefaults()
 	c.Tracing.applyDefaults()
 	c.Admin.applyDefaults()
+	c.applyTransformDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -625,6 +631,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.Admin.validate(c.Server, c.TLS); err != nil {
+		return err
+	}
+	if err := c.validateTransform(); err != nil {
 		return err
 	}
 

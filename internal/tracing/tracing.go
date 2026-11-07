@@ -86,6 +86,10 @@ const (
 	AttrAttempt = attribute.Key("gatekeeper.backend.attempt")
 	AttrRetry   = attribute.Key("gatekeeper.backend.retry")
 
+	// AttrTransformPath is the path forwarded to the backend after a
+	// route's strip_prefix or rewrite changed it. Never the query.
+	AttrTransformPath = attribute.Key("gatekeeper.transform.path")
+
 	AttrAdminIdentity = attribute.Key("gatekeeper.admin.identity")
 	AttrAdminResult   = attribute.Key("gatekeeper.admin.result")
 

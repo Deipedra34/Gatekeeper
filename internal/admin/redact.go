@@ -83,6 +83,7 @@ func redactedConfig(cfg *config.Config) (map[string]any, error) {
 					}
 				}
 			}
+			secrets = append(secrets, redactTransformValues(m)...)
 		}
 	}
 	if tr, ok := tree["tracing"].(map[string]any); ok {
@@ -90,6 +91,45 @@ func redactedConfig(cfg *config.Config) (map[string]any, error) {
 	}
 
 	return scrub(tree, scrubbable(secrets)).(map[string]any), nil
+}
+
+// sensitiveNameParts mark a header or query parameter whose configured
+// value is treated as a credential in /admin/v1/config — e.g. a
+// set_headers Authorization the gateway sends to a backend.
+var sensitiveNameParts = []string{"auth", "cookie", "token", "secret", "key", "password", "passwd", "credential", "signature", "session"}
+
+func sensitiveName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, p := range sensitiveNameParts {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactTransformValues redacts the values of sensitive-looking headers
+// and query parameters a route's transform sets, returning the values
+// it removed so the safety-net pass catches any copy elsewhere.
+func redactTransformValues(route map[string]any) []string {
+	var removed []string
+	for _, p := range [][]string{
+		{"transform", "request", "add_headers"}, {"transform", "request", "set_headers"},
+		{"transform", "request", "add_query_params"},
+		{"transform", "response", "add_headers"}, {"transform", "response", "set_headers"},
+	} {
+		values, ok := getPath(route, p...).(map[string]any)
+		if !ok {
+			continue
+		}
+		for name, v := range values {
+			if s, ok := v.(string); ok && s != "" && sensitiveName(name) {
+				removed = append(removed, s)
+				values[name] = redacted
+			}
+		}
+	}
+	return removed
 }
 
 // minScrubLen is the shortest secret the safety-net pass looks for;

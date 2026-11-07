@@ -20,6 +20,7 @@ import (
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/lb"
 	"gatekeeper/internal/tracing"
+	"gatekeeper/internal/transform"
 	"gatekeeper/internal/websocket"
 )
 
@@ -79,7 +80,7 @@ func (s wsSettings) originAllowed(origin string) bool {
 // With tracing on, the upgrade gets a websocket.handshake span (policy
 // checks, backend dial, and the 101) and, once established, a
 // websocket.connection span lasting until the tunnel closes.
-func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *route) {
+func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *route, vars transform.Vars) {
 	hsCtx, hsSpan := tracing.Start(req.Context(), tracing.SpanWebSocketHandshake,
 		trace.WithAttributes(tracing.AttrHTTPRoute.String(rt.label)))
 	hsEnded := false
@@ -180,7 +181,15 @@ func (r *Router) serveWebSocket(w http.ResponseWriter, req *http.Request, rt *ro
 	// they must not cut a long-lived connection short.
 	_ = clientConn.SetDeadline(time.Time{})
 
-	if err := writeSwitchingProtocols(clientBuf.Writer, w.Header(), resp.Header); err != nil {
+	// The 101 bypasses the response writer, so the route's response
+	// transform is applied to it here.
+	finish := func(h http.Header) {
+		if rt.respTransform != nil {
+			rt.respTransform.ApplyHeaders(h, vars)
+			r.countTransform(rt, transformResponseHeaders)
+		}
+	}
+	if err := writeSwitchingProtocols(clientBuf.Writer, w.Header(), resp.Header, finish); err != nil {
 		tracing.Fail(hsSpan, "writing 101 to client failed")
 		_ = clientConn.Close()
 		_ = backendConn.Close()
@@ -410,10 +419,13 @@ func forwardResponse(w http.ResponseWriter, resp *http.Response) {
 // writeSwitchingProtocols writes the 101 response to the hijacked client
 // connection: the headers the middleware chain set (rate-limit, CORS)
 // merged with the backend's handshake headers, which take precedence.
-func writeSwitchingProtocols(bw *bufio.Writer, chainHeader, backendHeader http.Header) error {
+func writeSwitchingProtocols(bw *bufio.Writer, chainHeader, backendHeader http.Header, finish func(http.Header)) error {
 	h := chainHeader.Clone()
 	for k, v := range backendHeader {
 		h[k] = v
+	}
+	if finish != nil {
+		finish(h)
 	}
 	if _, err := bw.WriteString("HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
 		return err
