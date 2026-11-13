@@ -1,6 +1,9 @@
 package gateway
 
 import (
+	"context"
+	"time"
+
 	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/ratelimiter/store"
@@ -56,4 +59,24 @@ func policySettings(eff config.RouteAccessControl) accesscontrol.PolicySettings 
 		Deny:       eff.Deny,
 		DenyStatus: eff.DenyStatus,
 	}
+}
+
+// activeBansTimeout bounds how long a /metrics scrape waits for the
+// store to count active bans.
+const activeBansTimeout = time.Second
+
+// activeBans counts active bans for the /metrics gauge. It reports
+// nothing without access control, or when the store can't be read.
+func (g *Gateway) activeBans() (int, bool) {
+	c := g.access.Load()
+	if c == nil || c.Bans() == nil {
+		return 0, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), activeBansTimeout)
+	defer cancel()
+	n, err := c.Bans().Count(ctx)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"gatekeeper/internal/accesscontrol"
+	"gatekeeper/internal/metrics"
 )
 
 // AccessControl rejects requests from client addresses the route's
@@ -32,41 +33,76 @@ import (
 // offense, and the auth and rate limit middleware further down report
 // their rejections too (see reportOffense), so an address that keeps
 // offending gets banned.
-func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (string, bool)) Middleware {
+func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (string, bool), opts ...AccessControlOption) Middleware {
+	a := &accessControl{c: c, routeFor: routeFor}
+	for _, opt := range opts {
+		opt(a)
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			addr, known := c.ClientAddr(r)
 			route := ""
-			if routeFor != nil {
-				route, _ = routeFor(r)
+			if a.routeFor != nil {
+				route, _ = a.routeFor(r)
 			}
 			policy := c.PolicyFor(route)
 			if reason := policy.Check(addr, known); reason != accesscontrol.ReasonNone {
 				if known {
-					recordOffense(r.Context(), c, addr, accesscontrol.OffenseDenied)
+					a.recordOffense(r.Context(), addr, accesscontrol.OffenseDenied)
 				}
-				block(w, policy.DenyStatus(), 0)
+				a.block(w, reason, policy.DenyStatus(), 0)
 				return
 			}
 			if known {
 				if ban, banned, err := c.Banned(r.Context(), addr); err == nil && banned {
-					block(w, policy.DenyStatus(), time.Until(ban.ExpiresAt))
+					reason := accesscontrol.ReasonAutoBan
+					if ban.Source == accesscontrol.SourceManual {
+						reason = accesscontrol.ReasonManualBan
+					}
+					a.block(w, reason, policy.DenyStatus(), time.Until(ban.ExpiresAt))
 					return
 				}
-				r = r.WithContext(context.WithValue(r.Context(), accessKey{}, requestAccess{addr: addr, c: c}))
+				r = r.WithContext(context.WithValue(r.Context(), accessKey{}, requestAccess{addr: addr, a: a}))
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
+// AccessControlOption customises AccessControl.
+type AccessControlOption func(*accessControl)
+
+// WithAccessMetrics counts blocked requests and issued bans in m.
+func WithAccessMetrics(m *metrics.Metrics) AccessControlOption {
+	return func(a *accessControl) { a.metrics = m }
+}
+
+// accessControl is one AccessControl middleware's settings.
+type accessControl struct {
+	c        *accesscontrol.Controller
+	routeFor func(*http.Request) (string, bool)
+	metrics  *metrics.Metrics
+}
+
 // block writes the rejection. retryAfter, when positive, is how long
 // until a ban ends.
-func block(w http.ResponseWriter, status int, retryAfter time.Duration) {
+func (a *accessControl) block(w http.ResponseWriter, reason accesscontrol.Reason, status int, retryAfter time.Duration) {
+	if a.metrics != nil {
+		a.metrics.AccessBlocked.WithLabelValues(string(reason)).Inc()
+	}
 	if retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(max(math.Ceil(retryAfter.Seconds()), 1))))
 	}
 	http.Error(w, "access denied", status)
+}
+
+// recordOffense records o for addr. The request is being rejected
+// anyway; if the store fails, the offense just isn't counted.
+func (a *accessControl) recordOffense(ctx context.Context, addr netip.Addr, o accesscontrol.Offense) {
+	_, banned, err := a.c.RecordOffense(ctx, addr, o)
+	if err == nil && banned && a.metrics != nil {
+		a.metrics.BansIssued.WithLabelValues(accesscontrol.SourceAuto).Inc()
+	}
 }
 
 // requestAccess is what the access control middleware attaches to a
@@ -74,7 +110,7 @@ func block(w http.ResponseWriter, status int, retryAfter time.Duration) {
 // controller to report offenses to.
 type requestAccess struct {
 	addr netip.Addr
-	c    *accesscontrol.Controller
+	a    *accessControl
 }
 
 type accessKey struct{}
@@ -92,12 +128,6 @@ func ClientAddrFrom(ctx context.Context) (netip.Addr, bool) {
 // request it does nothing.
 func reportOffense(r *http.Request, o accesscontrol.Offense) {
 	if ra, ok := r.Context().Value(accessKey{}).(requestAccess); ok {
-		recordOffense(r.Context(), ra.c, ra.addr, o)
+		ra.a.recordOffense(r.Context(), ra.addr, o)
 	}
-}
-
-// recordOffense records o for addr. The request is being rejected
-// anyway; if the store fails, the offense just isn't counted.
-func recordOffense(ctx context.Context, c *accesscontrol.Controller, addr netip.Addr, o accesscontrol.Offense) {
-	_, _, _ = c.RecordOffense(ctx, addr, o)
 }

@@ -111,6 +111,7 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 	}
 	if m != nil {
 		m.SetBackendSource(g.backends.Snapshot)
+		m.SetActiveBansSource(g.activeBans)
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -339,7 +340,8 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		// lookup: no request ID, no per-request log line, and nothing
 		// from auth, the rate limiter (no tokens), the cache, the circuit
 		// breaker, or a backend.
-		mws = append(mws, middleware.AccessControl(access, router.RouteLabelFor))
+		mws = append(mws, middleware.AccessControl(access, router.RouteLabelFor,
+			middleware.WithAccessMetrics(g.metrics)))
 	}
 	h := middleware.Chain(router, append(mws,
 		// Early, so every response — 401s and 429s included — carries it.

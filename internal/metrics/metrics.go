@@ -139,8 +139,51 @@ type Metrics struct {
 	// source IP over its failed-authentication limit).
 	AdminAuthFailures *prometheus.CounterVec
 
+	// AccessBlocked counts requests rejected by access control, by
+	// reason: "deny_list", "not_in_allowlist", "auto_ban", or
+	// "manual_ban". Nothing is counted without access control configured.
+	AccessBlocked *prometheus.CounterVec
+
+	// BansIssued counts bans issued, by source: "auto" (auto-ban) or
+	// "manual" (the admin API). Each instance counts the bans it issued.
+	BansIssued *prometheus.CounterVec
+
+	activeBans *activeBansCollector
+
 	backends *backendCollector
 }
+
+// activeBansCollector reports the number of active bans, read from the
+// shared store at scrape time, so every instance reports the same
+// fleet-wide number and an expired ban stops counting on its own.
+type activeBansCollector struct {
+	desc   *prometheus.Desc
+	source atomic.Pointer[func() (int, bool)]
+}
+
+func (c *activeBansCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c *activeBansCollector) Collect(ch chan<- prometheus.Metric) {
+	src := c.source.Load()
+	if src == nil {
+		return
+	}
+	if n, ok := (*src)(); ok {
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(n))
+	}
+}
+
+// SetActiveBansSource tells /metrics how to count active bans. src
+// returns false when there's nothing to report (access control isn't
+// configured, or the store can't be read), and the gauge is then left
+// out of the scrape.
+func (m *Metrics) SetActiveBansSource(src func() (int, bool)) {
+	m.activeBans.source.Store(&src)
+}
+
+// ActiveBansCollector is the collector behind
+// gatekeeper_access_control_active_bans, exposed for tests.
+func (m *Metrics) ActiveBansCollector() prometheus.Collector { return m.activeBans }
 
 // BackendState is one backend's live state, as reported by the load
 // balancer when /metrics is scraped.
@@ -369,6 +412,18 @@ func New() *Metrics {
 			Name: "gatekeeper_admin_auth_failures_total",
 			Help: "Total number of admin API requests refused before reaching an endpoint, by reason.",
 		}, []string{"reason"}),
+		AccessBlocked: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_access_control_blocked_total",
+			Help: "Total number of requests rejected by IP access control, by reason (deny_list, not_in_allowlist, auto_ban, manual_ban).",
+		}, []string{"reason"}),
+		BansIssued: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_access_control_bans_total",
+			Help: "Total number of client address bans issued by this instance, by source (auto or manual).",
+		}, []string{"source"}),
+		activeBans: &activeBansCollector{
+			desc: prometheus.NewDesc("gatekeeper_access_control_active_bans",
+				"Number of client addresses currently banned, across every instance sharing the store.", nil, nil),
+		},
 		backends: newBackendCollector(),
 		certExpiry: &certExpiryCollector{
 			desc: prometheus.NewDesc("gatekeeper_tls_certificate_expiry_seconds",
@@ -404,6 +459,9 @@ func New() *Metrics {
 		m.TransformsApplied,
 		m.AdminRequests,
 		m.AdminAuthFailures,
+		m.AccessBlocked,
+		m.BansIssued,
+		m.activeBans,
 		m.backends,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
