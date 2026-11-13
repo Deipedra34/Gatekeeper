@@ -2,9 +2,11 @@ package accesscontrol
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"gatekeeper/internal/ratelimiter/store"
 )
@@ -142,3 +144,55 @@ func (c *Controller) RecordOffense(ctx context.Context, addr netip.Addr, o Offen
 
 // Resolver returns the client address resolver.
 func (c *Controller) Resolver() *Resolver { return c.resolver }
+
+// Errors from Ban and Unban.
+var (
+	// ErrProtected means the address is on never_ban or is a trusted
+	// proxy.
+	ErrProtected = errors.New("accesscontrol: address is on the never_ban list or is a trusted proxy")
+	// ErrBansDisabled means the controller has no store to keep bans in.
+	ErrBansDisabled = errors.New("accesscontrol: bans are not available")
+)
+
+// DefaultManualBanDuration is how long a manual ban lasts when no
+// duration is given and auto-ban isn't configured.
+const DefaultManualBanDuration = time.Hour
+
+// DefaultBanDuration is the duration of a manual ban that doesn't name
+// one: auto-ban's first-ban duration, or DefaultManualBanDuration.
+func (c *Controller) DefaultBanDuration() time.Duration {
+	if c.autoBan != nil {
+		return c.autoBan.s.BanDuration
+	}
+	return DefaultManualBanDuration
+}
+
+// Ban bans addr for d, replacing any current ban, as an operator action
+// (source "manual"). A protected address can't be banned.
+func (c *Controller) Ban(ctx context.Context, addr netip.Addr, d time.Duration, reason string) (Ban, error) {
+	if c.bans == nil {
+		return Ban{}, ErrBansDisabled
+	}
+	addr = normalize(addr)
+	if c.Protected(addr) {
+		return Ban{}, ErrProtected
+	}
+	if d <= 0 {
+		return Ban{}, errors.New("accesscontrol: ban duration must be > 0")
+	}
+	now := time.Now().UTC()
+	ban := Ban{IP: addr.String(), Source: SourceManual, Reason: reason, BannedAt: now, ExpiresAt: now.Add(d)}
+	if err := c.bans.Add(ctx, ban); err != nil {
+		return Ban{}, err
+	}
+	return ban, nil
+}
+
+// Unban lifts addr's ban, whichever way it was issued. found reports
+// whether there was one.
+func (c *Controller) Unban(ctx context.Context, addr netip.Addr) (found bool, err error) {
+	if c.bans == nil {
+		return false, ErrBansDisabled
+	}
+	return c.bans.Remove(ctx, addr)
+}
