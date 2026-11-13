@@ -316,6 +316,101 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "429": { $ref: "#/components/responses/TooManyAuthFailures" }
 
+  /admin/v1/access-control:
+    get:
+      tags: [read]
+      summary: IP access control lists, trusted proxies, auto-ban settings, and active bans
+      description: |
+        The global policy and each route override as requests see them
+        (route fields merged over the global ones), plus every active ban
+        in the shared store — so with Redis, the bans of every instance.
+        With no access control configured, only enabled false and an
+        empty bans list are returned.
+      operationId: getAccessControl
+      responses:
+        "200":
+          description: Access control state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccessControl" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+        "502": { $ref: "#/components/responses/StoreError" }
+
+  /admin/v1/bans:
+    post:
+      tags: [actions]
+      summary: Ban a client address
+      x-destructive: true
+      description: |
+        Rejects every request from the address on every instance sharing
+        the store until the ban expires or is lifted, replacing any current
+        ban of it. Addresses on access_control.auto_ban.never_ban and
+        trusted proxies can't be banned (409). Needs access control to be
+        configured (409 otherwise).
+      operationId: createBan
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BanRequest" }
+      responses:
+        "201":
+          description: Banned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BanResult" }
+        "200":
+          description: With dry_run, the ban that would be issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BanResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: Access control isn't configured, or the address is protected from bans
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+        "502": { $ref: "#/components/responses/StoreError" }
+
+  /admin/v1/bans/{ip}:
+    delete:
+      tags: [actions]
+      summary: Lift a ban
+      description: Lifts the address's ban, automatic or manual, on every instance.
+      operationId: deleteBan
+      parameters:
+        - name: ip
+          in: path
+          required: true
+          description: A single IPv4 or IPv6 address.
+          schema: { type: string }
+          example: "203.0.113.7"
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: Lifted (or, with dry_run, would be)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UnbanResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Access control isn't configured
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+        "502": { $ref: "#/components/responses/StoreError" }
+
 components:
   securitySchemes:
     bearerToken:
@@ -556,3 +651,80 @@ components:
             target: { type: string }
             previous_state: { type: string, enum: [closed, open, half_open] }
             state: { type: string, enum: [closed] }
+
+    AccessPolicy:
+      type: object
+      properties:
+        route: { type: string, description: Route label (route overrides only) }
+        mode: { type: string, enum: [off, denylist, allowlist_only] }
+        allow: { type: array, items: { type: string } }
+        deny: { type: array, items: { type: string } }
+        deny_status: { type: integer }
+
+    Ban:
+      type: object
+      properties:
+        ip: { type: string }
+        source: { type: string, enum: [auto, manual] }
+        reason: { type: string }
+        level: { type: integer, description: "Which auto-ban of this address this is (escalation)" }
+        banned_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    AccessControl:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        global: { $ref: "#/components/schemas/AccessPolicy" }
+        routes:
+          type: array
+          items: { $ref: "#/components/schemas/AccessPolicy" }
+        trusted_proxies: { type: array, items: { type: string } }
+        auto_ban:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            threshold: { type: integer }
+            window: { type: string }
+            ban_duration: { type: string }
+            triggers:
+              type: array
+              items: { type: string, enum: [rate_limit, auth_failure, denied] }
+            never_ban: { type: array, items: { type: string } }
+            escalation:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                multiplier: { type: number }
+                max_duration: { type: string }
+                reset_after: { type: string }
+        bans:
+          type: array
+          items: { $ref: "#/components/schemas/Ban" }
+        active_bans: { type: integer }
+
+    BanRequest:
+      type: object
+      required: [ip]
+      additionalProperties: false
+      properties:
+        ip: { type: string, description: A single IPv4 or IPv6 address }
+        duration:
+          type: string
+          description: Go duration; defaults to access_control.auto_ban.ban_duration, or 1h
+          example: "30m"
+        reason: { type: string, maxLength: 200 }
+
+    BanResult:
+      allOf:
+        - $ref: "#/components/schemas/ActionResult"
+        - type: object
+          properties:
+            ban: { $ref: "#/components/schemas/Ban" }
+
+    UnbanResult:
+      allOf:
+        - $ref: "#/components/schemas/ActionResult"
+        - type: object
+          properties:
+            ip: { type: string }
