@@ -27,6 +27,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/v1/backends", s.listBackends)
 	s.mux.HandleFunc("GET /admin/v1/ratelimits/{client}", s.getRateLimit)
 	s.mux.HandleFunc("GET /admin/v1/cache/stats", s.cacheStats)
+	s.mux.HandleFunc("GET /admin/v1/access-control", s.accessControl)
 
 	s.mux.HandleFunc("POST /admin/v1/reload", s.reloadConfig)                 // dry_run
 	s.mux.HandleFunc("POST /admin/v1/cache/purge", s.purgeCache)              // destructive, dry_run

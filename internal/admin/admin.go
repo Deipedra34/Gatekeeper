@@ -1,6 +1,6 @@
 // Package admin serves Gatekeeper's admin API: read-only views of the
 // running gateway (status, redacted config, routes, backends, rate limit
-// state, cache stats) and operator actions (reload, cache purge, rate
+// state, cache stats, access control lists and bans) and operator actions (reload, cache purge, rate
 // limit reset, backend drain/enable, circuit breaker reset).
 //
 // It runs on its own listener, never on the proxy's, so no backend route
