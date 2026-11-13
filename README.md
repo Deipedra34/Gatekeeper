@@ -1112,6 +1112,71 @@ TOKEN="$header.$payload.$sig"
 
 In production, tokens come from your identity provider. Keep only the public key on the gateway for RS256, and never commit HS256 secrets or private keys.
 
+## IP access control and auto-ban
+
+Gatekeeper can decide which client addresses may use it at all, before any other work is done on a request. Lists of single IPv4/IPv6 addresses and CIDR ranges can be set for the whole gateway and overridden per route, and an address that keeps misbehaving can be banned for a while, automatically or from the admin API.
+
+All of it lives in an optional `access_control` section. **Without that section (and without any route-level `access_control`), no access control code runs at all**, and requests are handled exactly as in earlier versions.
+
+| Setting | What it does |
+|---|---|
+| `mode` | `off` (the default: no list restriction), `denylist` (reject addresses on `deny`), or `allowlist_only` (reject every address not on `allow`) |
+| `allow`, `deny` | Single addresses (`203.0.113.7`, `2001:db8::1`) and CIDR ranges (`10.0.0.0/8`, `2001:db8::/32`) |
+| `deny_status` | The status a rejected request gets. Defaults to `403` |
+| `trusted_proxies` | Proxies whose `X-Forwarded-For` / `X-Real-IP` are believed. See [Trusted proxies and the client address](#trusted-proxies-and-the-client-address) |
+| `auto_ban` | Temporary bans for repeat offenders. See [Auto-ban](#auto-ban) |
+
+Rules:
+
+- **Deny always wins over allow.** An address on both lists is rejected, in either mode.
+- **Bans apply in every mode**, `off` included, and on every route.
+- **Every entry is validated when the config is loaded.** A typo such as `10.0.0.300` or `10.0.0.0/33` stops startup, or rejects a `SIGHUP` reload, with the entry's exact location: `config: invalid: access_control.deny[1]: "10.0.0.300" is not a valid IP address or CIDR range`. Lists that can't do anything are refused too: `allow` / `deny` entries with `mode: off`, and `allowlist_only` with an empty `allow` list (which would reject every request).
+- IPv4-mapped IPv6 addresses (`::ffff:192.0.2.1`) match IPv4 entries, so an entry matches a client however its address is written.
+
+### Global denylist
+
+Keep known-bad addresses away from every route:
+
+```yaml
+access_control:
+  mode: denylist
+  deny:
+    - "198.51.100.0/24"
+    - "203.0.113.66"
+    - "2001:db8:bad::/48"
+```
+
+### Allowlist-only admin route
+
+Route-level `access_control` overrides the global settings for that route. Every field the route sets replaces the global one; fields it leaves out are inherited (an explicit empty list replaces the global list with nothing). Here `/admin` is reachable only from the office network and VPN, and everyone else gets a `404` so the route's existence isn't confirmed. The global deny list still applies there, since the route doesn't override `deny`:
+
+```yaml
+access_control:
+  mode: denylist
+  deny: ["198.51.100.0/24"]
+
+routes:
+  - path_prefix: "/admin"
+    target: "http://localhost:9100"
+    access_control:
+      mode: allowlist_only
+      allow: ["10.0.0.0/8", "2001:db8:ops::/48"]
+      deny_status: 404
+  - path_prefix: "/health"
+    target: "http://localhost:9000"
+    access_control: {mode: "off"}   # no lists here (bans still apply)
+  - path_prefix: "/"
+    target: "http://localhost:9000"
+```
+
+### Where it runs in the pipeline
+
+Access control is the first thing that runs on a request, right after the latency metric starts timing. A blocked request costs one address lookup in the compiled lists, plus a ban lookup in the store if it passes them. It never reaches CORS, auth, or the rate limiter, so it **consumes no rate limit tokens**. It also never reaches the cache, the circuit breaker, or a backend, and it gets no per-request log line (see [Logging, metrics, and tracing](#logging-metrics-and-tracing)). The response is `deny_status` with the body `access denied`.
+
+The lists are compiled once, at load and on each reload, into a sorted table of disjoint address ranges. A lookup is a single binary search, so a list with 100,000 entries costs about as much as one with 1,000. See [ADR 9](docs/adr/0009-ip-access-control.md) and [Benchmarks](#benchmarks).
+
+The admin API (its own listener), `/metrics`, and the gateway's own health checks against backends (outgoing requests) don't go through this pipeline, so access control and bans never affect them.
+
 ## Setup
 
 Requires Go 1.26+ (see `go.mod`). Redis is optional, only needed if you set `storage.backend: redis`.
