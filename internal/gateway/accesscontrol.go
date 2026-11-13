@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"gatekeeper/internal/accesscontrol"
@@ -86,4 +88,34 @@ func (g *Gateway) activeBans() (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// logAccessControl summarises cfg's access control when it's loaded at
+// startup or by a reload, so the log shows which lists are in force.
+// Bans are kept in the store, so a reload neither lifts nor resets them.
+func (g *Gateway) logAccessControl(cfg *config.Config) {
+	if !cfg.AccessControlEnabled() {
+		return
+	}
+	global := config.EffectiveAccessControl(config.AccessControlConfig{}, nil)
+	var proxies int
+	autoBan := "off"
+	if ac := cfg.AccessControl; ac != nil {
+		global = config.EffectiveAccessControl(*ac, nil)
+		proxies = len(ac.TrustedProxies)
+		if ac.AutoBan.Enabled {
+			autoBan = fmt.Sprintf("on (%d offenses in %s -> %s)", ac.AutoBan.Threshold, ac.AutoBan.Window, ac.AutoBan.BanDuration)
+		}
+	}
+	var overrides []string
+	for _, rt := range cfg.Routes {
+		if rt.AccessControl != nil {
+			overrides = append(overrides, rt.Label())
+		}
+	}
+	g.logger.Printf("access_control: mode=%s allow=%d deny=%d trusted_proxies=%d route_overrides=[%s] auto_ban=%s",
+		global.Mode, len(global.Allow), len(global.Deny), proxies, strings.Join(overrides, " "), autoBan)
+	if cfg.Transform.TrustForwardedHeaders && proxies == 0 {
+		g.logger.Printf("access_control: transform.trust_forwarded_headers is on but access_control.trusted_proxies is empty, so access control ignores X-Forwarded-For and uses the connection's peer address")
+	}
 }

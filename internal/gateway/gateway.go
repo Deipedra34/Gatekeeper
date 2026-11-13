@@ -337,6 +337,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		router.Discard()
 		return nil, err
 	}
+	g.logAccessControl(cfg)
 
 	mws := []middleware.Middleware{middleware.RequestMetrics(g.metrics, router.RouteLabelFor)}
 	if access != nil {
