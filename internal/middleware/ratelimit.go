@@ -170,7 +170,14 @@ func clientKey(cfg config.RateLimitConfig, r *http.Request) string {
 	}
 }
 
+// clientIP identifies a client for the "ip" scope. With access control
+// on, that's the address it resolved — the peer, or what a trusted proxy
+// reports — so a client can't escape its limit by sending its own
+// X-Forwarded-For. Without it, the behaviour is unchanged.
 func clientIP(r *http.Request) string {
+	if addr, ok := ClientAddrFrom(r.Context()); ok {
+		return addr.String()
+	}
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		return fwd
 	}
