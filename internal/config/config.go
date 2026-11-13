@@ -51,6 +51,10 @@ type Config struct {
 	Tracing   TracingConfig   `yaml:"tracing"`
 	Admin     AdminConfig     `yaml:"admin"`
 	Transform TransformConfig `yaml:"transform"`
+
+	// AccessControl holds the IP allow/deny lists, trusted proxies, and
+	// auto-ban settings. Nil (the section left out) means none of it.
+	AccessControl *AccessControlConfig `yaml:"access_control,omitempty"`
 }
 
 // ServerConfig controls the HTTP listener Gatekeeper itself exposes.
@@ -277,6 +281,10 @@ type Route struct {
 	// Transform rewrites the request forwarded to the backend and the
 	// response returned to the client. Unset means no change.
 	Transform RouteTransform `yaml:"transform"`
+
+	// AccessControl overrides the global access_control allow/deny
+	// settings for this route. Nil inherits them.
+	AccessControl *RouteAccessControl `yaml:"access_control,omitempty"`
 }
 
 // DefaultWSIdleTimeout is the WebSocket idle timeout applied to a route
@@ -484,6 +492,7 @@ func (c *Config) applyDefaults() {
 	c.Tracing.applyDefaults()
 	c.Admin.applyDefaults()
 	c.applyTransformDefaults()
+	c.applyAccessControlDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -634,6 +643,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.validateTransform(); err != nil {
+		return err
+	}
+	if err := c.validateAccessControl(); err != nil {
 		return err
 	}
 
