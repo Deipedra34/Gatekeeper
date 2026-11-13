@@ -2,8 +2,11 @@ package middleware
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"net/netip"
+	"strconv"
+	"time"
 
 	"gatekeeper/internal/accesscontrol"
 )
@@ -19,6 +22,11 @@ import (
 // ClientAddrFrom). routeFor maps a request to its route label (normally
 // the router's RouteLabelFor); a request matching no route gets the
 // global policy.
+//
+// An address that passes the lists is then checked against the ban
+// list in the shared store; a banned one is rejected the same way, with
+// a Retry-After header saying when the ban ends. If the store can't be
+// read the request is let through, as the rate limiter does.
 func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (string, bool)) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,15 +37,28 @@ func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (st
 			}
 			policy := c.PolicyFor(route)
 			if reason := policy.Check(addr, known); reason != accesscontrol.ReasonNone {
-				http.Error(w, "access denied", policy.DenyStatus())
+				block(w, policy.DenyStatus(), 0)
 				return
 			}
 			if known {
+				if ban, banned, err := c.Banned(r.Context(), addr); err == nil && banned {
+					block(w, policy.DenyStatus(), time.Until(ban.ExpiresAt))
+					return
+				}
 				r = r.WithContext(context.WithValue(r.Context(), clientAddrKey{}, addr))
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// block writes the rejection. retryAfter, when positive, is how long
+// until a ban ends.
+func block(w http.ResponseWriter, status int, retryAfter time.Duration) {
+	if retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(max(math.Ceil(retryAfter.Seconds()), 1))))
+	}
+	http.Error(w, "access denied", status)
 }
 
 type clientAddrKey struct{}

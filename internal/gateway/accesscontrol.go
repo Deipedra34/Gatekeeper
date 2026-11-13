@@ -3,12 +3,14 @@ package gateway
 import (
 	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/ratelimiter/store"
 )
 
 // buildAccessControl compiles cfg's access control, or returns nil when
 // none is configured — in which case no access control middleware is
 // installed at all and requests are handled exactly as before.
-func buildAccessControl(cfg *config.Config) (*accesscontrol.Controller, error) {
+// Bans live in st, the store shared with the rate limiter.
+func buildAccessControl(cfg *config.Config, st store.Store) (*accesscontrol.Controller, error) {
 	if !cfg.AccessControlEnabled() {
 		return nil, nil
 	}
@@ -20,6 +22,7 @@ func buildAccessControl(cfg *config.Config) (*accesscontrol.Controller, error) {
 		Global:         policySettings(config.EffectiveAccessControl(global, nil)),
 		Routes:         map[string]accesscontrol.PolicySettings{},
 		TrustedProxies: global.TrustedProxies,
+		Store:          st,
 	}
 	for _, rt := range cfg.Routes {
 		if rt.AccessControl != nil {

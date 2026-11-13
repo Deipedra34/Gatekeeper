@@ -327,7 +327,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		g.logger.Printf("auth: auth.enabled is false, so routes with auth_mode jwt or either are NOT protected")
 	}
 
-	access, err := buildAccessControl(cfg)
+	access, err := buildAccessControl(cfg, g.store)
 	if err != nil {
 		router.Discard()
 		return nil, err
