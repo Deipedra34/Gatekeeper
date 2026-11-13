@@ -93,6 +93,12 @@ const (
 	AttrAdminIdentity = attribute.Key("gatekeeper.admin.identity")
 	AttrAdminResult   = attribute.Key("gatekeeper.admin.result")
 
+	// AttrAccessBlockReason is why IP access control rejected the
+	// request (deny_list, not_in_allowlist, auto_ban, manual_ban). Set on
+	// the server span of blocked requests only; the client address
+	// itself is never recorded.
+	AttrAccessBlockReason = attribute.Key("gatekeeper.access_control.block_reason")
+
 	AttrWSRejectReason = attribute.Key("gatekeeper.websocket.reject_reason")
 	AttrWSCloseReason  = attribute.Key("gatekeeper.websocket.close_reason")
 )

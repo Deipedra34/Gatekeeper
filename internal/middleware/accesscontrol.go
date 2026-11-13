@@ -8,8 +8,11 @@ import (
 	"strconv"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/metrics"
+	"gatekeeper/internal/tracing"
 )
 
 // AccessControl rejects requests from client addresses the route's
@@ -108,6 +111,8 @@ func (a *accessControl) block(w http.ResponseWriter, r *http.Request, addr netip
 	if a.metrics != nil {
 		a.metrics.AccessBlocked.WithLabelValues(string(reason)).Inc()
 	}
+	// A no-op without tracing: there's no span in the context then.
+	trace.SpanFromContext(r.Context()).SetAttributes(tracing.AttrAccessBlockReason.String(string(reason)))
 	client := "unknown"
 	if addr.IsValid() {
 		client = addr.String()
