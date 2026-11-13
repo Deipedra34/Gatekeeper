@@ -370,3 +370,41 @@ func TestAccessControl_NotConfiguredBehavesAsBefore(t *testing.T) {
 	assert.NotContains(t, rec.Body.String(), "gatekeeper_access_control")
 	assert.NotContains(t, h.logs.String(), "access_control")
 }
+
+// TestAccessControl_BlockReasonOnTheServerSpan checks that a blocked
+// request's server span says why, and that no auth or rate limit span
+// exists for it — it never got that far. httptest requests come from
+// 192.0.2.1.
+func TestAccessControl_BlockReasonOnTheServerSpan(t *testing.T) {
+	backend := newBackendRecorder(t, nil)
+	tr := newTraced(t, tracingYAML(backend.srv.URL, 10, tracingOn+`
+access_control: {mode: denylist, deny: ["192.0.2.1"]}
+`, ""))
+
+	require.Equal(t, http.StatusForbidden, tr.get("/api/items", withKey()).Code)
+
+	spans := spansByName(tr.rec)
+	require.Len(t, spans["GET /api"], 1)
+	server := spans["GET /api"][0]
+	assert.Equal(t, "deny_list", mustAttr(t, server, "gatekeeper.access_control.block_reason"))
+	assert.Equal(t, int64(403), mustAttr(t, server, "http.response.status_code"))
+	assert.Empty(t, spans["auth"])
+	assert.Empty(t, spans["rate_limit"])
+	assert.EqualValues(t, 0, backend.calls.Load())
+	for _, s := range tr.rec.Ended() {
+		for _, kv := range s.Attributes() {
+			assert.NotContains(t, kv.Value.Emit(), "192.0.2.1", "the client address isn't recorded")
+		}
+	}
+}
+
+func TestAccessControl_AllowedRequestsHaveNoBlockReason(t *testing.T) {
+	backend := newBackendRecorder(t, nil)
+	tr := newTraced(t, tracingYAML(backend.srv.URL, 10, tracingOn+`
+access_control: {mode: denylist, deny: ["198.51.100.0/24"]}
+`, ""))
+	require.Equal(t, http.StatusOK, tr.get("/api/items", withKey()).Code)
+	server := spansByName(tr.rec)["GET /api"][0]
+	_, ok := attr(server, "gatekeeper.access_control.block_reason")
+	assert.False(t, ok)
+}
