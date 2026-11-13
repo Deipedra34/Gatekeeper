@@ -1,7 +1,8 @@
 // Package admin serves Gatekeeper's admin API: read-only views of the
 // running gateway (status, redacted config, routes, backends, rate limit
-// state, cache stats, access control lists and bans) and operator actions (reload, cache purge, rate
-// limit reset, backend drain/enable, circuit breaker reset).
+// state, cache stats, access control lists and bans) and operator
+// actions (reload, cache purge, rate limit reset, backend drain/enable,
+// circuit breaker reset, IP ban and unban).
 //
 // It runs on its own listener, never on the proxy's, so no backend route
 // can shadow it and no public client can reach it. Every request is
@@ -237,7 +238,7 @@ func writeDenied(w http.ResponseWriter, d decision) {
 // otherwise.
 func (s *Server) unmatched(w http.ResponseWriter, r *http.Request) {
 	var allowed []string
-	for _, m := range []string{http.MethodGet, http.MethodPost} {
+	for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
 		probe := r.Clone(r.Context())
 		probe.Method = m
 		if _, p := s.mux.Handler(probe); p != "" {

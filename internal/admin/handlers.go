@@ -17,8 +17,8 @@ import (
 	"gatekeeper/internal/version"
 )
 
-// routes registers every endpoint. GETs only read; every POST changes
-// gateway state, and the destructive ones (marked) accept ?dry_run=true
+// routes registers every endpoint. GETs only read; every POST and DELETE
+// changes gateway state, and the destructive ones (marked) accept ?dry_run=true
 // to report what they would do without doing it.
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/v1/status", s.status)
@@ -35,6 +35,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /admin/v1/backends/{id}/drain", s.drainBackend)    // destructive, dry_run
 	s.mux.HandleFunc("POST /admin/v1/backends/{id}/enable", s.enableBackend)
 	s.mux.HandleFunc("POST /admin/v1/circuit-breakers/{id}/reset", s.resetBreaker) // dry_run
+	s.mux.HandleFunc("POST /admin/v1/bans", s.createBan)                           // dry_run
+	s.mux.HandleFunc("DELETE /admin/v1/bans/{ip}", s.deleteBan)                    // dry_run
 }
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
