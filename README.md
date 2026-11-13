@@ -1200,6 +1200,37 @@ With access control on and `rate_limit.scope: ip`, the rate limiter keys on this
 
 `trusted_proxies` is separate from `transform.trust_forwarded_headers`, which controls what's *forwarded to backends* (see [Forwarding headers](#forwarding-headers)). If `trust_forwarded_headers` is on but `trusted_proxies` is empty, Gatekeeper logs at startup that access control is using the peer address. Trusted proxies are never banned, since banning one would block every client behind it.
 
+### Auto-ban
+
+`auto_ban` temporarily bans an address that keeps getting rejected:
+
+```yaml
+access_control:
+  auto_ban:
+    enabled: true
+    threshold: 20          # offenses...
+    window: 1m             # ...within this window
+    ban_duration: 10m      # first ban
+    triggers: [rate_limit, auth_failure, denied]   # the default: all three
+    never_ban: ["127.0.0.1", "::1", "10.20.0.0/16"]  # monitoring, office, ...
+    escalation:
+      enabled: true
+      multiplier: 2        # 10m, 20m, 40m, ...
+      max_duration: 24h
+      reset_after: 24h     # no ban for this long: back to 10m
+```
+
+- **Triggers.** `rate_limit` counts the rate limiter's `429`s, `auth_failure` counts the auth middleware's `401`s, and `denied` counts rejections by the allow/deny lists. A `429` or `401` from a *backend* never counts. All triggers add up to the same per-address count.
+- **Bans live in the store** the rate limiter already uses (`storage.backend`). With Redis, offenses seen by every instance add up, and a ban issued by one instance is enforced by all of them. Each ban is a key with a TTL, so it expires on its own. Bans survive config reloads and, with Redis, restarts.
+- **A banned request** gets the route's `deny_status` (`403` by default), with a `Retry-After` header giving the seconds left on the ban.
+- **One ban per window.** Only the offense that lands exactly on the threshold issues the ban, so concurrent requests, on one instance or many, can't ban an address twice. An address that's still banned when it reaches the threshold again (for example, because an allowlist keeps rejecting it) isn't banned again, so its ban is neither extended nor escalated.
+- **Escalation.** With `escalation.enabled`, the n-th ban of an address lasts `ban_duration × multiplier^(n-1)`, capped at `max_duration`. The count resets once the address goes `reset_after` without a ban.
+- **`never_ban`** addresses and ranges are never banned, automatically or through the admin API, and neither are `trusted_proxies`. Adding an address to `never_ban` in a reload also stops an existing ban of it from being enforced.
+- **Lifting a ban** through the admin API also clears the address's offense count.
+- **If the store is unreachable**, requests are let through (as the rate limiter does) and a warning is logged. A storage problem never turns into an outage.
+
+Bans can also be issued and lifted by hand. See [Access control endpoints](#access-control-endpoints).
+
 ### Where it runs in the pipeline
 
 Access control is the first thing that runs on a request, right after the latency metric starts timing. A blocked request costs one address lookup in the compiled lists, plus a ban lookup in the store if it passes them. It never reaches CORS, auth, or the rate limiter, so it **consumes no rate limit tokens**. It also never reaches the cache, the circuit breaker, or a backend, and it gets no per-request log line (see [Logging, metrics, and tracing](#logging-metrics-and-tracing)). The response is `deny_status` with the body `access denied`.
