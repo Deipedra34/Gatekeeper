@@ -61,6 +61,13 @@ func policySettings(eff config.RouteAccessControl) accesscontrol.PolicySettings 
 	}
 }
 
+// Access control logs at most accessLogBurst lines at once, then one
+// per accessLogInterval; the rest are counted and dropped.
+const (
+	accessLogInterval = time.Second
+	accessLogBurst    = 10
+)
+
 // activeBansTimeout bounds how long a /metrics scrape waits for the
 // store to count active bans.
 const activeBansTimeout = time.Second

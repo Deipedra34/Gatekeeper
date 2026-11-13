@@ -66,6 +66,9 @@ type Gateway struct {
 	// access is the current config's compiled access control; nil when
 	// none is configured.
 	access atomic.Pointer[accesscontrol.Controller]
+	// accessLog rate limits access control log lines. It outlives
+	// reloads, so a reload mid-flood doesn't reset the limit.
+	accessLog *accesscontrol.LogThrottle
 
 	// tracer is the tracing pipeline the current request pipeline uses.
 	// It's rebuilt on Reload only when the tracing section changed.
@@ -108,6 +111,7 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		wsHub:      websocket.NewHub(m),
 		backends:   lb.NewRegistry(),
 		retiring:   map[*tracing.Provider]*time.Timer{},
+		accessLog:  accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
 	}
 	if m != nil {
 		m.SetBackendSource(g.backends.Snapshot)
@@ -341,7 +345,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		// from auth, the rate limiter (no tokens), the cache, the circuit
 		// breaker, or a backend.
 		mws = append(mws, middleware.AccessControl(access, router.RouteLabelFor,
-			middleware.WithAccessMetrics(g.metrics)))
+			middleware.WithAccessMetrics(g.metrics), middleware.WithAccessLog(g.accessLog)))
 	}
 	h := middleware.Chain(router, append(mws,
 		// Early, so every response — 401s and 429s included — carries it.

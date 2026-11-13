@@ -50,16 +50,20 @@ func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (st
 				if known {
 					a.recordOffense(r.Context(), addr, accesscontrol.OffenseDenied)
 				}
-				a.block(w, reason, policy.DenyStatus(), 0)
+				a.block(w, r, addr, reason, policy.DenyStatus(), 0)
 				return
 			}
 			if known {
-				if ban, banned, err := c.Banned(r.Context(), addr); err == nil && banned {
+				ban, banned, err := c.Banned(r.Context(), addr)
+				if err != nil {
+					a.log.Printf("access_control: WARNING: ban check for %s failed, letting the request through: %v", addr, err)
+				}
+				if banned {
 					reason := accesscontrol.ReasonAutoBan
 					if ban.Source == accesscontrol.SourceManual {
 						reason = accesscontrol.ReasonManualBan
 					}
-					a.block(w, reason, policy.DenyStatus(), time.Until(ban.ExpiresAt))
+					a.block(w, r, addr, reason, policy.DenyStatus(), time.Until(ban.ExpiresAt))
 					return
 				}
 				r = r.WithContext(context.WithValue(r.Context(), accessKey{}, requestAccess{addr: addr, a: a}))
@@ -77,19 +81,42 @@ func WithAccessMetrics(m *metrics.Metrics) AccessControlOption {
 	return func(a *accessControl) { a.metrics = m }
 }
 
+// WithAccessLog logs blocked requests, new bans, and store errors
+// through t, which rate limits them. Without it nothing is logged.
+func WithAccessLog(t *accesscontrol.LogThrottle) AccessControlOption {
+	return func(a *accessControl) { a.log = t }
+}
+
 // accessControl is one AccessControl middleware's settings.
 type accessControl struct {
 	c        *accesscontrol.Controller
 	routeFor func(*http.Request) (string, bool)
 	metrics  *metrics.Metrics
+	log      *accesscontrol.LogThrottle // nil: no logging
 }
+
+// maxLoggedPath caps how much of a blocked request's path is logged.
+const maxLoggedPath = 100
 
 // block writes the rejection. retryAfter, when positive, is how long
 // until a ban ends.
-func (a *accessControl) block(w http.ResponseWriter, reason accesscontrol.Reason, status int, retryAfter time.Duration) {
+//
+// The log line has the method, the path (truncated, never the query),
+// the client address, and the reason — never headers, which can carry
+// credentials.
+func (a *accessControl) block(w http.ResponseWriter, r *http.Request, addr netip.Addr, reason accesscontrol.Reason, status int, retryAfter time.Duration) {
 	if a.metrics != nil {
 		a.metrics.AccessBlocked.WithLabelValues(string(reason)).Inc()
 	}
+	client := "unknown"
+	if addr.IsValid() {
+		client = addr.String()
+	}
+	path := r.URL.Path
+	if len(path) > maxLoggedPath {
+		path = path[:maxLoggedPath] + "..."
+	}
+	a.log.Printf("access_control: blocked %s %q from %s: %s (status %d)", r.Method, path, client, reason, status)
 	if retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(max(math.Ceil(retryAfter.Seconds()), 1))))
 	}
@@ -99,10 +126,19 @@ func (a *accessControl) block(w http.ResponseWriter, reason accesscontrol.Reason
 // recordOffense records o for addr. The request is being rejected
 // anyway; if the store fails, the offense just isn't counted.
 func (a *accessControl) recordOffense(ctx context.Context, addr netip.Addr, o accesscontrol.Offense) {
-	_, banned, err := a.c.RecordOffense(ctx, addr, o)
-	if err == nil && banned && a.metrics != nil {
+	ban, banned, err := a.c.RecordOffense(ctx, addr, o)
+	if err != nil {
+		a.log.Printf("access_control: WARNING: recording a %s offense for %s failed: %v", o, addr, err)
+		return
+	}
+	if !banned {
+		return
+	}
+	if a.metrics != nil {
 		a.metrics.BansIssued.WithLabelValues(accesscontrol.SourceAuto).Inc()
 	}
+	a.log.Printf("access_control: auto-banned %s until %s (level %d: %s)",
+		ban.IP, ban.ExpiresAt.Format(time.RFC3339), ban.Level, ban.Reason)
 }
 
 // requestAccess is what the access control middleware attaches to a
