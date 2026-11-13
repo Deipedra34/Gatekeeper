@@ -114,19 +114,24 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 	if err != nil {
 		return nil, err
 	}
-	h, router, limiters, err := g.build(cfg, tp, nil)
+	b, err := g.build(cfg, tp, nil)
 	if err != nil {
 		_ = tp.Shutdown(context.Background())
 		return nil, err
 	}
-	g.pipeline.Store(&h)
-	g.router.Store(router)
+	g.install(cfg, b, tp)
+	return g, nil
+}
+
+// install makes b, built from cfg, the live pipeline.
+func (g *Gateway) install(cfg *config.Config, b *built, tp *tracing.Provider) {
+	g.pipeline.Store(&b.handler)
+	g.router.Store(b.router)
 	g.current.Store(cfg)
-	g.limiters.Store(&limiters)
+	g.limiters.Store(&b.limiters)
 	g.tracer.Store(tp)
 	now := time.Now()
 	g.loadedAt.Store(&now)
-	return g, nil
 }
 
 // Close stops background work tied to the current config — active
@@ -211,7 +216,7 @@ func (g *Gateway) Reload() error {
 		}
 	}
 	oldRouter := g.router.Load()
-	h, router, limiters, err := g.build(cfg, tp, oldRouter)
+	b, err := g.build(cfg, tp, oldRouter)
 	if err != nil {
 		if tp != old {
 			_ = tp.Shutdown(context.Background())
@@ -221,15 +226,9 @@ func (g *Gateway) Reload() error {
 	// Backends shared with the old router pick up their new settings now,
 	// right before the swap; backends the new config dropped drain behind
 	// it — in-flight requests finish, new ones go elsewhere.
-	router.Activate()
-	g.pipeline.Store(&h)
-	g.router.Store(router)
-	g.current.Store(cfg)
-	g.limiters.Store(&limiters)
-	g.tracer.Store(tp)
-	now := time.Now()
-	g.loadedAt.Store(&now)
-	oldRouter.Retire(router)
+	b.router.Activate()
+	g.install(cfg, b, tp)
+	oldRouter.Retire(b.router)
 	if tp != old {
 		g.retire(old)
 	}
@@ -291,7 +290,7 @@ func (g *Gateway) retire(p *tracing.Provider) {
 // prev, if non-nil, is the live router being replaced; the new router is
 // then built to share its unchanged backends and isn't live until
 // Activate. On error, nothing live has been touched.
-func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Router) (http.Handler, *proxy.Router, map[string]ratelimiter.Limiter, error) {
+func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Router) (*built, error) {
 	opts := []proxy.Option{
 		proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends), proxy.WithTransformConfig(cfg.Transform),
 	}
@@ -300,19 +299,19 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 	}
 	router, err := proxy.NewRouter(cfg.Routes, cfg.Proxy, g.metrics, g.cache, opts...)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	limiters, err := buildLimiters(cfg, g.store)
 	if err != nil {
 		router.Discard()
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	auth, err := middleware.Auth(cfg.Auth, router.AuthModeFor, g.metrics)
 	if err != nil {
 		router.Discard()
-		return nil, nil, nil, err
+		return nil, err
 	}
 	if !cfg.Auth.Enabled && routesAcceptJWT(cfg.Routes) {
 		g.logger.Printf("auth: auth.enabled is false, so routes with auth_mode jwt or either are NOT protected")
@@ -331,7 +330,14 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 	// Outermost, so the server span covers the whole request and every
 	// stage below can start its span from it. A no-op when disabled.
 	h = tp.Handler(h, router.RouteLabelFor)
-	return h, router, limiters, nil
+	return &built{handler: h, router: router, limiters: limiters}, nil
+}
+
+// built is everything build derives from one config.
+type built struct {
+	handler  http.Handler
+	router   *proxy.Router
+	limiters map[string]ratelimiter.Limiter
 }
 
 func routesAcceptJWT(routes []config.Route) bool {
