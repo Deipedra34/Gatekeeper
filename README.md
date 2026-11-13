@@ -1269,7 +1269,9 @@ With the [admin API](#admin-api) enabled:
 | `DELETE /admin/v1/bans/{ip}` | Lifts a ban, automatic or manual, on every instance sharing the store. `404` if the address isn't banned |
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN"   -d '{"ip": "203.0.113.7", "duration": "30m", "reason": "credential stuffing"}'   http://127.0.0.1:9090/admin/v1/bans
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"ip": "203.0.113.7", "duration": "30m", "reason": "credential stuffing"}' \
+  http://127.0.0.1:9090/admin/v1/bans
 curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/bans/203.0.113.7
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/access-control
 ```
