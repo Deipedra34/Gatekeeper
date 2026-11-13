@@ -1875,6 +1875,26 @@ This lines up with the trade-offs described above. **Fixed Window Counter is the
 
 The Redis numbers tell a second, independent story: every algorithm gets roughly 300–1000x slower once state has to round-trip a Lua script over the network instead of staying behind a local mutex, which is the real cost of coordinating limits fleet-wide ([ADR 2](docs/adr/0002-redis-lua-atomic-operations.md)) — and it's also why [`FallbackStore`](docs/adr/0004-fallback-store-graceful-degradation.md) existing at all matters: losing Redis costs you fleet-wide accuracy, but staying on it costs raw throughput even when it's healthy.
 
+### Access control
+
+[`internal/accesscontrol/bench_test.go`](internal/accesscontrol/bench_test.go) looks addresses up in generated lists (a mix of IPv4/IPv6 addresses and ranges), and [`internal/middleware/accesscontrol_bench_test.go`](internal/middleware/accesscontrol_bench_test.go) measures the whole middleware with a 10,000-entry deny list. Same machine as above:
+
+```
+BenchmarkPrefixSet_Contains/entries=10-24          9.326 ns/op     0 B/op    0 allocs/op
+BenchmarkPrefixSet_Contains/entries=1000-24        34.10 ns/op     0 B/op    0 allocs/op
+BenchmarkPrefixSet_Contains/entries=10000-24       64.50 ns/op     0 B/op    0 allocs/op
+BenchmarkPrefixSet_Contains/entries=100000-24      29.85 ns/op     0 B/op    0 allocs/op
+BenchmarkPrefixSet_LinearScan-24                   44173 ns/op    16 B/op    1 allocs/op   (10,000 entries)
+BenchmarkNewPrefixSet-24                        27513788 ns/op               53 allocs/op   (100,000 entries)
+BenchmarkResolver_ClientAddr/untrusted_peer-24     48.99 ns/op     0 B/op    0 allocs/op
+BenchmarkResolver_ClientAddr/two_trusted_hops-24   230.7 ns/op     0 B/op    0 allocs/op
+BenchmarkAccessControl/allowed/lists_only-24       276.4 ns/op   400 B/op    3 allocs/op
+BenchmarkAccessControl/blocked/lists_only-24       572.0 ns/op   232 B/op   10 allocs/op
+BenchmarkAccessControl/allowed/lists_and_memory_bans-24   497.1 ns/op   464 B/op   5 allocs/op
+```
+
+A lookup is a binary search over merged ranges, so it stays in the tens of nanoseconds, without allocating, from 10 entries to 100,000. The 100,000-entry list is even faster than the 10,000-entry one, because its many overlapping ranges merge into fewer. Checking every prefix in turn costs ~700x more at 10,000 entries. Compiling 100,000 entries takes ~28ms, once per load or reload. The middleware as a whole adds well under a microsecond to a request. With Redis, the ban check adds one `GET` round trip, about the same as a rate limiter check.
+
 ## Architecture Decisions
 
 Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address — live in [`docs/adr/`](docs/adr/).
