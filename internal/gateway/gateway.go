@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/lb"
@@ -61,6 +62,10 @@ type Gateway struct {
 	current  atomic.Pointer[config.Config]
 	limiters atomic.Pointer[map[string]ratelimiter.Limiter]
 	loadedAt atomic.Pointer[time.Time] // when current was loaded
+
+	// access is the current config's compiled access control; nil when
+	// none is configured.
+	access atomic.Pointer[accesscontrol.Controller]
 
 	// tracer is the tracing pipeline the current request pipeline uses.
 	// It's rebuilt on Reload only when the tracing section changed.
@@ -129,6 +134,7 @@ func (g *Gateway) install(cfg *config.Config, b *built, tp *tracing.Provider) {
 	g.router.Store(b.router)
 	g.current.Store(cfg)
 	g.limiters.Store(&b.limiters)
+	g.access.Store(b.access)
 	g.tracer.Store(tp)
 	now := time.Now()
 	g.loadedAt.Store(&now)
@@ -172,6 +178,10 @@ func (g *Gateway) Limiter(tier string) (ratelimiter.Limiter, bool) {
 	l, ok := (*g.limiters.Load())[tier]
 	return l, ok
 }
+
+// AccessControl returns the current config's compiled access control,
+// or nil when none is configured.
+func (g *Gateway) AccessControl() *accesscontrol.Controller { return g.access.Load() }
 
 // Cache returns the response cache, shared by every config.
 func (g *Gateway) Cache() *cache.Cache { return g.cache }
@@ -317,8 +327,21 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		g.logger.Printf("auth: auth.enabled is false, so routes with auth_mode jwt or either are NOT protected")
 	}
 
-	h := middleware.Chain(router,
-		middleware.RequestMetrics(g.metrics, router.RouteLabelFor),
+	access, err := buildAccessControl(cfg)
+	if err != nil {
+		router.Discard()
+		return nil, err
+	}
+
+	mws := []middleware.Middleware{middleware.RequestMetrics(g.metrics, router.RouteLabelFor)}
+	if access != nil {
+		// As early as possible, so a blocked address costs one list
+		// lookup: no request ID, no per-request log line, and nothing
+		// from auth, the rate limiter (no tokens), the cache, the circuit
+		// breaker, or a backend.
+		mws = append(mws, middleware.AccessControl(access, router.RouteLabelFor))
+	}
+	h := middleware.Chain(router, append(mws,
 		// Early, so every response — 401s and 429s included — carries it.
 		middleware.RequestID(cfg.Transform.RequestID),
 		middleware.RequestLogger(g.logger),
@@ -326,11 +349,11 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		middleware.CORS(cfg.CORS),
 		auth,
 		middleware.RateLimit(cfg.RateLimit, limiters, g.metrics, middleware.WithStoreType(cfg.Storage.Backend)),
-	)
+	)...)
 	// Outermost, so the server span covers the whole request and every
 	// stage below can start its span from it. A no-op when disabled.
 	h = tp.Handler(h, router.RouteLabelFor)
-	return &built{handler: h, router: router, limiters: limiters}, nil
+	return &built{handler: h, router: router, limiters: limiters, access: access}, nil
 }
 
 // built is everything build derives from one config.
@@ -338,6 +361,7 @@ type built struct {
 	handler  http.Handler
 	router   *proxy.Router
 	limiters map[string]ratelimiter.Limiter
+	access   *accesscontrol.Controller
 }
 
 func routesAcceptJWT(routes []config.Route) bool {
