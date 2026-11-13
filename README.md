@@ -1239,6 +1239,51 @@ The lists are compiled once, at load and on each reload, into a sorted table of 
 
 The admin API (its own listener), `/metrics`, and the gateway's own health checks against backends (outgoing requests) don't go through this pipeline, so access control and bans never affect them.
 
+### Logging, metrics, and tracing
+
+Blocked requests are logged without headers (which can carry credentials) and without the query string. The log line has the method, the path (truncated to 100 characters), the client address, the reason, and the status:
+
+```
+access_control: blocked GET "/wp-login.php" from 198.51.100.7: deny_list (status 403)
+access_control: auto-banned 203.0.113.9 until 2026-11-13T21:40:00Z (level 2: 20 offenses within 1m0s (last: auth_failure))
+```
+
+These lines are **rate limited**: up to 10 at once, then one per second. Lines over that are dropped and counted, and the next line that gets through ends with `(N similar lines suppressed)`. A flood of blocked requests therefore can't fill the disk. Blocked requests don't get the usual per-request log line either.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gatekeeper_access_control_blocked_total` | `reason`: `deny_list`, `not_in_allowlist`, `auto_ban`, `manual_ban` | Requests rejected by access control. Every one is counted, logged or not |
+| `gatekeeper_access_control_bans_total` | `source`: `auto`, `manual` | Bans this instance issued |
+| `gatekeeper_access_control_active_bans` | | Addresses banned right now, read from the store at scrape time, so with Redis it's the fleet-wide number |
+
+Blocked requests also show up in `gatekeeper_request_duration_seconds` with their status. With [tracing](#distributed-tracing) on, a blocked request's server span carries `gatekeeper.access_control.block_reason` and has no `auth` or `rate_limit` child spans. The client address is never recorded on spans.
+
+### Access control endpoints
+
+With the [admin API](#admin-api) enabled:
+
+| Method & path | What it does |
+|---|---|
+| `GET /admin/v1/access-control` | The lists in force (global, and each route override merged as requests see it), trusted proxies, auto-ban settings, and every active ban |
+| `POST /admin/v1/bans` | Bans one address: `{"ip": "203.0.113.7", "duration": "1h", "reason": "abuse report"}`. `duration` defaults to `auto_ban.ban_duration` when auto-ban is on, and `1h` otherwise. `never_ban` addresses and trusted proxies get `409` |
+| `DELETE /admin/v1/bans/{ip}` | Lifts a ban, automatic or manual, on every instance sharing the store. `404` if the address isn't banned |
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN"   -d '{"ip": "203.0.113.7", "duration": "30m", "reason": "credential stuffing"}'   http://127.0.0.1:9090/admin/v1/bans
+curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/bans/203.0.113.7
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/access-control
+```
+
+Both actions accept `?dry_run=true`. Like every admin endpoint, they're authenticated, counted in `gatekeeper_admin_requests_total`, and written to the audit log. Bans are per address. Ranges belong in `access_control.deny`. Without access control configured, `GET` reports `"enabled": false`, and `POST` / `DELETE` answer `409`.
+
+### Reloading
+
+`SIGHUP` (or `POST /admin/v1/reload`) recompiles the lists and swaps them in with the rest of the pipeline. A request already in flight finishes on the lists it started with, and the next one uses the new lists. If any entry is invalid, the whole reload is rejected and the previous lists stay in force. Bans are kept in the store, not the config, so a reload neither lifts nor resets them. Removing the `access_control` section removes the middleware entirely. Each load logs a summary:
+
+```
+access_control: mode=denylist allow=0 deny=3 trusted_proxies=2 route_overrides=[/admin] auto_ban=on (20 offenses in 1m0s -> 10m0s)
+```
+
 ## Setup
 
 Requires Go 1.26+ (see `go.mod`). Redis is optional, only needed if you set `storage.backend: redis`.
