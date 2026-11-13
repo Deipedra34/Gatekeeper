@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
 	"go.opentelemetry.io/otel/trace"
@@ -118,6 +119,7 @@ func RateLimit(cfg config.RateLimitConfig, limiters map[string]ratelimiter.Limit
 				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(result.RetryAfter.Seconds()))))
 				m.RequestsRejected.WithLabelValues(label, tier).Inc()
 				websocket.RecordRejectionFor(r, m, websocket.RejectRateLimit)
+				reportOffense(r, accesscontrol.OffenseRateLimit)
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
 			}

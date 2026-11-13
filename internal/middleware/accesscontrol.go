@@ -27,6 +27,11 @@ import (
 // list in the shared store; a banned one is rejected the same way, with
 // a Retry-After header saying when the ban ends. If the store can't be
 // read the request is let through, as the rate limiter does.
+//
+// With auto-ban on, a request the lists reject counts as a "denied"
+// offense, and the auth and rate limit middleware further down report
+// their rejections too (see reportOffense), so an address that keeps
+// offending gets banned.
 func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (string, bool)) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +42,9 @@ func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (st
 			}
 			policy := c.PolicyFor(route)
 			if reason := policy.Check(addr, known); reason != accesscontrol.ReasonNone {
+				if known {
+					recordOffense(r.Context(), c, addr, accesscontrol.OffenseDenied)
+				}
 				block(w, policy.DenyStatus(), 0)
 				return
 			}
@@ -45,7 +53,7 @@ func AccessControl(c *accesscontrol.Controller, routeFor func(*http.Request) (st
 					block(w, policy.DenyStatus(), time.Until(ban.ExpiresAt))
 					return
 				}
-				r = r.WithContext(context.WithValue(r.Context(), clientAddrKey{}, addr))
+				r = r.WithContext(context.WithValue(r.Context(), accessKey{}, requestAccess{addr: addr, c: c}))
 			}
 			next.ServeHTTP(w, r)
 		})
@@ -61,12 +69,35 @@ func block(w http.ResponseWriter, status int, retryAfter time.Duration) {
 	http.Error(w, "access denied", status)
 }
 
-type clientAddrKey struct{}
+// requestAccess is what the access control middleware attaches to a
+// request it lets through: the resolved client address, and the
+// controller to report offenses to.
+type requestAccess struct {
+	addr netip.Addr
+	c    *accesscontrol.Controller
+}
+
+type accessKey struct{}
 
 // ClientAddrFrom returns the client address the access control
 // middleware resolved for this request. There's none when access
 // control isn't configured.
 func ClientAddrFrom(ctx context.Context) (netip.Addr, bool) {
-	a, ok := ctx.Value(clientAddrKey{}).(netip.Addr)
-	return a, ok
+	ra, ok := ctx.Value(accessKey{}).(requestAccess)
+	return ra.addr, ok
+}
+
+// reportOffense counts an offense (a rate limit or auth rejection) by
+// r's client toward an automatic ban. Without access control on the
+// request it does nothing.
+func reportOffense(r *http.Request, o accesscontrol.Offense) {
+	if ra, ok := r.Context().Value(accessKey{}).(requestAccess); ok {
+		recordOffense(r.Context(), ra.c, ra.addr, o)
+	}
+}
+
+// recordOffense records o for addr. The request is being rejected
+// anyway; if the store fails, the offense just isn't counted.
+func recordOffense(ctx context.Context, c *accesscontrol.Controller, addr netip.Addr, o accesscontrol.Offense) {
+	_, _, _ = c.RecordOffense(ctx, addr, o)
 }

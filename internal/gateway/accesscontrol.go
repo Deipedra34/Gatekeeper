@@ -24,6 +24,16 @@ func buildAccessControl(cfg *config.Config, st store.Store) (*accesscontrol.Cont
 		TrustedProxies: global.TrustedProxies,
 		Store:          st,
 	}
+	if ab := global.AutoBan; cfg.AccessControl != nil && ab.Enabled {
+		s.AutoBan = &accesscontrol.AutoBanSettings{
+			Threshold:   ab.Threshold,
+			Window:      ab.Window.Duration,
+			BanDuration: ab.BanDuration.Duration,
+		}
+		for _, t := range ab.Triggers {
+			s.AutoBan.Triggers = append(s.AutoBan.Triggers, accesscontrol.Offense(t))
+		}
+	}
 	for _, rt := range cfg.Routes {
 		if rt.AccessControl != nil {
 			s.Routes[rt.Label()] = policySettings(config.EffectiveAccessControl(global, rt.AccessControl))

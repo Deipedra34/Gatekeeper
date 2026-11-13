@@ -7,6 +7,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 
+	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/tracing"
@@ -209,6 +210,7 @@ func Auth(cfg config.AuthConfig, modeFor func(*http.Request) string, m *metrics.
 				tracing.Fail(span, "unauthorized")
 				span.End()
 				websocket.RecordRejectionFor(r, m, websocket.RejectAuth)
+				reportOffense(r, accesscontrol.OffenseAuthFailure)
 				out.reject(w)
 				return
 			}
