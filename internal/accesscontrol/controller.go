@@ -31,6 +31,9 @@ type Settings struct {
 	// Store holds bans. It's the store the rate limiter uses, so with
 	// Redis bans are shared by every instance. Nil disables bans.
 	Store store.Store
+	// AutoBan, if set (and Store is too), bans addresses that offend
+	// repeatedly.
+	AutoBan *AutoBanSettings
 }
 
 // Controller is the compiled access control of one config: built when
@@ -41,6 +44,7 @@ type Controller struct {
 	global   *Policy
 	routes   map[string]*Policy
 	bans     *BanList
+	autoBan  *AutoBan
 }
 
 // NewController compiles s. Every list is parsed once, here.
@@ -56,6 +60,9 @@ func NewController(s Settings) (*Controller, error) {
 	c := &Controller{resolver: NewResolver(trusted), global: global, routes: make(map[string]*Policy, len(s.Routes))}
 	if s.Store != nil {
 		c.bans = NewBanList(s.Store)
+		if s.AutoBan != nil {
+			c.autoBan = NewAutoBan(s.Store, c.bans, *s.AutoBan)
+		}
 	}
 	for label, ps := range s.Routes {
 		p, err := newPolicy(ps)
@@ -101,6 +108,12 @@ func (c *Controller) Banned(ctx context.Context, addr netip.Addr) (Ban, bool, er
 		return Ban{}, false, nil
 	}
 	return c.bans.Get(ctx, addr)
+}
+
+// RecordOffense counts an offense by addr toward an automatic ban; see
+// AutoBan.Record. It's a no-op when auto-ban is off.
+func (c *Controller) RecordOffense(ctx context.Context, addr netip.Addr, o Offense) (Ban, bool, error) {
+	return c.autoBan.Record(ctx, addr, o)
 }
 
 // Resolver returns the client address resolver.
