@@ -1169,6 +1169,37 @@ routes:
     target: "http://localhost:9000"
 ```
 
+### Trusted proxies and the client address
+
+Access control has to know the real client address, and that can't come from anything the client controls. By default it's the address of the TCP connection's peer. `X-Forwarded-For` and `X-Real-IP` are **ignored** unless that peer is listed in `trusted_proxies`, so a client can't pick its own address by sending the header itself.
+
+When the gateway runs behind load balancers or a CDN, list them:
+
+```yaml
+access_control:
+  trusted_proxies:
+    - "10.0.0.10"          # the internal load balancers
+    - "10.0.0.11"
+    - "2001:db8:lb::/64"
+  mode: allowlist_only
+  allow: ["192.0.2.0/24"]
+```
+
+For a request from a trusted proxy, the client is the **right-most `X-Forwarded-For` address that isn't itself a trusted proxy**. Each proxy appends the address it received the request from, so walking the list from the right, past the proxies you trust, lands on the first hop nobody you trust vouches for. Anything further left was written by the client and may be forged:
+
+| Peer | `X-Forwarded-For` | Client address |
+|---|---|---|
+| `203.0.113.1` (not trusted) | `10.9.9.9` | `203.0.113.1`. The header is ignored |
+| `10.0.0.10` | `198.51.100.7` | `198.51.100.7` |
+| `10.0.0.10` | `10.9.9.9, 198.51.100.7` | `198.51.100.7`. The client prepended a fake `10.9.9.9`, and it's ignored |
+| `10.0.0.10` | `198.51.100.7, 10.0.0.11` | `198.51.100.7`. Two trusted proxies are skipped |
+| `10.0.0.10` | (none), `X-Real-IP: 198.51.100.7` | `198.51.100.7` |
+| `10.0.0.10` | `198.51.100.7, garbage` | `10.0.0.10`. The walk stops at an entry that isn't an address |
+
+With access control on and `rate_limit.scope: ip`, the rate limiter keys on this same resolved address too, so rotating fake `X-Forwarded-For` values no longer buys a client fresh rate limit buckets. Without access control the rate limiter behaves exactly as before.
+
+`trusted_proxies` is separate from `transform.trust_forwarded_headers`, which controls what's *forwarded to backends* (see [Forwarding headers](#forwarding-headers)). If `trust_forwarded_headers` is on but `trusted_proxies` is empty, Gatekeeper logs at startup that access control is using the peer address. Trusted proxies are never banned, since banning one would block every client behind it.
+
 ### Where it runs in the pipeline
 
 Access control is the first thing that runs on a request, right after the latency metric starts timing. A blocked request costs one address lookup in the compiled lists, plus a ban lookup in the store if it passes them. It never reaches CORS, auth, or the rate limiter, so it **consumes no rate limit tokens**. It also never reaches the cache, the circuit breaker, or a backend, and it gets no per-request log line (see [Logging, metrics, and tracing](#logging-metrics-and-tracing)). The response is `deny_status` with the body `access denied`.
