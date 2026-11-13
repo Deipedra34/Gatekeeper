@@ -74,9 +74,13 @@ func levelKey(a netip.Addr) string   { return keyPrefix + "level:" + a.String() 
 // the threshold, addr is banned and the new ban returned (banned true).
 //
 // Only the request whose increment lands exactly on the threshold
-// issues the ban, so concurrent offenses — on this instance or another —
-// can't ban an address twice. The counter is cleared once the ban is
-// in place.
+// issues the ban. The counter isn't reset by the ban, it just expires
+// with its window, so concurrent offenses — on this instance or another,
+// or ones still in flight when the ban lands — can't ban an address
+// twice: an address is banned at most once per window. And an address
+// that's still banned when it reaches the threshold again (say, by
+// being rejected by the allow/deny lists, which are checked before bans)
+// isn't banned again, so its ban is neither extended nor escalated.
 func (ab *AutoBan) Record(ctx context.Context, addr netip.Addr, o Offense) (ban Ban, banned bool, err error) {
 	if ab == nil || !ab.triggers[o] {
 		return Ban{}, false, nil
@@ -88,6 +92,9 @@ func (ab *AutoBan) Record(ctx context.Context, addr netip.Addr, o Offense) (ban 
 	}
 	if n != int64(ab.s.Threshold) {
 		return Ban{}, false, nil
+	}
+	if _, already, err := ab.bans.Get(ctx, addr); err != nil || already {
+		return Ban{}, false, err
 	}
 
 	level, err := ab.nextLevel(ctx, addr)
@@ -106,7 +113,6 @@ func (ab *AutoBan) Record(ctx context.Context, addr netip.Addr, o Offense) (ban 
 	if err := ab.bans.Add(ctx, ban); err != nil {
 		return Ban{}, false, err
 	}
-	_ = ab.st.Delete(ctx, strikesKey(addr))
 	return ban, true, nil
 }
 

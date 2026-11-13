@@ -188,11 +188,19 @@ func (c *Controller) Ban(ctx context.Context, addr netip.Addr, d time.Duration, 
 	return ban, nil
 }
 
-// Unban lifts addr's ban, whichever way it was issued. found reports
-// whether there was one.
+// Unban lifts addr's ban, whichever way it was issued, and clears its
+// auto-ban offense count so it starts over. found reports whether there
+// was a ban.
 func (c *Controller) Unban(ctx context.Context, addr netip.Addr) (found bool, err error) {
 	if c.bans == nil {
 		return false, ErrBansDisabled
 	}
-	return c.bans.Remove(ctx, addr)
+	found, err = c.bans.Remove(ctx, addr)
+	if err != nil {
+		return false, err
+	}
+	if c.autoBan != nil {
+		_ = c.autoBan.st.Delete(ctx, strikesKey(normalize(addr)))
+	}
+	return found, nil
 }
