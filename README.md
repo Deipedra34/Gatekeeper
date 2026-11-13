@@ -32,6 +32,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Load balancing and health checks.** A route can spread traffic over several backends with round robin, weighted round robin, least connections, random, or sticky IP / header hashing. Active and passive health checks take failing backends out of rotation and bring them back. Circuit breakers are per backend, retries fail over to a different backend, and backends removed by a reload drain gracefully. A single `target` still works exactly as before.
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Authenticated admin API.** Optional, on its own listener (never the proxy port). It shows status, redacted config, routes, backend health, per-client rate limit state, and cache stats. It can reload the config, purge the cache, reset rate limits, drain and re-enable backends, and reset circuit breakers. Bearer tokens are stored as SHA-256 hashes; mTLS, a CIDR allowlist, failed-login lockout, a JSON audit log, tracing, and metrics are all included.
+- **IP access control and auto-ban.** Optional allow and deny lists of IPv4/IPv6 addresses and CIDR ranges, global and per route, checked first so a blocked address costs one lookup and no rate limit tokens. The client address comes from the connection, and `X-Forwarded-For` is believed only from configured trusted proxies. Addresses that keep hitting the rate limiter, failing auth, or getting denied are banned for a while, with escalating bans for repeat offenders, shared across instances through Redis. There are metrics, rate-limited logs, and admin endpoints to list, ban, and unban.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
 ## Installation
@@ -1344,7 +1345,9 @@ startup — changing the listen address, the storage backend, the metrics
 path, or TLS settings still requires a restart. The one exception is the
 TLS certificate itself: `SIGHUP` also reloads the server certificate and
 key (see [Certificate hot reload](#certificate-hot-reload)). The `tracing`
-section is reloaded too (see [Distributed tracing](#distributed-tracing)).
+section is reloaded too (see [Distributed tracing](#distributed-tracing)), and
+so are the `access_control` lists; bans, which live in the store, are kept
+(see [IP access control and auto-ban](#reloading)).
 
 ## Admin API
 
@@ -1452,8 +1455,11 @@ All responses are JSON. Errors always have the same shape:
 | `POST /admin/v1/backends/{id}/drain` | **Destructive.** Takes a backend out of rotation; in-flight requests finish |
 | `POST /admin/v1/backends/{id}/enable` | Puts a drained backend back in rotation |
 | `POST /admin/v1/circuit-breakers/{id}/reset` | Forces a backend's circuit breaker closed |
+| `GET /admin/v1/access-control` | IP allow/deny lists, trusted proxies, auto-ban settings, and active bans |
+| `POST /admin/v1/bans` | **Destructive.** Bans a client address on every instance |
+| `DELETE /admin/v1/bans/{ip}` | Lifts a ban |
 
-`reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, and `circuit-breakers/{id}/reset` accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
+`reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, `circuit-breakers/{id}/reset`, and both ban endpoints accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
 
 **Identifiers:**
 
@@ -1692,7 +1698,7 @@ gatekeeper_tls_certificate_reloads_total{result="success"} 2
 
 The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
-Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
+Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). Access control metrics (`gatekeeper_access_control_*`) are described in [Logging, metrics, and tracing](#logging-metrics-and-tracing). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
 
 **Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
 
@@ -1871,7 +1877,7 @@ The Redis numbers tell a second, independent story: every algorithm gets roughly
 
 ## Architecture Decisions
 
-Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe — live in [`docs/adr/`](docs/adr/).
+Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address — live in [`docs/adr/`](docs/adr/).
 
 ## Configuration reference
 
@@ -1890,6 +1896,8 @@ tracing:     { enabled, exporter: otlp_grpc|otlp_http|stdout, endpoint, insecure
 tls:         { enabled, cert_file, key_file, min_version: "1.2"|"1.3", cipher_suites: [...], client_auth: none|request|require|verify_if_given|require_and_verify, client_ca_file, reload_interval, redirect_http_port, hsts: { enabled, max_age, include_subdomains, preload } }
 transform:   { trust_forwarded_headers, request_id: { enabled, header }, security_headers: { enabled, content_type_options, frame_options, referrer_policy } }
              # per route: transform: { request: { strip_prefix, rewrite: { pattern, replacement }, add_headers, set_headers, remove_headers, add_query_params, remove_query_params }, response: { add_headers, set_headers, remove_headers, security_headers } }
+access_control: { mode: off|denylist|allowlist_only, allow: [...], deny: [...], deny_status, trusted_proxies: [...], auto_ban: { enabled, threshold, window, ban_duration, triggers: [rate_limit|auth_failure|denied], never_ban: [...], escalation: { enabled, multiplier, max_duration, reset_after } } }
+             # per route: access_control: { mode, allow, deny, deny_status }
 admin:       { enabled, listen, tokens: [ { id, sha256 } ], mtls: { enabled, allowed_cns: [...] }, allowed_cidrs: [...], tls: { ...same as tls... }, auth_failures: { max_failures, window }, read_timeout, write_timeout, idle_timeout, max_body_bytes, audit_log }
 ```
 
