@@ -23,6 +23,7 @@ func buildAccessControl(cfg *config.Config, st store.Store) (*accesscontrol.Cont
 		Routes:         map[string]accesscontrol.PolicySettings{},
 		TrustedProxies: global.TrustedProxies,
 		Store:          st,
+		NeverBan:       global.AutoBan.NeverBan,
 	}
 	if ab := global.AutoBan; cfg.AccessControl != nil && ab.Enabled {
 		s.AutoBan = &accesscontrol.AutoBanSettings{

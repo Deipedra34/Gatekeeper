@@ -34,6 +34,10 @@ type Settings struct {
 	// AutoBan, if set (and Store is too), bans addresses that offend
 	// repeatedly.
 	AutoBan *AutoBanSettings
+	// NeverBan lists addresses and ranges that are never banned. Trusted
+	// proxies are never banned either: banning one would block every
+	// client behind it.
+	NeverBan []string
 }
 
 // Controller is the compiled access control of one config: built when
@@ -45,6 +49,7 @@ type Controller struct {
 	routes   map[string]*Policy
 	bans     *BanList
 	autoBan  *AutoBan
+	neverBan *PrefixSet
 }
 
 // NewController compiles s. Every list is parsed once, here.
@@ -57,7 +62,14 @@ func NewController(s Settings) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &Controller{resolver: NewResolver(trusted), global: global, routes: make(map[string]*Policy, len(s.Routes))}
+	neverBan, err := NewPrefixSet(s.NeverBan)
+	if err != nil {
+		return nil, fmt.Errorf("accesscontrol: never_ban: %w", err)
+	}
+	c := &Controller{
+		resolver: NewResolver(trusted), global: global, neverBan: neverBan,
+		routes: make(map[string]*Policy, len(s.Routes)),
+	}
 	if s.Store != nil {
 		c.bans = NewBanList(s.Store)
 		if s.AutoBan != nil {
@@ -102,17 +114,29 @@ func (c *Controller) ClientAddr(req *http.Request) (netip.Addr, bool) {
 // Bans returns the ban list, or nil when bans are disabled.
 func (c *Controller) Bans() *BanList { return c.bans }
 
-// Banned returns addr's current ban, if it has one.
+// Protected reports whether addr may never be banned: it's on the
+// never_ban list or is a trusted proxy.
+func (c *Controller) Protected(addr netip.Addr) bool {
+	return c.neverBan.Contains(addr) || c.resolver.Trusted(addr)
+}
+
+// Banned returns addr's current ban, if it has one. A protected address
+// is never banned, even if a ban was stored before it became protected
+// (by a reload adding it to never_ban).
 func (c *Controller) Banned(ctx context.Context, addr netip.Addr) (Ban, bool, error) {
-	if c.bans == nil {
+	if c.bans == nil || c.Protected(addr) {
 		return Ban{}, false, nil
 	}
 	return c.bans.Get(ctx, addr)
 }
 
 // RecordOffense counts an offense by addr toward an automatic ban; see
-// AutoBan.Record. It's a no-op when auto-ban is off.
+// AutoBan.Record. It's a no-op when auto-ban is off and for a protected
+// address.
 func (c *Controller) RecordOffense(ctx context.Context, addr netip.Addr, o Offense) (Ban, bool, error) {
+	if c.autoBan == nil || c.Protected(addr) {
+		return Ban{}, false, nil
+	}
 	return c.autoBan.Record(ctx, addr, o)
 }
 
