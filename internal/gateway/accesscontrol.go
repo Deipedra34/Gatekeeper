@@ -29,6 +29,12 @@ func buildAccessControl(cfg *config.Config, st store.Store) (*accesscontrol.Cont
 			Threshold:   ab.Threshold,
 			Window:      ab.Window.Duration,
 			BanDuration: ab.BanDuration.Duration,
+			Escalation: accesscontrol.EscalationSettings{
+				Enabled:     ab.Escalation.Enabled,
+				Multiplier:  ab.Escalation.Multiplier,
+				MaxDuration: ab.Escalation.MaxDuration.Duration,
+				ResetAfter:  ab.Escalation.ResetAfter.Duration,
+			},
 		}
 		for _, t := range ab.Triggers {
 			s.AutoBan.Triggers = append(s.AutoBan.Triggers, accesscontrol.Offense(t))
