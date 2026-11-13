@@ -238,6 +238,14 @@ cors:
 #       security_headers: {enabled: true}              # overrides transform.security_headers
 # Values may use ${client_ip}, ${request_id}, ${client_id}, ${client_tier},
 # ${route}, and ${trace_id}; anything else fails config validation.
+#
+# A route can override the global access_control allow/deny settings
+# (see the access_control section at the end). Fields it sets replace the
+# global ones; fields it leaves out are inherited:
+#   access_control:
+#     mode: allowlist_only           # off, denylist, or allowlist_only
+#     allow: ["10.0.0.0/8", "2001:db8:ops::/48"]
+#     deny_status: 404               # hide the route from everyone else
 routes:
   - path_prefix: "/ws"
     target: "http://localhost:9000"
@@ -394,3 +402,42 @@ transform:
     # content_type_options: nosniff
     # frame_options: DENY             # DENY or SAMEORIGIN
     # referrer_policy: no-referrer
+
+# IP access control: allow and deny lists, the proxies trusted to report
+# the client address, and automatic temporary bans. Left out (as here),
+# none of it runs and requests are handled exactly as before. Reloaded on
+# SIGHUP; an invalid entry rejects the reload and the old lists stay.
+# See README.md's "IP access control and auto-ban" section.
+#
+# access_control:
+#   # off (default): no list restriction. denylist: reject addresses on
+#   # deny. allowlist_only: reject everything not on allow. Deny always
+#   # wins over allow.
+#   mode: denylist
+#   # Single IPv4/IPv6 addresses and CIDR ranges.
+#   deny: ["198.51.100.0/24", "203.0.113.66", "2001:db8:bad::/48"]
+#   # allow: ["10.0.0.0/8"]
+#   # Status for rejected requests (default 403).
+#   deny_status: 403
+#   # Proxies/load balancers in front of the gateway. X-Forwarded-For and
+#   # X-Real-IP are believed only when the connection comes from one of
+#   # these; the client is the right-most X-Forwarded-For address that
+#   # isn't a trusted proxy. Empty (default): always the peer address.
+#   trusted_proxies: ["10.0.0.10", "10.0.0.11"]
+#   auto_ban:
+#     enabled: false
+#     # Ban an address after `threshold` offenses within `window`.
+#     threshold: 20
+#     window: 1m
+#     ban_duration: 10m
+#     # What counts: rate_limit (429), auth_failure (401), denied (lists).
+#     triggers: [rate_limit, auth_failure, denied]
+#     # Never banned, automatically or by the admin API. Trusted proxies
+#     # are never banned either.
+#     never_ban: ["127.0.0.1", "::1"]
+#     # Repeat offenders: ban_duration x multiplier^(n-1), capped.
+#     escalation:
+#       enabled: false
+#       multiplier: 2
+#       max_duration: 24h
+#       reset_after: 24h        # since the last ban
