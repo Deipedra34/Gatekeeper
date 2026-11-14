@@ -70,12 +70,15 @@ func TestAutoBan_OnlyConfiguredTriggersCount(t *testing.T) {
 }
 
 func TestAutoBan_OffensesOutsideTheWindowDontCount(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
-	c := autoBanController(t, AutoBanSettings{Threshold: 2, Window: 100 * time.Millisecond, BanDuration: time.Minute})
+	// The window is long enough that the two offenses after the sleep
+	// land in the same one even on a slow runner (-race).
+	c := autoBanController(t, AutoBanSettings{Threshold: 2, Window: time.Second, BanDuration: time.Minute})
 	client := addr("203.0.113.7")
 	_, banned, _ := c.RecordOffense(ctx, client, OffenseRateLimit)
 	require.False(t, banned)
-	time.Sleep(250 * time.Millisecond) // the window ends
+	time.Sleep(1500 * time.Millisecond) // the window ends
 	_, banned, _ = c.RecordOffense(ctx, client, OffenseRateLimit)
 	assert.False(t, banned, "the first offense expired with its window")
 	_, banned, _ = c.RecordOffense(ctx, client, OffenseRateLimit)
@@ -128,10 +131,13 @@ func TestAutoBan_Escalation(t *testing.T) {
 }
 
 func TestAutoBan_EscalationResetsAfterAQuietPeriod(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
+	// reset_after is long enough that the first two bans escalate even
+	// on a slow runner (-race).
 	c := autoBanController(t, AutoBanSettings{
 		Threshold: 1, Window: time.Minute, BanDuration: time.Minute,
-		Escalation: EscalationSettings{Enabled: true, Multiplier: 2, MaxDuration: time.Hour, ResetAfter: 150 * time.Millisecond},
+		Escalation: EscalationSettings{Enabled: true, Multiplier: 2, MaxDuration: time.Hour, ResetAfter: time.Second},
 	})
 	client := addr("203.0.113.7")
 	ban, _, _ := c.RecordOffense(ctx, client, OffenseRateLimit)
@@ -141,7 +147,7 @@ func TestAutoBan_EscalationResetsAfterAQuietPeriod(t *testing.T) {
 	require.Equal(t, 2, ban.Level)
 	_, _ = c.Unban(ctx, client)
 
-	time.Sleep(350 * time.Millisecond) // longer than reset_after since the last ban
+	time.Sleep(1500 * time.Millisecond) // longer than reset_after since the last ban
 	ban, _, err := c.RecordOffense(ctx, client, OffenseRateLimit)
 	require.NoError(t, err)
 	assert.Equal(t, 1, ban.Level)
