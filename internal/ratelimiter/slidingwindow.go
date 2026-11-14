@@ -72,6 +72,9 @@ func (w *slidingWindowLog) Allow(ctx context.Context, key string) (Result, error
 			return Result{}, err
 		}
 		if !ok {
+			if err := casBackoff(ctx, attempt); err != nil {
+				return Result{}, err
+			}
 			continue
 		}
 

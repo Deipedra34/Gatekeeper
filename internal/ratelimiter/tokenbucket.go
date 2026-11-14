@@ -41,8 +41,6 @@ type bucketState struct {
 	LastRefill int64   `json:"last_refill_unix_nano"`
 }
 
-const maxCASRetries = 20
-
 // Allow implements Limiter with an optimistic compare-and-swap loop: load
 // the current state, work out how much refill is owed since it was last
 // written, decide allow or deny, then try writing the new state back —
@@ -90,7 +88,12 @@ func (b *tokenBucket) Allow(ctx context.Context, key string) (Result, error) {
 			return Result{}, err
 		}
 		if !ok {
-			continue // another goroutine/instance updated the bucket first; retry
+			// Another goroutine/instance updated the bucket first; back
+			// off briefly, then retry.
+			if err := casBackoff(ctx, attempt); err != nil {
+				return Result{}, err
+			}
+			continue
 		}
 
 		result := Result{

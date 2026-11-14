@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"gatekeeper/internal/ratelimiter/store"
@@ -15,10 +16,39 @@ import (
 
 // ErrTooMuchContention comes back when a CAS-based algorithm (Token
 // Bucket, Sliding Window Log) can't land an update after maxCASRetries
-// tries. This shouldn't happen under normal load — it's a safety valve
+// tries, backing off between them. This shouldn't happen under normal load — it's a safety valve
 // against pathological contention, not something meant to trigger in
 // practice.
 var ErrTooMuchContention = errors.New("ratelimiter: too much contention on client state, try again")
+
+// maxCASRetries bounds how many times a CAS-based algorithm reloads and
+// retries a client's state before giving up with ErrTooMuchContention.
+const maxCASRetries = 32
+
+// casBackoff waits before the next CAS attempt after attempt failed. The
+// wait grows with each failure (50µs, 100µs, ... capped at 5ms) and is
+// randomized, so goroutines (or instances) that collided on the same key
+// spread out instead of colliding again on the very next try. It returns
+// early with the context's error if ctx is done.
+func casBackoff(ctx context.Context, attempt int) error {
+	const (
+		base    = 50 * time.Microsecond
+		ceiling = 5 * time.Millisecond
+	)
+	d := ceiling
+	if attempt < 7 {
+		d = min(base<<attempt, ceiling)
+	}
+	d = d/2 + rand.N(d/2+1) // jitter in [d/2, d]
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
 
 // Result describes the outcome of a single Allow check.
 type Result struct {
