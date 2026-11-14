@@ -76,7 +76,9 @@ func TestTokenBucket_ConcurrentRequestsNeverExceedBurst(t *testing.T) {
 	st := store.NewMemoryStore()
 	defer st.Close()
 	const burst = 10
-	b := newTokenBucket(st, Rule{Rate: 1, Burst: burst})
+	// A refill rate low enough that no token comes back while the test
+	// runs, however slow the machine (-race), so exactly burst pass.
+	b := newTokenBucket(st, Rule{Rate: 0.001, Burst: burst})
 	ctx := context.Background()
 
 	const goroutines = 100
