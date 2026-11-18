@@ -71,9 +71,13 @@ type Route struct {
 
 	onEvent func(Event)
 
-	mu   sync.Mutex
-	base Weights  // the weights, before any running rollout
-	ro   *rollout // nil without a rollout
+	configured Weights // the weights in the config
+
+	mu     sync.Mutex
+	base   Weights   // the weights, before any running rollout
+	ro     *rollout  // nil without a rollout
+	manual bool      // an operator or a rollback set base
+	last   *Rollback // the most recent rollback
 }
 
 // Event reports a change to a route's weights, for logs and metrics.
@@ -138,7 +142,7 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 	if r.baseline < 0 {
 		r.baseline = 0
 	}
-	r.base = w
+	r.base, r.configured = w, w.Clone()
 	if ro := cfg.Rollout; ro != nil {
 		i, ok := r.Index(ro.Variant)
 		if !ok {
@@ -281,20 +285,6 @@ func (r *Route) Pause() error {
 		r.emit(Event{Kind: EventPause, Variant: variant}, w)
 	}
 	return err
-}
-
-// Resume continues a paused rollout from where it stopped.
-func (r *Route) Resume() error {
-	r.mu.Lock()
-	if r.ro == nil || r.ro.state != RolloutPaused {
-		r.mu.Unlock()
-		return ErrNoRollout
-	}
-	r.ro.unpause(r.now())
-	w, variant := r.currentLocked(), r.rolloutVariantLocked()
-	r.mu.Unlock()
-	r.emit(Event{Kind: EventResume, Variant: variant}, w)
-	return nil
 }
 
 // Rollout returns the route's rollout status, or nil without one.

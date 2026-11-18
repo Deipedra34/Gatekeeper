@@ -129,7 +129,7 @@ func TestRollout_PauseAndResume(t *testing.T) {
 
 	require.NoError(t, r.Resume())
 	assert.Equal(t, RolloutRunning, r.Rollout().State)
-	assert.ErrorIs(t, r.Resume(), ErrNoRollout, "not paused")
+	assert.ErrorIs(t, r.Resume(), ErrNothingToResume, "not paused")
 	assert.Equal(t, clock.Now().Add(6*time.Minute), *r.Rollout().NextStepAt, "the 4 minutes already spent still count")
 	clock.Advance(6 * time.Minute)
 	assert.Equal(t, Weights{50, 50}, r.Weights())
@@ -154,7 +154,7 @@ func TestRollout_WithoutOne(t *testing.T) {
 	r := newRoute(t, twoWay())
 	assert.Nil(t, r.Rollout())
 	assert.ErrorIs(t, r.Pause(), ErrNoRollout)
-	assert.ErrorIs(t, r.Resume(), ErrNoRollout)
+	assert.ErrorIs(t, r.Resume(), ErrNothingToResume)
 }
 
 func TestRollout_ConcurrentReadersSeeOneStepEvent(t *testing.T) {
