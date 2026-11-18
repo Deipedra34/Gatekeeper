@@ -69,7 +69,10 @@ type Route struct {
 	salt     string
 	now      func() time.Time
 	signer   *CookieSigner
-	override overrideAllow
+	// randomSecret is set when signer uses the secret generated at
+	// startup.
+	randomSecret bool
+	override     overrideAllow
 
 	onEvent func(Event)
 
@@ -183,7 +186,7 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 			return nil, err
 		}
 		if secret == nil {
-			r.signer = processSigner()
+			r.signer, r.randomSecret = processSigner(), true
 		} else {
 			r.signer = NewCookieSigner(secret)
 		}
@@ -207,9 +210,7 @@ func processSigner() *CookieSigner {
 // RandomCookieSecret reports whether the route signs sticky cookies with
 // a secret generated at startup (so they don't survive a restart or
 // reach other instances).
-func (r *Route) RandomCookieSecret() bool {
-	return r.signer != nil && r.signer == processSignerVal
-}
+func (r *Route) RandomCookieSecret() bool { return r.randomSecret }
 
 // Label returns the route's label.
 func (r *Route) Label() string { return r.label }
