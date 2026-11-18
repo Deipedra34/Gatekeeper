@@ -33,6 +33,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Dynamic config reload.** `SIGHUP` re-reads the config file and swaps routes, rate-limit rules, tiers, and algorithm into the running gateway atomically — no restart, no dropped requests. An invalid config is logged and ignored, leaving the old one in place.
 - **Authenticated admin API.** Optional, on its own listener (never the proxy port). It shows status, redacted config, routes, backend health, per-client rate limit state, and cache stats. It can reload the config, purge the cache, reset rate limits, drain and re-enable backends, and reset circuit breakers. Bearer tokens are stored as SHA-256 hashes; mTLS, a CIDR allowlist, failed-login lockout, a JSON audit log, tracing, and metrics are all included.
 - **IP access control and auto-ban.** Optional allow and deny lists of IPv4/IPv6 addresses and CIDR ranges, global and per route, checked first so a blocked address costs one lookup and no rate limit tokens. The client address comes from the connection, and `X-Forwarded-For` is believed only from configured trusted proxies. Addresses that keep hitting the rate limiter, failing auth, or getting denied are banned for a while, with escalating bans for repeat offenders, shared across instances through Redis. There are metrics, rate-limited logs, and admin endpoints to list, ban, and unban.
+- **Traffic splitting for canary and A/B releases.** Optional per-route variants, each with its own load-balanced backend group, split by weight. Clients stay on their variant through a stable hash of their IP, API key, JWT subject, or certificate, or a signed cookie. Allowlisted testers can force a variant with a header, match rules pin requests by header, cookie, or path, and a rollout raises a canary's weight in steps. Guardrails roll a variant back automatically when its 5xx rate or p95 latency gets worse than the baseline's, with a minimum sample and a cooldown. Per-variant metrics, log fields, span attributes, Grafana panels, and admin endpoints to set weights, pause, resume, promote, and roll back.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
 ## Installation
@@ -156,6 +157,7 @@ internal/cache/        the response cache: key derivation, Cache-Control handlin
 internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around each route's backend calls
 internal/server/       the listeners: plain HTTP or HTTPS (mTLS, certificate hot reload, HSTS), plus the HTTP→HTTPS redirect
 internal/lb/           load balancing: backend pools, strategies, consistent hashing, active/passive health checks, draining
+internal/split/        traffic splitting: stable hashing, sticky assignment, overrides and rules, rollouts, auto-rollback guardrails
 internal/admin/        the admin API: its own listener, token/mTLS auth, audit log, and the status/config/backends/cache/ratelimit endpoints
 internal/tracing/      OpenTelemetry setup (exporters, sampling, OTEL_* overrides), the server span, and span/propagation helpers
 internal/certgen/      throwaway CA / server / client certificate generation for tests and scripts/gencerts
@@ -1563,7 +1565,10 @@ TLS certificate itself: `SIGHUP` also reloads the server certificate and
 key (see [Certificate hot reload](#certificate-hot-reload)). The `tracing`
 section is reloaded too (see [Distributed tracing](#distributed-tracing)), and
 so are the `access_control` lists; bans, which live in the store, are kept
-(see [IP access control and auto-ban](#reloading)).
+(see [IP access control and auto-ban](#reloading)). Traffic splits are
+rebuilt as well, keeping sticky clients in place and, when a route's weights,
+rollout, and guardrails are unchanged, its live state (see
+[Reloading and multiple instances](#reloading-and-multiple-instances)).
 
 ## Admin API
 
@@ -1674,12 +1679,15 @@ All responses are JSON. Errors always have the same shape:
 | `GET /admin/v1/access-control` | IP allow/deny lists, trusted proxies, auto-ban settings, and active bans |
 | `POST /admin/v1/bans` | **Destructive.** Bans a client address on every instance |
 | `DELETE /admin/v1/bans/{ip}` | Lifts a ban |
+| `GET /admin/v1/routes/{route}/split` | A split route's current weights, rollout, cooldowns, and last rollback |
+| `POST /admin/v1/routes/{route}/split` | **Destructive.** Sets weights, pauses or resumes the rollout, promotes a variant, or rolls one back. See [Traffic split endpoints](#traffic-split-endpoints) |
 
-`reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, `circuit-breakers/{id}/reset`, and both ban endpoints accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
+`reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, `circuit-breakers/{id}/reset`, both ban endpoints, and `POST routes/{route}/split` accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
 
 **Identifiers:**
 
 - **`{id}`** is the 12-character backend ID shown by `GET /admin/v1/backends` and `GET /admin/v1/routes`. It stays the same across reloads and restarts as long as the route and target don't change. Circuit breakers are per backend, so they use the same ID.
+- **`{route}`** is the 12-character route ID shown by `GET /admin/v1/routes` (stable as long as the route's path prefix or host doesn't change), or the path prefix with its slashes escaped (`%2Fapi`) or without the leading slash (`api`).
 - **`{client}`** names a client the way `/metrics` does:
   - An API key is named by its fingerprint, `key:<12 hex>`. Get it with `printf %s "$KEY" | sha256sum | cut -c1-12`. A raw key is refused, so keys never end up in URLs or logs.
   - JWT and certificate clients are `jwt:<id>` and `mtls:<identity>`.
@@ -1759,7 +1767,7 @@ Two counters are added to the existing `/metrics` endpoint:
 `/admin/v1/config` returns the config with the same keys as the YAML file. Before it's returned:
 
 - **API keys** are replaced by their `key:` fingerprints. That covers `auth.api_keys`, and the keys of `rate_limit.clients` when the scope is `api_key`.
-- **Other secrets** become `[REDACTED]`: `auth.jwt.secret`, `storage.redis.password`, and every admin token hash.
+- **Other secrets** become `[REDACTED]`: `auth.jwt.secret`, `storage.redis.password`, every admin token hash, and traffic split cookie secrets. The API keys allowed to override a traffic split are shown as fingerprints, and match rule values on credential-like headers or cookies are redacted.
 - **Credentials in URLs** (`user:password@` in backend targets or the tracing endpoint) are removed.
 - **Transform credentials:** header and query values in route `transform` sections whose names look like credentials (`Authorization`, `X-Api-Token`, ...) become `[REDACTED]`.
 - **Safety net:** any other value that contains one of those secrets is redacted too.
@@ -1914,7 +1922,7 @@ gatekeeper_tls_certificate_reloads_total{result="success"} 2
 
 The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
-Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). Access control metrics (`gatekeeper_access_control_*`) are described in [Logging, metrics, and tracing](#logging-metrics-and-tracing). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
+Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). Access control metrics (`gatekeeper_access_control_*`) are described in [Logging, metrics, and tracing](#logging-metrics-and-tracing). Traffic split metrics (`gatekeeper_variant_*`) are described in [Logs, metrics, and tracing](#logs-metrics-and-tracing). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
 
 **Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
 
