@@ -28,6 +28,7 @@ import (
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/lb"
 	"gatekeeper/internal/metrics"
+	"gatekeeper/internal/split"
 	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/transform"
 	"gatekeeper/internal/websocket"
@@ -67,6 +68,12 @@ type route struct {
 	handshakeTimeout time.Duration
 
 	ws wsSettings
+
+	// split and variants are set on a split route: split chooses each
+	// request's variant, and pool, proxy, and cacheTarget above are
+	// replaced by that variant's (see selectVariant). Nil otherwise.
+	split    *split.Route
+	variants []variant
 }
 
 // Router dispatches requests to the backend whose route matches, based
@@ -81,6 +88,9 @@ type Router struct {
 	prev     *Router
 
 	transformCfg config.TransformConfig
+
+	splits       *split.Registry
+	apiKeyHeader string
 }
 
 // Option customises a Router built by NewRouter.
@@ -138,6 +148,12 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 	if r.hub == nil {
 		r.hub = websocket.NewHub(m)
 	}
+	if r.splits == nil {
+		r.splits = split.NewRegistry()
+	}
+	if r.apiKeyHeader == "" {
+		r.apiKeyHeader = "X-API-Key"
+	}
 	if r.registry == nil {
 		r.registry = lb.NewRegistry()
 		if m != nil {
@@ -152,7 +168,22 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 
 	for _, rt := range routes {
 		label := routeLabel(rt)
-		pool, cacheTarget, err := r.buildPool(rt, label, m)
+		var (
+			pool        *lb.Pool
+			cacheTarget string
+			sr          *split.Route
+			variants    []variant
+			err         error
+		)
+		if rt.TrafficSplit != nil {
+			sr, variants, err = r.buildVariants(rt, label, proxyCfg, m)
+			if err == nil {
+				b := variants[sr.Baseline()]
+				pool, cacheTarget = b.pool, b.cacheTarget
+			}
+		} else {
+			pool, cacheTarget, err = r.buildPool(rt, label, m)
+		}
 		if err != nil {
 			r.backends.Discard()
 			return nil, err
@@ -181,6 +212,8 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			respTransform:    respT,
 			handshakeTimeout: proxyCfg.Timeout.Duration,
 			ws:               newWSSettings(rt),
+			split:            sr,
+			variants:         variants,
 		})
 	}
 	if r.prev == nil {
@@ -375,6 +408,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if rt == nil {
 		http.Error(w, "no backend route configured for this request", http.StatusNotFound)
 		return
+	}
+
+	if rt.split != nil {
+		var done func()
+		rt, w, done = r.selectVariant(rt, w, req)
+		defer done()
 	}
 
 	w, req, vars := r.prepare(rt, w, req)
