@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/ratelimiter/store"
 	"gatekeeper/internal/split"
 	"gatekeeper/internal/websocket/wstest"
@@ -172,4 +174,23 @@ func TestSplit_FailingCanaryIsRolledBackByItsTraffic(t *testing.T) {
 		assert.Equal(t, "stable", from(router, fmt.Sprintf("10.4.0.%d", i), "/api", nil).Body.String())
 	}
 	assert.Equal(t, before, canary.hits.Load())
+}
+
+func TestSplit_RecordsPerVariantMetrics(t *testing.T) {
+	stable, canary := newVariantBackend(t, "stable"), newVariantBackend(t, "canary")
+	m := metrics.New()
+	router, err := NewRouter([]config.Route{splitRoute(stable, canary, 50)}, noRetryProxyConfig(), m, nil)
+	require.NoError(t, err)
+	t.Cleanup(router.Close)
+
+	canary.fail.Store(true)
+	for i := range 200 {
+		from(router, fmt.Sprintf("10.5.0.%d", i), "/api", nil)
+	}
+	s, c := testutil.ToFloat64(m.VariantRequests.WithLabelValues("/api", "stable")), testutil.ToFloat64(m.VariantRequests.WithLabelValues("/api", "canary"))
+	assert.Equal(t, 200.0, s+c)
+	assert.Equal(t, float64(stable.hits.Load()), s)
+	assert.Equal(t, c, testutil.ToFloat64(m.VariantErrors.WithLabelValues("/api", "canary")), "every canary request failed")
+	assert.Zero(t, testutil.ToFloat64(m.VariantErrors.WithLabelValues("/api", "stable")))
+	assert.Equal(t, 2, testutil.CollectAndCount(m.VariantDuration, "gatekeeper_variant_request_duration_seconds"))
 }

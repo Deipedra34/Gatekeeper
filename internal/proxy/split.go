@@ -141,7 +141,9 @@ func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Reque
 		if rec.hijacked {
 			return // a WebSocket: its handshake isn't a request to judge
 		}
-		rt.split.Record(d.Index, time.Since(start), rec.status)
+		elapsed := time.Since(start)
+		rt.split.Record(d.Index, elapsed, rec.status)
+		r.recordVariant(rt.label, v.name, elapsed, rec.status)
 	}
 	return &vrt, rec, req, done
 }
@@ -181,3 +183,15 @@ func (rec *variantRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // Unwrap lets http.ResponseController reach the underlying writer.
 func (rec *variantRecorder) Unwrap() http.ResponseWriter { return rec.ResponseWriter }
+
+// recordVariant counts a finished request in the per-variant metrics.
+func (r *Router) recordVariant(route, variant string, elapsed time.Duration, status int) {
+	if r.metrics == nil {
+		return
+	}
+	r.metrics.VariantRequests.WithLabelValues(route, variant).Inc()
+	if status >= 500 {
+		r.metrics.VariantErrors.WithLabelValues(route, variant).Inc()
+	}
+	r.metrics.VariantDuration.WithLabelValues(route, variant).Observe(elapsed.Seconds())
+}
