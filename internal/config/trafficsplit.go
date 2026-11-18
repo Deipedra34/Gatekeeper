@@ -1,11 +1,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"strings"
 	"time"
+
+	"gatekeeper/internal/accesscontrol"
 )
 
 // TrafficSplitConfig splits a route's traffic between named variants
@@ -262,7 +265,7 @@ func (r Route) validateSplitBackends() error {
 
 // validateTrafficSplit checks everything about a split route except its
 // backend groups (see validateSplitBackends).
-func (r Route) validateTrafficSplit() error {
+func (r Route) validateTrafficSplit(tiers map[string]TierLimit) error {
 	ts := r.TrafficSplit
 	if ts == nil {
 		return nil
@@ -270,7 +273,13 @@ func (r Route) validateTrafficSplit() error {
 	if err := ts.validateWeights(); err != nil {
 		return err
 	}
-	return ts.validateSticky()
+	if err := ts.validateSticky(); err != nil {
+		return err
+	}
+	if err := ts.validateOverride(tiers); err != nil {
+		return err
+	}
+	return ts.validateRules()
 }
 
 // validateWeights checks that every weight is a percentage and that they
@@ -409,4 +418,63 @@ func checkCookieSecret(s []byte) ([]byte, error) {
 		return nil, fmt.Errorf("traffic_split.sticky.cookie: the signing secret must be at least 16 bytes")
 	}
 	return s, nil
+}
+
+// validateOverride checks the override header settings. An enabled
+// override must say who may use it: an empty allowlist would let any
+// client pick the canary, so that has to be asked for with anyone: true.
+func (ts *TrafficSplitConfig) validateOverride(tiers map[string]TierLimit) error {
+	o := ts.Override
+	if !validHeaderName(o.Header) {
+		return fmt.Errorf("traffic_split.override.header %q is not a valid header name", o.Header)
+	}
+	if !o.Enabled {
+		return nil
+	}
+	a := o.Allow
+	if !a.Anyone && len(a.Tiers) == 0 && len(a.APIKeys) == 0 && len(a.CIDRs) == 0 {
+		return fmt.Errorf("traffic_split.override.allow: list the tiers, api_keys, or cidrs that may pick a variant (or set anyone: true, for routes the public can't reach)")
+	}
+	for j, t := range a.Tiers {
+		if _, ok := tiers[t]; !ok {
+			return fmt.Errorf("traffic_split.override.allow.tiers[%d]: no rate_limit tier is called %q", j, t)
+		}
+	}
+	for j, k := range a.APIKeys {
+		if k == "" {
+			return fmt.Errorf("traffic_split.override.allow.api_keys[%d] must not be empty", j)
+		}
+	}
+	if _, err := accesscontrol.NewPrefixSet(a.CIDRs); err != nil {
+		var ee *accesscontrol.EntryError
+		if errors.As(err, &ee) {
+			return fmt.Errorf("traffic_split.override.allow.cidrs[%d]: %w", ee.Index, ee.Err)
+		}
+		return fmt.Errorf("traffic_split.override.allow.cidrs: %w", err)
+	}
+	return nil
+}
+
+// validateRules checks the match rules.
+func (ts *TrafficSplitConfig) validateRules() error {
+	for j, rule := range ts.Rules {
+		where := fmt.Sprintf("traffic_split.rules[%d]", j)
+		if ts.variantIndex(rule.Variant) < 0 {
+			return fmt.Errorf("%s: no variant is called %q", where, rule.Variant)
+		}
+		m := rule.Match
+		if m.Header == nil && m.Cookie == nil && m.PathPrefix == "" {
+			return fmt.Errorf("%s: match needs a header, cookie, or path_prefix", where)
+		}
+		if m.Header != nil && !validHeaderName(m.Header.Name) {
+			return fmt.Errorf("%s: match.header.name %q is not a valid header name", where, m.Header.Name)
+		}
+		if m.Cookie != nil && !validHeaderName(m.Cookie.Name) {
+			return fmt.Errorf("%s: match.cookie.name %q is not a valid cookie name", where, m.Cookie.Name)
+		}
+		if m.PathPrefix != "" && !strings.HasPrefix(m.PathPrefix, "/") {
+			return fmt.Errorf("%s: match.path_prefix must start with /", where)
+		}
+	}
+	return nil
 }

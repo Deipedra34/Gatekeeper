@@ -603,7 +603,7 @@ func (c *Config) validate() error {
 		if err := r.validateBackends(); err != nil {
 			return fmt.Errorf("routes[%d]: %w", i, err)
 		}
-		if err := r.validateTrafficSplit(); err != nil {
+		if err := r.validateTrafficSplit(c.RateLimit.Tiers); err != nil {
 			return fmt.Errorf("routes[%d]: %w", i, err)
 		}
 		if r.Cache.TTL.Duration < 0 {
