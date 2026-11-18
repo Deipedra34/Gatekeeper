@@ -93,6 +93,11 @@ func (h *splitHarness) get(path, remote string, headers ...string) *httptest.Res
 // backends at the given weights, plus extra settings under traffic_split
 // and extra top-level config.
 func splitYAML(stable, canary *splitBackend, stableWeight, canaryWeight, burst int, splitExtra, extra string) string {
+	return splitYAMLFor(stable.srv.URL, canary.srv.URL, stableWeight, canaryWeight, burst, splitExtra, extra)
+}
+
+// splitYAMLFor is splitYAML with backend URLs.
+func splitYAMLFor(stableURL, canaryURL string, stableWeight, canaryWeight, burst int, splitExtra, extra string) string {
 	return fmt.Sprintf(`
 rate_limit:
   scope: api_key
@@ -112,7 +117,7 @@ routes:
         - {name: stable, weight: %d, target: %q}
         - {name: canary, weight: %d, target: %q}
 %s
-%s`, burst, stableWeight, stable.srv.URL, canaryWeight, canary.srv.URL, splitExtra, extra)
+%s`, burst, stableWeight, stableURL, canaryWeight, canaryURL, splitExtra, extra)
 }
 
 func TestGatewaySplit_AuthRunsBeforeTheSplit(t *testing.T) {
