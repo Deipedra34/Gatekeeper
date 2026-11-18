@@ -7,11 +7,14 @@ import (
 	"net/http/httputil"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/lb"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/split"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/transform"
 )
 
@@ -115,6 +118,10 @@ func (r *Router) splitClient(req *http.Request) split.Client {
 func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Request) (*route, http.ResponseWriter, *http.Request, func()) {
 	d := rt.split.Select(req, r.splitClient(req))
 	middleware.NoteVariant(req.Context(), rt.variants[d.Index].name)
+	trace.SpanFromContext(req.Context()).SetAttributes(
+		tracing.AttrVariant.String(rt.variants[d.Index].name),
+		tracing.AttrVariantSource.String(d.Source),
+	)
 	if h := rt.split.OverrideHeader(); !rt.split.ForwardOverrideHeader() && req.Header.Get(h) != "" {
 		// Whether or not it was honoured, the backend never sees it:
 		// it's the gateway's to interpret.

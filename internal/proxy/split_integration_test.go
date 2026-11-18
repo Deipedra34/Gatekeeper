@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,12 +13,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/ratelimiter/store"
 	"gatekeeper/internal/split"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/websocket/wstest"
 )
 
@@ -193,4 +198,36 @@ func TestSplit_RecordsPerVariantMetrics(t *testing.T) {
 	assert.Equal(t, c, testutil.ToFloat64(m.VariantErrors.WithLabelValues("/api", "canary")), "every canary request failed")
 	assert.Zero(t, testutil.ToFloat64(m.VariantErrors.WithLabelValues("/api", "stable")))
 	assert.Equal(t, 2, testutil.CollectAndCount(m.VariantDuration, "gatekeeper_variant_request_duration_seconds"))
+}
+
+func TestSplit_VariantIsASpanAttribute(t *testing.T) {
+	stable, canary := newVariantBackend(t, "stable"), newVariantBackend(t, "canary")
+	rt := splitRoute(stable, canary, 0)
+	rt.TrafficSplit.Override = config.OverrideConfig{Enabled: true, Header: config.DefaultVariantHeader, Allow: config.OverrideAllow{Anyone: true}}
+	router := newSplitRouter(t, 0, rt)
+
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	for _, tc := range []struct{ header, variant, source string }{
+		{"", "stable", split.SourceWeight},
+		{"canary", "canary", split.SourceOverride},
+	} {
+		ctx, span := tp.Tracer("test").Start(context.Background(), "server")
+		req := httptest.NewRequest(http.MethodGet, "/api", nil).WithContext(ctx)
+		if tc.header != "" {
+			req.Header.Set("X-Gatekeeper-Variant", tc.header)
+		}
+		router.ServeHTTP(httptest.NewRecorder(), req)
+		span.End()
+
+		ended := sr.Ended()
+		attrs := map[attribute.Key]string{}
+		for _, a := range ended[len(ended)-1].Attributes() {
+			attrs[a.Key] = a.Value.Emit()
+		}
+		assert.Equal(t, tc.variant, attrs[tracing.AttrVariant])
+		assert.Equal(t, tc.source, attrs[tracing.AttrVariantSource])
+	}
 }

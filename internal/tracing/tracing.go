@@ -99,6 +99,12 @@ const (
 	// itself is never recorded.
 	AttrAccessBlockReason = attribute.Key("gatekeeper.access_control.block_reason")
 
+	// AttrVariant is the traffic split variant that served the request,
+	// and AttrVariantSource how it was chosen (weight, override, rule).
+	// Set on the server span of requests to split routes.
+	AttrVariant       = attribute.Key("gatekeeper.variant")
+	AttrVariantSource = attribute.Key("gatekeeper.variant.source")
+
 	AttrWSRejectReason = attribute.Key("gatekeeper.websocket.reject_reason")
 	AttrWSCloseReason  = attribute.Key("gatekeeper.websocket.close_reason")
 )
