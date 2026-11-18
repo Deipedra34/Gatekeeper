@@ -69,9 +69,39 @@ type Route struct {
 	signer   *CookieSigner
 	override overrideAllow
 
-	mu      sync.Mutex
-	weights Weights
+	onEvent func(Event)
+
+	mu   sync.Mutex
+	base Weights  // the weights, before any running rollout
+	ro   *rollout // nil without a rollout
 }
+
+// Event reports a change to a route's weights, for logs and metrics.
+type Event struct {
+	Route string
+	// Kind is EventRolloutStep, EventPause, EventResume, EventSet,
+	// EventPromote, or EventRollback.
+	Kind string
+	// Variant is the variant the event is about, if any.
+	Variant string
+	// Weights are the route's weights after the event.
+	Weights map[string]int
+	// Reason explains a rollback.
+	Reason string
+	// Auto is set for changes nobody asked for: rollout steps and
+	// automatic rollbacks.
+	Auto bool
+}
+
+// Event kinds.
+const (
+	EventRolloutStep = "rollout_step"
+	EventPause       = "pause"
+	EventResume      = "resume"
+	EventSet         = "set"
+	EventPromote     = "promote"
+	EventRollback    = "rollback"
+)
 
 // Option customises a Route.
 type Option func(*Route)
@@ -79,6 +109,12 @@ type Option func(*Route)
 // WithClock replaces time.Now, for tests.
 func WithClock(now func() time.Time) Option {
 	return func(r *Route) { r.now = now }
+}
+
+// WithEvents calls fn after every change to the route's weights. It's
+// called without the route's lock held, so it may read the route.
+func WithEvents(fn func(Event)) Option {
+	return func(r *Route) { r.onEvent = fn }
 }
 
 // NewRoute compiles cfg, a validated traffic split, for the route
@@ -102,7 +138,14 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 	if r.baseline < 0 {
 		r.baseline = 0
 	}
-	r.weights = w
+	r.base = w
+	if ro := cfg.Rollout; ro != nil {
+		i, ok := r.Index(ro.Variant)
+		if !ok {
+			return nil, fmt.Errorf("split: route %s: rollout of unknown variant %q", label, ro.Variant)
+		}
+		r.ro = newRollout(i, ro.Steps, ro.Interval.Duration, r.now())
+	}
 	r.salt = cfg.Sticky.Salt
 	if r.salt == "" {
 		r.salt = label
@@ -166,11 +209,103 @@ func (r *Route) Index(name string) (int, bool) {
 // Baseline returns the baseline variant's index.
 func (r *Route) Baseline() int { return r.baseline }
 
-// Weights returns the current weights.
+// Weights returns the current weights, advancing a running rollout
+// first.
 func (r *Route) Weights() Weights {
 	r.mu.Lock()
+	moved := r.advanceLocked()
+	w := r.currentLocked()
+	variant := r.rolloutVariantLocked()
+	r.mu.Unlock()
+	if moved {
+		r.emit(Event{Kind: EventRolloutStep, Variant: variant, Auto: true}, w)
+	}
+	return w
+}
+
+// advanceLocked advances a running rollout to now, reporting whether it
+// moved.
+// rolloutVariantLocked names the rollout's variant ("" without one).
+func (r *Route) rolloutVariantLocked() string {
+	if r.ro == nil {
+		return ""
+	}
+	return r.names[r.ro.variant]
+}
+
+func (r *Route) advanceLocked() bool {
+	return r.ro != nil && r.ro.advance(r.now()) > 0
+}
+
+// currentLocked returns the weights in force: the rollout's share for
+// its variant (the others splitting the rest as in base) while a rollout
+// is in charge, base otherwise.
+func (r *Route) currentLocked() Weights {
+	if r.ro == nil || r.ro.state == RolloutStopped {
+		return r.base.Clone()
+	}
+	return r.base.WithShare(r.ro.variant, r.ro.share(), r.baseline)
+}
+
+// emit reports e, with weights w, to the event hook.
+func (r *Route) emit(e Event, w Weights) {
+	if r.onEvent == nil {
+		return
+	}
+	e.Route = r.label
+	e.Weights = r.named(w)
+	r.onEvent(e)
+}
+
+// named returns w keyed by variant name.
+func (r *Route) named(w Weights) map[string]int {
+	m := make(map[string]int, len(w))
+	for i, n := range r.names {
+		m[n] = w[i]
+	}
+	return m
+}
+
+// Pause freezes a running rollout at its current step.
+func (r *Route) Pause() error {
+	r.mu.Lock()
+	r.advanceLocked()
+	if r.ro == nil {
+		r.mu.Unlock()
+		return ErrNoRollout
+	}
+	err := r.ro.pause(r.now())
+	w, variant := r.currentLocked(), r.rolloutVariantLocked()
+	r.mu.Unlock()
+	if err == nil {
+		r.emit(Event{Kind: EventPause, Variant: variant}, w)
+	}
+	return err
+}
+
+// Resume continues a paused rollout from where it stopped.
+func (r *Route) Resume() error {
+	r.mu.Lock()
+	if r.ro == nil || r.ro.state != RolloutPaused {
+		r.mu.Unlock()
+		return ErrNoRollout
+	}
+	r.ro.unpause(r.now())
+	w, variant := r.currentLocked(), r.rolloutVariantLocked()
+	r.mu.Unlock()
+	r.emit(Event{Kind: EventResume, Variant: variant}, w)
+	return nil
+}
+
+// Rollout returns the route's rollout status, or nil without one.
+func (r *Route) Rollout() *RolloutStatus {
+	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.weights.Clone()
+	r.advanceLocked()
+	if r.ro == nil {
+		return nil
+	}
+	return r.ro.status(r.names[r.ro.variant])
 }
 
 // Select chooses req's variant.
