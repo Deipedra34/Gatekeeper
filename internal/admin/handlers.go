@@ -86,6 +86,9 @@ type routeBackend struct {
 	ID     string `json:"id"`
 	Target string `json:"target"`
 	Weight int    `json:"weight"`
+	// Variant names the traffic split variant the backend serves, on a
+	// split route.
+	Variant string `json:"variant,omitempty"`
 }
 
 type routeCache struct {
@@ -115,14 +118,28 @@ func (s *Server) listRoutes(w http.ResponseWriter, _ *http.Request) {
 				OpenDuration:     rt.CircuitBreaker.OpenDuration.String(),
 			},
 		}
-		for _, bc := range rt.EffectiveBackends() {
-			target := bc.Target
-			if u, err := url.Parse(bc.Target); err == nil {
-				target = lb.Label(u) // never echo credentials in a target
+		groups := []config.Route{rt}
+		var variants []string
+		if ts := rt.TrafficSplit; ts != nil {
+			// A split route's backends are its variants'.
+			groups = groups[:0]
+			for i, v := range ts.Variants {
+				groups = append(groups, rt.VariantRoute(i))
+				variants = append(variants, v.Name)
 			}
-			info.Backends = append(info.Backends, routeBackend{
-				ID: lb.BackendID(rt.Label(), target), Target: target, Weight: max(bc.Weight, 1),
-			})
+		}
+		for gi, group := range groups {
+			for _, bc := range group.EffectiveBackends() {
+				target := bc.Target
+				if u, err := url.Parse(bc.Target); err == nil {
+					target = lb.Label(u) // never echo credentials in a target
+				}
+				rb := routeBackend{ID: lb.BackendID(rt.Label(), target), Target: target, Weight: max(bc.Weight, 1)}
+				if variants != nil {
+					rb.Variant = variants[gi]
+				}
+				info.Backends = append(info.Backends, rb)
+			}
 		}
 		routes = append(routes, info)
 	}
