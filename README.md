@@ -1439,6 +1439,70 @@ It's built to fail safe and never flap:
 
 The windows are per instance: each instance judges the traffic it serves, and rolls back its own weights (see [Reloading and multiple instances](#reloading-and-multiple-instances)).
 
+### How it fits with the rest of the pipeline
+
+The variant is chosen inside the router, after everything that decides whether a request is let in at all, and before everything that serves it:
+
+- **Access control, auth, CORS, and rate limiting run first, unchanged.** A rejected request never reaches a variant. **Rate limits stay per client**: a client switching variants (or overriding) draws on its one bucket, not one per variant.
+- **Caching:** the cache key includes the variant, so a canary's response is never served to stable's clients, or the reverse, even for the same URL. Routes without a split keep exactly the same cache keys.
+- **Retries never cross variants.** Each variant has its own retry transport over its own backends: a failing canary request is retried on other canary backends, and if they all fail, the canary's error is the answer.
+- **Load balancing, health checks, and circuit breakers** work per variant exactly as on an unsplit route, with the same per-backend breakers and ejections.
+- **Request and response transformations** apply to every variant.
+- **WebSocket upgrades** choose their variant at the handshake, and the connection stays there for its lifetime, even if the weights change while it's open.
+- The **override header** is removed before forwarding (unless `forward_header: true`). The `response_header`, if set, and the sticky cookie are added to every response, cached ones and `101 Switching Protocols` included.
+
+### Logs, metrics, and tracing
+
+Request log lines for split routes end with the variant:
+
+```
+GET /api/orders 200 3.1ms 203.0.113.7:51544 variant=canary
+```
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gatekeeper_variant_requests_total` | `route`, `variant` | Requests each variant served |
+| `gatekeeper_variant_errors_total` | `route`, `variant` | Of those, the ones answered with a 5xx |
+| `gatekeeper_variant_request_duration_seconds` | `route`, `variant` | Latency histogram per variant |
+| `gatekeeper_variant_weight_percent` | `route`, `variant` | Each variant's current weight, read at scrape time, so rollout steps and rollbacks show up straight away |
+| `gatekeeper_variant_rollbacks_total` | `route`, `variant`, `trigger`: `error_rate`, `latency`, `manual` | Rollbacks |
+
+Upgraded WebSocket connections aren't counted in the per-variant request metrics (they have their own). The [Grafana dashboard](#grafana-dashboard) has a **Traffic splitting** row with weights, requests, 5xx rate, and p95 latency per variant, and rollbacks. With [tracing](#distributed-tracing) on, the server span carries `gatekeeper.variant` and `gatekeeper.variant.source` (`weight`, `override`, or `rule`).
+
+### Traffic split endpoints
+
+With the [admin API](#admin-api) enabled, `{route}` is the route's `id` from `GET /admin/v1/routes` (which also lists each split route's backends with their variant), its path prefix with the slashes escaped (`%2Fapi`), or its path prefix without the leading slash (`api`).
+
+| Method & path | What it does |
+|---|---|
+| `GET /admin/v1/routes/{route}/split` | Current and configured weights, the rollout's state and next step, whether an operator or a rollback controls the weights, cooldowns, and the last rollback |
+| `POST /admin/v1/routes/{route}/split` | `{"action": "set", "weights": {"stable": 75, "canary": 25}}`, `{"action": "pause"}`, `{"action": "resume"}`, `{"action": "promote"}`, or `{"action": "rollback", "reason": "..."}` |
+
+- `set`, `promote`, and `rollback` take the weights out of the rollout's hands. `resume` returns to the configured behaviour: a paused rollout carries on; a stopped one starts again from its first step; without a rollout, the configured weights come back.
+- `promote` and `rollback` act on `"variant"`, which defaults to the rollout's variant, or with two variants to the one that isn't the baseline.
+- Giving traffic to a variant still in its post-rollback cooldown answers `409` unless the body has `"force": true`.
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/routes/api/split
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"action": "pause"}' http://127.0.0.1:9090/admin/v1/routes/api/split
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"action": "promote"}' http://127.0.0.1:9090/admin/v1/routes/api/split
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"action": "rollback", "reason": "latency regression"}' \
+  http://127.0.0.1:9090/admin/v1/routes/api/split
+```
+
+`POST` accepts `?dry_run=true`, which checks the request and reports the split without changing it. Like every admin endpoint, these are authenticated, counted in `gatekeeper_admin_requests_total`, and written to the audit log. Every change is also logged by the gateway (`split: route /api: set; weights now canary=25 stable=75`).
+
+### Reloading and multiple instances
+
+`SIGHUP` (or `POST /admin/v1/reload`) rebuilds split routes with the rest of the pipeline:
+
+- **Requests in flight finish on the variant and backend they started on**, even if the reload changes the weights, removes the variant, or repoints it. Its backends drain as on any route.
+- **Sticky clients don't move** unless the weights do, and then only the clients whose buckets change hands.
+- **Live state survives a reload that leaves the route's weights, rollout, and guardrails unchanged**: weights set through the admin API, the rollout's progress (and pause), the last rollback, cooldowns, and the guardrails' windows. A reload that changes backends, stickiness, overrides, rules, or the response header keeps all of that. A reload that changes the weights, the rollout, or the guardrails is a deliberate change to the split, so the route starts again from the new config.
+- An invalid split rejects the whole reload, and the previous config stays in force.
+
+Weights changed through the admin API, rollout progress, and automatic rollbacks are **per instance**. Stickiness is consistent across a fleet, because it only depends on the client and the route, but run the same admin action against each instance (or let each instance's guardrails judge the traffic it serves). See [ADR 10](docs/adr/0010-traffic-splitting.md) for why.
+
 ## Setup
 
 Requires Go 1.26+ (see `go.mod`). Redis is optional, only needed if you set `storage.backend: redis`.
