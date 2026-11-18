@@ -1287,6 +1287,158 @@ Both actions accept `?dry_run=true`. Like every admin endpoint, they're authenti
 access_control: mode=denylist allow=0 deny=3 trusted_proxies=2 route_overrides=[/admin] auto_ban=on (20 offenses in 1m0s -> 10m0s)
 ```
 
+## Traffic splitting (canary and A/B)
+
+A route can split its traffic between named **variants**, such as `stable` and `canary`, each with its own backend group. This is how you send 10% of users to a new release, test two versions against each other, or shift traffic over gradually and let Gatekeeper take it back automatically if the new version misbehaves.
+
+It's all in an optional `traffic_split` section on a route. **A route without `traffic_split` is proxied exactly as before**, and no traffic split code runs for it.
+
+| Setting | What it does |
+|---|---|
+| `variants` | The variants, each with a `name`, a `weight` (percent), and a backend group configured like a route's: `target` or `backends`, `lb_strategy`, `health_check`, `passive_health_check`. Load balancing, health checks, circuit breakers, and retries all work inside each variant |
+| `baseline` | The variant others are compared with by `auto_rollback`, and that gets a rolled-back variant's share. Defaults to the first variant |
+| `sticky` | What keeps a client on the same variant: `by: client_ip` (the default), `api_key`, `jwt_subject`, `client_cert`, or `cookie`. See [Sticky assignment](#sticky-assignment) |
+| `override` | Lets selected clients pick a variant with a request header. See [Header override for testers](#header-override-for-testers) |
+| `rules` | Sends requests matching a header, cookie, or path prefix to a fixed variant |
+| `rollout` | Raises one variant's weight in steps over time. See [Gradual rollout](#gradual-rollout) |
+| `auto_rollback` | Per variant: takes its traffic away when its 5xx rate or p95 latency gets worse than the baseline's. See [Automatic rollback](#automatic-rollback) |
+| `response_header` | Names a response header telling the client which variant served it. Off by default |
+
+Rules:
+
+- **Weights are whole percentages and must add up to exactly 100.** That's checked when the config is loaded, like everything else here: a split that adds up to 99, names an unknown variant, lets the public override without an allowlist, or reuses a backend in two variants stops startup, or rejects a `SIGHUP` reload, with the exact location (`routes[2]: traffic_split: variant weights must add up to 100, got 110`).
+- A split route takes its backends from its variants, so it has no `target` or `backends` of its own. Everything else on the route (auth mode, cache, circuit breaker settings, backend TLS, transforms, WebSocket settings, access control) applies to every variant.
+- A variant's backend group can't share a target with another variant.
+
+### Simple 90/10 canary
+
+```yaml
+routes:
+  - path_prefix: "/api"
+    traffic_split:
+      variants:
+        - name: stable
+          weight: 90
+          backends:
+            - target: "http://api-v1-a:8080"
+            - target: "http://api-v1-b:8080"
+        - name: canary
+          weight: 10
+          target: "http://api-v2:8080"
+```
+
+Nine in ten clients reach `stable` (balanced across its two backends), one in ten reach `canary`, and each client stays where it landed.
+
+### Sticky assignment
+
+A variant is chosen per client, not per request, so a user doesn't flip between versions from one click to the next. The client's identity (with `by: client_ip`, its address) is hashed into one of 10,000 buckets, and each variant owns a range of buckets in config order: with `[90, 10]`, `stable` owns buckets 0-8999 and `canary` 9000-9999.
+
+- The hash depends only on the identity and the route (its label, or `sticky.salt` if you set one). It doesn't depend on the config, other routes, the process, or the instance, so **a client keeps its variant across reloads, restarts, and every instance of a fleet**, and an unrelated config change never moves anyone.
+- Changing weights moves only the clients whose buckets change hands. **List the stable variant first**: then growing the canary from 10% to 25% moves exactly the extra 15% of clients from stable to canary, and none the other way.
+- A request without the configured identity (no API key on an `api_key`-sticky route, say) falls back to its client address. The address is the one [access control](#trusted-proxies-and-the-client-address) resolved, if it's on. Otherwise it's the connection's peer, or `X-Forwarded-For` with `transform.trust_forwarded_headers`.
+
+**Sticky by API key**, so a customer stays on one version from every device and address:
+
+```yaml
+    traffic_split:
+      variants:
+        - {name: stable, weight: 80, target: "http://api-v1:8080"}
+        - {name: canary, weight: 20, target: "http://api-v2:8080"}
+      sticky:
+        by: api_key          # the auth.header value; also jwt_subject, client_cert, client_ip
+```
+
+**Sticky by cookie**, for browsers behind shared addresses: the first response sets a cookie holding the client's bucket, and later requests use it. The cookie is signed, so a client can't edit it to pick a variant. Set the signing secret through an environment variable so cookies stay valid across restarts and instances; without one, Gatekeeper generates a secret at startup and logs that it did.
+
+```yaml
+      sticky:
+        by: cookie
+        cookie:
+          name: gk_variant          # default
+          ttl: 24h                  # default
+          secret_env: GATEKEEPER_SPLIT_COOKIE_SECRET   # at least 16 bytes
+          secure: true
+```
+
+### Header override for testers
+
+Testers can force a variant with a request header, even one with weight 0. **Only clients on the allowlist can**, so the public can't opt into the canary. A client is allowed if it matches any entry: a rate limit tier, an API key, or an address range. The header is removed before the request is forwarded, whether it was honoured or not, unless `forward_header: true`.
+
+```yaml
+      override:
+        enabled: true
+        header: X-Gatekeeper-Variant   # default
+        allow:
+          tiers: [internal]            # rate_limit tiers
+          api_keys: ["qa-team-key"]
+          cidrs: ["10.0.0.0/8", "2001:db8:office::/48"]
+```
+
+```bash
+curl -H "X-API-Key: qa-team-key" -H "X-Gatekeeper-Variant: canary" http://localhost:8080/api/orders
+```
+
+An empty allowlist is refused at load. If a route really isn't reachable by the public, say so with `allow: {anyone: true}`.
+
+**Match rules** send requests to a fixed variant without a header from the client: for example, internal testers marked by a header your SSO proxy sets, or a beta path. Rules are checked in order after an allowed override and before weights. Every condition a rule sets must hold, and a header or cookie without a `value` matches when it's present at all.
+
+```yaml
+      rules:
+        - variant: canary
+          match: {header: {name: X-Internal-Tester, value: "true"}}
+        - variant: canary
+          match: {path_prefix: /api/beta, cookie: {name: beta_opt_in}}
+```
+
+### Gradual rollout
+
+A `rollout` raises one variant's weight through a list of steps, one step every `interval`, starting when the config is loaded. The other variants share what's left in proportion to their configured weights (with two variants, the baseline gets the rest).
+
+```yaml
+      variants:
+        - {name: stable, weight: 100, target: "http://api-v1:8080"}
+        - {name: canary, weight: 0, target: "http://api-v2:8080"}
+      rollout:
+        variant: canary
+        steps: [5, 25, 50, 100]
+        interval: 30m
+```
+
+The canary gets 5% at once, 25% after 30 minutes, 50% after an hour, and everything after 90 minutes. It stays at the last step. The schedule needs no background work: it's evaluated whenever the weights are read, so it catches up correctly after a quiet period. From the [admin API](#traffic-split-endpoints) you can `pause` it at its current step, `resume` it, `promote` the canary straight to 100%, or `rollback` to 0%. Each step is logged:
+
+```
+split: route /api: rollout of canary stepped up; weights now canary=25 stable=75
+```
+
+### Automatic rollback
+
+`auto_rollback` on a variant compares it with the baseline over a rolling window, and when it does measurably worse, takes all its traffic away (to the baseline), logs why, and counts it in `gatekeeper_variant_rollbacks_total`.
+
+```yaml
+        - name: canary
+          weight: 10
+          target: "http://api-v2:8080"
+          auto_rollback:
+            window: 5m                     # default 5m
+            min_requests: 100              # default 100
+            max_error_rate_increase: 0.05  # 5xx rate more than 5 points above the baseline's
+            max_p95_latency_ratio: 1.5     # p95 latency more than 1.5x the baseline's
+            cooldown: 10m                  # default 10m
+```
+
+```
+split: route /api: variant canary rolled back automatically (error_rate): 5xx rate 12.0% over 340 requests vs baseline 0.4% (limit +5.0 points); weights now canary=0 stable=100
+```
+
+It's built to fail safe and never flap:
+
+- **Small samples never trigger it.** A variant isn't judged until it has served `min_requests` in the window. The latency check also needs `min_requests` on the baseline, since a p95 from a handful of requests says nothing. The error check compares with whatever the baseline has, and no baseline traffic at all counts as 0% errors, which errs towards rolling back.
+- **A rollback is one-way.** The variant stays at 0% and a running rollout stops. Nothing brings the traffic back automatically: an operator has to `resume` or `set` it.
+- **Then a cooldown applies.** For `cooldown` after an automatic rollback, giving the variant traffic again is refused (`409`) unless the request says `"force": true`. The guardrails stay active on forced traffic, and the windows start over after each rollback, so the requests that caused it can't count against the variant a second time.
+- Guardrails are checked at most once a second, inline as requests finish, without a background goroutine. A failure inside the check is contained and never breaks the request that ran it.
+
+The windows are per instance: each instance judges the traffic it serves, and rolls back its own weights (see [Reloading and multiple instances](#reloading-and-multiple-instances)).
+
 ## Setup
 
 Requires Go 1.26+ (see `go.mod`). Redis is optional, only needed if you set `storage.backend: redis`.
