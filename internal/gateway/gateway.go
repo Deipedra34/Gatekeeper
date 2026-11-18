@@ -26,6 +26,7 @@ import (
 	"gatekeeper/internal/proxy"
 	"gatekeeper/internal/ratelimiter"
 	"gatekeeper/internal/ratelimiter/store"
+	"gatekeeper/internal/split"
 	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/websocket"
 )
@@ -54,6 +55,11 @@ type Gateway struct {
 	// removed ones.
 	backends *lb.Registry
 	router   atomic.Pointer[proxy.Router]
+
+	// splits holds the live traffic splits. Like backends it outlives
+	// reloads, so weights an operator set, a rollout's progress, and
+	// rollbacks survive a reload that leaves a route's split alone.
+	splits *split.Registry
 
 	configPath string
 
@@ -113,9 +119,11 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		retiring:   map[*tracing.Provider]*time.Timer{},
 		accessLog:  accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
 	}
+	g.splits = split.NewRegistry(split.WithEvents(g.onSplitEvent))
 	if m != nil {
 		m.SetBackendSource(g.backends.Snapshot)
 		m.SetActiveBansSource(g.activeBans)
+		m.SetVariantWeightSource(g.variantWeights)
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -140,6 +148,7 @@ func (g *Gateway) install(cfg *config.Config, b *built, tp *tracing.Provider) {
 	g.current.Store(cfg)
 	g.limiters.Store(&b.limiters)
 	g.access.Store(b.access)
+	g.splits.Commit(b.router.SplitRoutes())
 	g.tracer.Store(tp)
 	now := time.Now()
 	g.loadedAt.Store(&now)
@@ -308,6 +317,7 @@ func (g *Gateway) retire(p *tracing.Provider) {
 func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Router) (*built, error) {
 	opts := []proxy.Option{
 		proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends), proxy.WithTransformConfig(cfg.Transform),
+		proxy.WithSplitRegistry(g.splits), proxy.WithAPIKeyHeader(cfg.Auth.Header),
 	}
 	if prev != nil {
 		opts = append(opts, proxy.WithPrevious(prev))
@@ -338,6 +348,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		return nil, err
 	}
 	g.logAccessControl(cfg)
+	g.logTrafficSplits(router.SplitRoutes())
 
 	mws := []middleware.Middleware{middleware.RequestMetrics(g.metrics, router.RouteLabelFor)}
 	if access != nil {
