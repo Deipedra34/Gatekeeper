@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gatekeeper/internal/accesscontrol"
@@ -73,6 +74,9 @@ type Route struct {
 
 	configured Weights // the weights in the config
 
+	guards   []*guard
+	lastEval atomic.Int64 // unix nanos of the last guardrail evaluation
+
 	mu     sync.Mutex
 	base   Weights   // the weights, before any running rollout
 	ro     *rollout  // nil without a rollout
@@ -90,8 +94,10 @@ type Event struct {
 	Variant string
 	// Weights are the route's weights after the event.
 	Weights map[string]int
-	// Reason explains a rollback.
-	Reason string
+	// Reason explains a rollback; Trigger says what caused it:
+	// TriggerErrorRate, TriggerLatency, or TriggerManual.
+	Reason  string
+	Trigger string
 	// Auto is set for changes nobody asked for: rollout steps and
 	// automatic rollbacks.
 	Auto bool
@@ -143,6 +149,7 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 		r.baseline = 0
 	}
 	r.base, r.configured = w, w.Clone()
+	r.guards = newGuards(cfg)
 	if ro := cfg.Rollout; ro != nil {
 		i, ok := r.Index(ro.Variant)
 		if !ok {

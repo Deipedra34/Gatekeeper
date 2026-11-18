@@ -20,6 +20,7 @@ var (
 // Rollback records the most recent rollback of a route.
 type Rollback struct {
 	Variant string    `json:"variant"`
+	Trigger string    `json:"trigger"`
 	Reason  string    `json:"reason"`
 	Auto    bool      `json:"auto"`
 	At      time.Time `json:"at"`
@@ -62,28 +63,33 @@ func (r *Route) Promote(i int) error {
 }
 
 // Rollback takes all of variant i's traffic away and gives it to the
-// baseline. It reports false (and changes nothing) when i had no traffic
-// to take.
-func (r *Route) Rollback(i int, reason string, auto bool) (bool, error) {
+// baseline, as an operator's decision. It reports false (and changes
+// nothing) when i had no traffic to take.
+func (r *Route) Rollback(i int, reason string) (bool, error) {
 	if i < 0 || i >= len(r.names) {
 		return false, fmt.Errorf("split: no variant %d", i)
 	}
 	if i == r.baseline {
 		return false, ErrBaseline
 	}
+	return r.rollback(i, TriggerManual, reason, false), nil
+}
+
+// rollback moves variant i's share to the baseline, recording why.
+func (r *Route) rollback(i int, trigger, reason string, auto bool) bool {
 	r.mu.Lock()
 	r.advanceLocked()
 	cur := r.currentLocked()
 	if cur[i] == 0 {
 		r.mu.Unlock()
-		return false, nil
+		return false
 	}
 	w := cur.Without(i, r.baseline)
 	r.takeOverLocked(w)
-	r.last = &Rollback{Variant: r.names[i], Reason: reason, Auto: auto, At: r.now().UTC()}
+	r.last = &Rollback{Variant: r.names[i], Trigger: trigger, Reason: reason, Auto: auto, At: r.now().UTC()}
 	r.mu.Unlock()
-	r.emit(Event{Kind: EventRollback, Variant: r.names[i], Reason: reason, Auto: auto}, w)
-	return true, nil
+	r.emit(Event{Kind: EventRollback, Variant: r.names[i], Trigger: trigger, Reason: reason, Auto: auto}, w)
+	return true
 }
 
 // takeOverLocked makes w the weights and stops a rollout from changing
