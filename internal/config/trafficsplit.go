@@ -279,7 +279,19 @@ func (r Route) validateTrafficSplit(tiers map[string]TierLimit) error {
 	if err := ts.validateOverride(tiers); err != nil {
 		return err
 	}
-	return ts.validateRules()
+	if err := ts.validateRules(); err != nil {
+		return err
+	}
+	if err := ts.validateRollout(); err != nil {
+		return err
+	}
+	if err := ts.validateAutoRollback(); err != nil {
+		return err
+	}
+	if ts.ResponseHeader != "" && !validHeaderName(ts.ResponseHeader) {
+		return fmt.Errorf("traffic_split.response_header %q is not a valid header name", ts.ResponseHeader)
+	}
+	return nil
 }
 
 // validateWeights checks that every weight is a percentage and that they
@@ -474,6 +486,64 @@ func (ts *TrafficSplitConfig) validateRules() error {
 		}
 		if m.PathPrefix != "" && !strings.HasPrefix(m.PathPrefix, "/") {
 			return fmt.Errorf("%s: match.path_prefix must start with /", where)
+		}
+	}
+	return nil
+}
+
+// validateRollout checks the rollout schedule: a non-baseline variant,
+// and steps that only ever go up.
+func (ts *TrafficSplitConfig) validateRollout() error {
+	ro := ts.Rollout
+	if ro == nil {
+		return nil
+	}
+	if ts.variantIndex(ro.Variant) < 0 {
+		return fmt.Errorf("traffic_split.rollout.variant: no variant is called %q", ro.Variant)
+	}
+	if ro.Variant == ts.Baseline {
+		return fmt.Errorf("traffic_split.rollout.variant: %q is the baseline; roll out another variant", ro.Variant)
+	}
+	if len(ro.Steps) == 0 {
+		return fmt.Errorf("traffic_split.rollout.steps: list the weights to step through, e.g. [5, 25, 50, 100]")
+	}
+	for j, w := range ro.Steps {
+		if w < 1 || w > 100 {
+			return fmt.Errorf("traffic_split.rollout.steps[%d]: weight must be between 1 and 100, got %d", j, w)
+		}
+		if j > 0 && w <= ro.Steps[j-1] {
+			return fmt.Errorf("traffic_split.rollout.steps[%d]: steps must increase, got %d after %d", j, w, ro.Steps[j-1])
+		}
+	}
+	if ro.Interval.Duration <= 0 {
+		return fmt.Errorf("traffic_split.rollout.interval must be > 0")
+	}
+	return nil
+}
+
+// validateAutoRollback checks every variant's guardrails.
+func (ts *TrafficSplitConfig) validateAutoRollback() error {
+	for i, v := range ts.Variants {
+		ar := v.AutoRollback
+		if ar == nil {
+			continue
+		}
+		where := fmt.Sprintf("traffic_split.variants[%d] (%s).auto_rollback", i, v.Name)
+		switch {
+		case v.Name == ts.Baseline:
+			return fmt.Errorf("%s: the baseline is what other variants are compared with, so it can't have guardrails of its own", where)
+		case ar.Window.Duration <= 0:
+			return fmt.Errorf("%s.window must be > 0", where)
+		case ar.MinRequests < 1:
+			return fmt.Errorf("%s.min_requests must be >= 1", where)
+		case ar.MaxErrorRateIncrease < 0 || ar.MaxErrorRateIncrease > 1:
+			return fmt.Errorf("%s.max_error_rate_increase must be between 0 and 1 (0.05 = five percentage points)", where)
+		case ar.MaxP95LatencyRatio != 0 && ar.MaxP95LatencyRatio <= 1:
+			return fmt.Errorf("%s.max_p95_latency_ratio must be greater than 1 (1.5 = 50%% slower than the baseline), or 0 to disable it", where)
+		case ar.MaxErrorRateIncrease == 0 && ar.MaxP95LatencyRatio == 0:
+			return fmt.Errorf("%s: set max_error_rate_increase, max_p95_latency_ratio, or both", where)
+		case ar.Cooldown.Duration < 0:
+			return fmt.Errorf("%s.cooldown must be >= 0", where)
 		}
 	}
 	return nil
