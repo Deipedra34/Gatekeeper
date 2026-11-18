@@ -2,7 +2,8 @@
 // running gateway (status, redacted config, routes, backends, rate limit
 // state, cache stats, access control lists and bans) and operator
 // actions (reload, cache purge, rate limit reset, backend drain/enable,
-// circuit breaker reset, IP ban and unban).
+// circuit breaker reset, IP ban and unban, traffic split weights,
+// rollouts, promotion, and rollback).
 //
 // It runs on its own listener, never on the proxy's, so no backend route
 // can shadow it and no public client can reach it. Every request is
