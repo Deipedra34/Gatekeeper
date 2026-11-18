@@ -133,7 +133,7 @@ func TestGuard_EvaluatesAtMostOncePerInterval(t *testing.T) {
 func TestGuard_IdleVariantIsNotJudged(t *testing.T) {
 	clock, events := newFakeClock(), &eventLog{}
 	r := guardedRoute(t, clock, events, config.AutoRollbackConfig{MinRequests: 10, MaxErrorRateIncrease: 0.05})
-	require.NoError(t, r.SetWeights(Weights{100, 0}))
+	require.NoError(t, r.SetWeights(Weights{100, 0}, false))
 	// Testers forcing the canary while it has no weight can't roll back
 	// what isn't there.
 	serve(r, 1, 50, time.Millisecond, http.StatusInternalServerError)
@@ -145,4 +145,104 @@ func TestGuard_UnguardedRouteIgnoresRecords(t *testing.T) {
 	r := newRoute(t, twoWay())
 	serve(r, 1, 1000, time.Second, http.StatusInternalServerError)
 	assert.Equal(t, Weights{90, 10}, r.Weights())
+}
+
+// tripCanary makes the canary fail its error guardrail and checks it was
+// rolled back.
+func tripCanary(t *testing.T, r *Route, clock *fakeClock) {
+	t.Helper()
+	serve(r, 0, 200, time.Millisecond, http.StatusOK)
+	serve(r, 1, 200, time.Millisecond, http.StatusInternalServerError)
+	settle(r, clock)
+	require.Equal(t, 0, r.Weights()[1], "the canary was rolled back")
+}
+
+func TestCooldown_BlocksGivingTrafficBack(t *testing.T) {
+	clock, events := newFakeClock(), &eventLog{}
+	r := guardedRoute(t, clock, events, config.AutoRollbackConfig{MinRequests: 100, MaxErrorRateIncrease: 0.05, Cooldown: config.Duration{Duration: 10 * time.Minute}})
+	tripCanary(t, r, clock)
+	until := clock.Now().Add(10 * time.Minute)
+	assert.Equal(t, until, *r.Status().Variants[1].CooldownUntil)
+	assert.Nil(t, r.Status().Variants[0].CooldownUntil)
+
+	var cd *CooldownError
+	require.ErrorAs(t, r.Resume(false), &cd)
+	assert.Equal(t, "canary", cd.Variant)
+	assert.Equal(t, until, cd.Until)
+	assert.ErrorAs(t, r.SetWeights(Weights{80, 20}, false), &cd)
+	assert.ErrorAs(t, r.Promote(1, false), &cd)
+	assert.Equal(t, Weights{100, 0}, r.Weights(), "nothing changed")
+
+	// What doesn't feed the canary is fine.
+	require.NoError(t, r.SetWeights(Weights{100, 0}, false))
+
+	// Once the cooldown is over, traffic can come back.
+	clock.Advance(10 * time.Minute)
+	assert.Nil(t, r.Status().Variants[1].CooldownUntil)
+	require.NoError(t, r.Resume(false))
+	assert.Equal(t, Weights{90, 10}, r.Weights())
+}
+
+func TestCooldown_ForceOverridesIt(t *testing.T) {
+	clock, events := newFakeClock(), &eventLog{}
+	r := guardedRoute(t, clock, events, config.AutoRollbackConfig{MinRequests: 100, MaxErrorRateIncrease: 0.05})
+	tripCanary(t, r, clock)
+	require.NoError(t, r.SetWeights(Weights{95, 5}, true))
+	assert.Equal(t, Weights{95, 5}, r.Weights())
+
+	// The guardrails still apply to forced traffic: failing again rolls
+	// it back again (and restarts the cooldown) instead of flapping.
+	clock.Advance(time.Minute)
+	tripCanary(t, r, clock)
+	assert.Equal(t, clock.Now().Add(10*time.Minute), *r.Status().Variants[1].CooldownUntil)
+}
+
+func TestCooldown_NoFlappingWhileFailing(t *testing.T) {
+	clock, events := newFakeClock(), &eventLog{}
+	r := guardedRoute(t, clock, events, config.AutoRollbackConfig{MinRequests: 100, MaxErrorRateIncrease: 0.05})
+	tripCanary(t, r, clock)
+	// The canary keeps failing for testers who force it, for an hour:
+	// the route never brings it back by itself, and one rollback is all
+	// that happens.
+	for range 60 {
+		clock.Advance(time.Minute)
+		serve(r, 1, 50, time.Millisecond, http.StatusInternalServerError)
+		settle(r, clock)
+		assert.Equal(t, 0, r.Weights()[1])
+	}
+	rollbacks := 0
+	for _, k := range events.kinds() {
+		if k == EventRollback {
+			rollbacks++
+		}
+	}
+	assert.Equal(t, 1, rollbacks)
+}
+
+func TestCooldown_RolloutResumeWaitsForIt(t *testing.T) {
+	clock, events := newFakeClock(), &eventLog{}
+	cfg := twoWay()
+	cfg.Variants[1].AutoRollback = &config.AutoRollbackConfig{Window: config.Duration{Duration: time.Minute}, MinRequests: 100, MaxErrorRateIncrease: 0.05, Cooldown: config.Duration{Duration: 5 * time.Minute}}
+	cfg.Rollout = &config.RolloutConfig{Variant: "canary", Steps: []int{5, 50}, Interval: config.Duration{Duration: time.Minute}}
+	r := newRoute(t, cfg, WithClock(clock.Now), WithEvents(events.record))
+	tripCanary(t, r, clock)
+	assert.Equal(t, RolloutStopped, r.Rollout().State, "a rollback stops the rollout")
+	clock.Advance(time.Hour)
+	assert.Equal(t, Weights{100, 0}, r.Weights(), "and it never restarts on its own")
+
+	r2 := newRoute(t, cfg, WithClock(clock.Now))
+	tripCanary(t, r2, clock)
+	var cd *CooldownError
+	assert.ErrorAs(t, r2.Resume(false), &cd)
+	assert.NoError(t, r2.Resume(true))
+	assert.Equal(t, Weights{95, 5}, r2.Weights())
+}
+
+func TestCooldown_ManualRollbackHasNone(t *testing.T) {
+	clock, events := newFakeClock(), &eventLog{}
+	r := guardedRoute(t, clock, events, config.AutoRollbackConfig{MinRequests: 100, MaxErrorRateIncrease: 0.05})
+	_, err := r.Rollback(1, "operator")
+	require.NoError(t, err)
+	assert.Nil(t, r.Status().Variants[1].CooldownUntil)
+	assert.NoError(t, r.Resume(false))
 }

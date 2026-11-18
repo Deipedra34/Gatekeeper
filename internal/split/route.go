@@ -77,11 +77,12 @@ type Route struct {
 	guards   []*guard
 	lastEval atomic.Int64 // unix nanos of the last guardrail evaluation
 
-	mu     sync.Mutex
-	base   Weights   // the weights, before any running rollout
-	ro     *rollout  // nil without a rollout
-	manual bool      // an operator or a rollback set base
-	last   *Rollback // the most recent rollback
+	mu       sync.Mutex
+	base     Weights           // the weights, before any running rollout
+	ro       *rollout          // nil without a rollout
+	manual   bool              // an operator or a rollback set base
+	last     *Rollback         // the most recent rollback
+	cooldown map[int]time.Time // variant -> end of its post-rollback cooldown
 }
 
 // Event reports a change to a route's weights, for logs and metrics.
@@ -133,7 +134,7 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 	if len(cfg.Variants) == 0 {
 		return nil, fmt.Errorf("split: route %s has no variants", label)
 	}
-	r := &Route{label: label, cfg: cfg, now: time.Now, baseline: -1}
+	r := &Route{label: label, cfg: cfg, now: time.Now, baseline: -1, cooldown: map[int]time.Time{}}
 	for _, opt := range opts {
 		opt(r)
 	}
