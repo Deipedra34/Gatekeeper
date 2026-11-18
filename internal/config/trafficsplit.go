@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"reflect"
+	"strings"
 	"time"
 )
 
@@ -265,7 +267,10 @@ func (r Route) validateTrafficSplit() error {
 	if ts == nil {
 		return nil
 	}
-	return ts.validateWeights()
+	if err := ts.validateWeights(); err != nil {
+		return err
+	}
+	return ts.validateSticky()
 }
 
 // validateWeights checks that every weight is a percentage and that they
@@ -339,4 +344,69 @@ func (ar *AutoRollbackConfig) applyDefaults() {
 	if ar.Cooldown.Duration == 0 {
 		ar.Cooldown.Duration = DefaultRollbackCooldown
 	}
+}
+
+// variantIndex returns the index of the variant called name, or -1.
+func (ts *TrafficSplitConfig) variantIndex(name string) int {
+	for i, v := range ts.Variants {
+		if v.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// validateSticky checks the baseline and the stickiness settings.
+func (ts *TrafficSplitConfig) validateSticky() error {
+	if ts.variantIndex(ts.Baseline) < 0 {
+		return fmt.Errorf("traffic_split.baseline: no variant is called %q", ts.Baseline)
+	}
+	switch ts.Sticky.By {
+	case StickyClientIP, StickyAPIKey, StickyJWTSubject, StickyClientCert, StickyCookie:
+	default:
+		return fmt.Errorf("traffic_split.sticky.by must be one of client_ip, api_key, jwt_subject, client_cert, cookie, got %q", ts.Sticky.By)
+	}
+	ck := ts.Sticky.Cookie
+	if !validHeaderName(ck.Name) {
+		return fmt.Errorf("traffic_split.sticky.cookie.name %q is not a valid cookie name", ck.Name)
+	}
+	if ck.TTL.Duration < 0 {
+		return fmt.Errorf("traffic_split.sticky.cookie.ttl must be >= 0")
+	}
+	if !strings.HasPrefix(ck.Path, "/") {
+		return fmt.Errorf("traffic_split.sticky.cookie.path must start with /")
+	}
+	if ts.Sticky.By == StickyCookie {
+		if _, err := ck.SigningSecret(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SigningSecret returns the cookie signing secret: Secret, or the
+// environment variable SecretEnv names. Nil (with no error) means
+// neither is set and the caller should generate one. Errors never
+// include the secret.
+func (ck StickyCookieConfig) SigningSecret() ([]byte, error) {
+	switch {
+	case ck.Secret != "" && ck.SecretEnv != "":
+		return nil, fmt.Errorf("traffic_split.sticky.cookie: set only one of secret and secret_env")
+	case ck.SecretEnv != "":
+		s := os.Getenv(ck.SecretEnv)
+		if s == "" {
+			return nil, fmt.Errorf("traffic_split.sticky.cookie: environment variable %s named by secret_env is empty or unset", ck.SecretEnv)
+		}
+		return checkCookieSecret([]byte(s))
+	case ck.Secret != "":
+		return checkCookieSecret([]byte(ck.Secret))
+	}
+	return nil, nil
+}
+
+func checkCookieSecret(s []byte) ([]byte, error) {
+	if len(s) < 16 {
+		return nil, fmt.Errorf("traffic_split.sticky.cookie: the signing secret must be at least 16 bytes")
+	}
+	return s, nil
 }
