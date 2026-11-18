@@ -73,6 +73,9 @@ func (s *Server) config(w http.ResponseWriter, _ *http.Request) {
 }
 
 type routeInfo struct {
+	// ID identifies the route in admin paths such as
+	// /admin/v1/routes/{id}/split.
+	ID             string          `json:"id"`
 	Label          string          `json:"label"`
 	PathPrefix     string          `json:"path_prefix,omitempty"`
 	Host           string          `json:"host,omitempty"`
@@ -109,7 +112,7 @@ func (s *Server) listRoutes(w http.ResponseWriter, _ *http.Request) {
 	routes := make([]routeInfo, 0, len(cfg.Routes))
 	for _, rt := range cfg.Routes {
 		info := routeInfo{
-			Label: rt.Label(), PathPrefix: rt.PathPrefix, Host: rt.Host,
+			ID: routeID(rt.Label()), Label: rt.Label(), PathPrefix: rt.PathPrefix, Host: rt.Host,
 			AuthMode: rt.EffectiveAuthMode(), LBStrategy: rt.EffectiveLBStrategy(),
 			Backends:  []routeBackend{},
 			Cache:     routeCache{Enabled: rt.Cache.IsEnabled(), TTL: rt.Cache.TTL.String()},

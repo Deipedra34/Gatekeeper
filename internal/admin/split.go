@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -35,23 +37,32 @@ type splitRequest struct {
 // maxSplitReason caps the operator-supplied rollback reason.
 const maxSplitReason = 200
 
-// findSplit resolves the {route} path segment to a live split route: a
-// route label, URL-escaped ("%2Fapi"), or a path prefix without its
-// leading slash ("api"). It answers 404 or 409 itself when there's none.
+// routeID identifies a route in admin paths: the first 12 hex
+// characters of its label's SHA-256. Stable for as long as the label is,
+// and URL-safe, which a label like "/" is not.
+func routeID(label string) string {
+	sum := sha256.Sum256([]byte(label))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// findSplit resolves the {route} path segment to a live split route: the
+// route's id (see GET /admin/v1/routes), its label URL-escaped
+// ("%2Fapi"), or a path prefix without its leading slash ("api"). It
+// answers 404 or 409 itself when there's none.
 func (s *Server) findSplit(w http.ResponseWriter, r *http.Request) (*split.Route, bool) {
 	name := r.PathValue("route")
-	for _, label := range []string{name, "/" + strings.TrimPrefix(name, "/")} {
-		if sr, ok := s.gw.TrafficSplit(label); ok {
+	for _, rt := range s.gw.Config().Routes {
+		l := rt.Label()
+		if l != name && l != "/"+name && routeID(l) != name {
+			continue
+		}
+		if sr, ok := s.gw.TrafficSplit(l); ok {
 			return sr, true
 		}
+		writeError(w, http.StatusConflict, codeConflict, "route "+l+" has no traffic_split")
+		return nil, false
 	}
-	for _, rt := range s.gw.Config().Routes {
-		if l := rt.Label(); l == name || l == "/"+name {
-			writeError(w, http.StatusConflict, codeConflict, "route "+l+" has no traffic_split")
-			return nil, false
-		}
-	}
-	writeError(w, http.StatusNotFound, codeNotFound, "no route "+name+"; see GET /admin/v1/routes (escape a path prefix's slashes, e.g. %2Fapi)")
+	writeError(w, http.StatusNotFound, codeNotFound, "no route "+name+"; use a route's id from GET /admin/v1/routes, or its path prefix with the slashes escaped (%2Fapi)")
 	return nil, false
 }
 
