@@ -125,6 +125,11 @@ func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Reque
 	if d.SetCookie != nil {
 		http.SetCookie(w, d.SetCookie)
 	}
+	if h := rt.split.ResponseHeader(); h != "" {
+		// Set before anything is written, so it reaches cached
+		// responses and WebSocket 101s alike.
+		w.Header().Set(h, v.name)
+	}
 
 	vrt := *rt
 	vrt.pool, vrt.proxy, vrt.cacheTarget = v.pool, v.proxy, v.cacheTarget

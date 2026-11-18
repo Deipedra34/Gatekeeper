@@ -419,6 +419,10 @@ func (r *Route) bucket(c Client) int {
 	return Bucket(r.salt, id)
 }
 
+// ResponseHeader names the response header that tells clients which
+// variant served them; "" when off.
+func (r *Route) ResponseHeader() string { return r.cfg.ResponseHeader }
+
 // OverrideHeader returns the override header's name, which the proxy
 // strips before forwarding unless forward_header is set.
 func (r *Route) OverrideHeader() string { return r.cfg.Override.Header }
