@@ -205,3 +205,144 @@ routes:
 		})
 	}
 }
+
+// splitSettings appends settings (indented under traffic_split) to
+// splitRoute.
+func splitSettings(settings string) string {
+	return splitRoute("") + settings
+}
+
+func TestTrafficSplit_FullExampleLoads(t *testing.T) {
+	t.Setenv("GK_TEST_COOKIE_SECRET", "0123456789abcdef0123")
+	cfg, err := loadYAML(t, splitSettings(`      baseline: stable
+      sticky:
+        by: cookie
+        cookie: {name: gk_canary, ttl: 1h, secret_env: GK_TEST_COOKIE_SECRET, secure: true}
+      override:
+        enabled: true
+        allow: {tiers: [internal], api_keys: [tester-key], cidrs: ["10.0.0.0/8", "2001:db8::/32"]}
+      rules:
+        - variant: canary
+          match: {header: {name: X-Tester, value: "yes"}}
+        - variant: canary
+          match: {cookie: {name: beta}, path_prefix: /api/beta}
+      rollout: {variant: canary, steps: [5, 25, 50, 100], interval: 10m}
+      response_header: X-Variant
+`))
+	require.NoError(t, err)
+	ts := cfg.Routes[0].TrafficSplit
+	assert.Equal(t, StickyCookie, ts.Sticky.By)
+	secret, err := ts.Sticky.Cookie.SigningSecret()
+	require.NoError(t, err)
+	assert.Equal(t, "0123456789abcdef0123", string(secret))
+	assert.Len(t, ts.Rules, 2)
+	assert.Equal(t, []int{5, 25, 50, 100}, ts.Rollout.Steps)
+	assert.Equal(t, 10*time.Minute, ts.Rollout.Interval.Duration)
+	assert.Equal(t, "X-Variant", ts.ResponseHeader)
+}
+
+func TestTrafficSplit_SettingsValidation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		settings, wantErr string
+	}{
+		"unknown baseline": {
+			"      baseline: blue\n", `traffic_split.baseline: no variant is called "blue"`,
+		},
+		"unknown sticky mode": {
+			"      sticky: {by: session}\n", "sticky.by must be one of",
+		},
+		"bad cookie name": {
+			"      sticky: {by: cookie, cookie: {name: \"a b\"}}\n", "is not a valid cookie name",
+		},
+		"short cookie secret": {
+			"      sticky: {by: cookie, cookie: {secret: short}}\n", "at least 16 bytes",
+		},
+		"two cookie secrets": {
+			"      sticky: {by: cookie, cookie: {secret: 0123456789abcdef, secret_env: X}}\n", "set only one of secret and secret_env",
+		},
+		"missing cookie secret env": {
+			"      sticky: {by: cookie, cookie: {secret_env: GK_TEST_UNSET_SECRET}}\n", "GK_TEST_UNSET_SECRET named by secret_env is empty or unset",
+		},
+		"override for everyone by accident": {
+			"      override: {enabled: true}\n", "list the tiers, api_keys, or cidrs that may pick a variant",
+		},
+		"override for an unknown tier": {
+			"      override: {enabled: true, allow: {tiers: [vip]}}\n", `override.allow.tiers[0]: no rate_limit tier is called "vip"`,
+		},
+		"override with a bad cidr": {
+			"      override: {enabled: true, allow: {cidrs: [\"10.0.0.0/8\", \"10.0.0.300\"]}}\n", "override.allow.cidrs[1]",
+		},
+		"override with a bad header": {
+			"      override: {enabled: true, header: \"X Variant\", allow: {anyone: true}}\n", "is not a valid header name",
+		},
+		"rule for an unknown variant": {
+			"      rules: [{variant: blue, match: {path_prefix: /x}}]\n", `rules[0]: no variant is called "blue"`,
+		},
+		"rule without conditions": {
+			"      rules: [{variant: canary, match: {}}]\n", "match needs a header, cookie, or path_prefix",
+		},
+		"rule with a relative path": {
+			"      rules: [{variant: canary, match: {path_prefix: beta}}]\n", "match.path_prefix must start with /",
+		},
+		"rollout of the baseline": {
+			"      rollout: {variant: stable, steps: [50], interval: 1m}\n", "is the baseline",
+		},
+		"rollout without steps": {
+			"      rollout: {variant: canary, interval: 1m}\n", "rollout.steps: list the weights",
+		},
+		"rollout going down": {
+			"      rollout: {variant: canary, steps: [25, 5], interval: 1m}\n", "steps must increase, got 5 after 25",
+		},
+		"rollout past 100": {
+			"      rollout: {variant: canary, steps: [50, 120], interval: 1m}\n", "steps[1]: weight must be between 1 and 100",
+		},
+		"rollout without interval": {
+			"      rollout: {variant: canary, steps: [5, 50]}\n", "rollout.interval must be > 0",
+		},
+		"bad response header": {
+			"      response_header: \"X Variant\"\n", "response_header",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := loadYAML(t, splitSettings(tc.settings))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestTrafficSplit_OverrideForAnyoneMustBeExplicit(t *testing.T) {
+	_, err := loadYAML(t, splitSettings("      override: {enabled: true, allow: {anyone: true}}\n"))
+	assert.NoError(t, err)
+	_, err = loadYAML(t, splitSettings("      override: {enabled: false}\n"))
+	assert.NoError(t, err, "a disabled override needs no allowlist")
+}
+
+func TestTrafficSplit_AutoRollbackValidation(t *testing.T) {
+	guard := func(settings string) string {
+		return strings.Replace(splitRoute(""), `          target: "http://canary:9000"`, `          target: "http://canary:9000"
+          auto_rollback: `+settings, 1)
+	}
+	_, err := loadYAML(t, guard("{max_error_rate_increase: 0.05, max_p95_latency_ratio: 1.5, window: 1m, min_requests: 20, cooldown: 0s}"))
+	assert.NoError(t, err)
+
+	for settings, wantErr := range map[string]string{
+		"{}":                                           "set max_error_rate_increase, max_p95_latency_ratio, or both",
+		"{max_error_rate_increase: 1.5}":               "max_error_rate_increase must be between 0 and 1",
+		"{max_error_rate_increase: -0.1}":              "max_error_rate_increase must be between 0 and 1",
+		"{max_p95_latency_ratio: 0.9}":                 "max_p95_latency_ratio must be greater than 1",
+		"{max_p95_latency_ratio: 1}":                   "max_p95_latency_ratio must be greater than 1",
+		"{max_p95_latency_ratio: 2, min_requests: -1}": "min_requests must be >= 1",
+		"{max_p95_latency_ratio: 2, window: -1s}":      "window must be > 0",
+		"{max_p95_latency_ratio: 2, cooldown: -1s}":    "cooldown must be >= 0",
+	} {
+		_, err := loadYAML(t, guard(settings))
+		require.Error(t, err, settings)
+		assert.Contains(t, err.Error(), wantErr, settings)
+	}
+
+	_, err = loadYAML(t, strings.Replace(splitRoute(""), `          target: "http://stable:9000"`, `          target: "http://stable:9000"
+          auto_rollback: {max_error_rate_increase: 0.05}`, 1))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "the baseline is what other variants are compared with")
+}
