@@ -412,7 +412,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if rt.split != nil {
 		var done func()
-		rt, w, done = r.selectVariant(rt, w, req)
+		rt, w, req, done = r.selectVariant(rt, w, req)
 		defer done()
 	}
 

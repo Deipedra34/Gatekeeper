@@ -112,9 +112,17 @@ func (r *Router) splitClient(req *http.Request) split.Client {
 // selectVariant picks req's variant on a split route and returns the
 // route as that variant sees it — its pool, proxy, and cache identity —
 // along with the writer to respond through, which records the outcome
-// for the guardrails.
-func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Request) (*route, http.ResponseWriter, func()) {
+// for the guardrails, and the request to forward: without the override
+// header, unless the route forwards it.
+func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Request) (*route, http.ResponseWriter, *http.Request, func()) {
 	d := rt.split.Select(req, r.splitClient(req))
+	if h := rt.split.OverrideHeader(); !rt.split.ForwardOverrideHeader() && req.Header.Get(h) != "" {
+		// Whether or not it was honoured, the backend never sees it:
+		// it's the gateway's to interpret.
+		out := req.Clone(req.Context())
+		out.Header.Del(h)
+		req = out
+	}
 	v := rt.variants[d.Index]
 	if d.SetCookie != nil {
 		http.SetCookie(w, d.SetCookie)
@@ -131,7 +139,7 @@ func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Reque
 		}
 		rt.split.Record(d.Index, time.Since(start), rec.status)
 	}
-	return &vrt, rec, done
+	return &vrt, rec, req, done
 }
 
 // variantRecorder captures a split request's status for the guardrails,
