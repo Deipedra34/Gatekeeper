@@ -1,11 +1,14 @@
 package split
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"sync"
 	"time"
 
+	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/config"
 )
 
@@ -13,6 +16,8 @@ import (
 const (
 	// SourceWeight: the client's bucket, by the current weights.
 	SourceWeight = "weight"
+	// SourceOverride: the override header, from an allowed client.
+	SourceOverride = "override"
 )
 
 // Client is what the gateway knows about a request's client, for sticky
@@ -42,6 +47,10 @@ type Decision struct {
 	// SetCookie, when non-nil, is a sticky cookie to send the client: it
 	// had none (or an invalid one) on a cookie-sticky route.
 	SetCookie *http.Cookie
+	// OverrideRefused is set when the request asked for a variant with
+	// the override header but wasn't allowed to (or named no variant):
+	// the header was ignored.
+	OverrideRefused bool
 }
 
 // Route is a split route's compiled traffic split and its live state:
@@ -55,6 +64,7 @@ type Route struct {
 	salt     string
 	now      func() time.Time
 	signer   *CookieSigner
+	override overrideAllow
 
 	mu      sync.Mutex
 	weights Weights
@@ -93,6 +103,12 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 	r.salt = cfg.Sticky.Salt
 	if r.salt == "" {
 		r.salt = label
+	}
+	if cfg.Override.Enabled {
+		var err error
+		if r.override, err = newOverrideAllow(cfg.Override.Allow); err != nil {
+			return nil, fmt.Errorf("split: route %s: %w", label, err)
+		}
 	}
 	if cfg.Sticky.By == config.StickyCookie {
 		secret, err := cfg.Sticky.Cookie.SigningSecret()
@@ -156,6 +172,20 @@ func (r *Route) Weights() Weights {
 
 // Select chooses req's variant.
 func (r *Route) Select(req *http.Request, c Client) Decision {
+	refused := false
+	if v := req.Header.Get(r.cfg.Override.Header); v != "" && r.cfg.Override.Enabled {
+		if i, ok := r.Index(v); ok && r.override.allows(c) {
+			return r.decide(i, SourceOverride)
+		}
+		refused = true
+	}
+	d := r.byWeight(req, c)
+	d.OverrideRefused = refused
+	return d
+}
+
+// byWeight places the client by its bucket and the current weights.
+func (r *Route) byWeight(req *http.Request, c Client) Decision {
 	w := r.Weights()
 	if r.signer == nil {
 		return r.decide(w.Pick(r.bucket(c)), SourceWeight)
@@ -234,4 +264,55 @@ func (r *Route) bucket(c Client) int {
 		return RandomBucket()
 	}
 	return Bucket(r.salt, id)
+}
+
+// OverrideHeader returns the override header's name, which the proxy
+// strips before forwarding unless forward_header is set.
+func (r *Route) OverrideHeader() string { return r.cfg.Override.Header }
+
+// ForwardOverrideHeader reports whether the override header is passed
+// on to the backend.
+func (r *Route) ForwardOverrideHeader() bool { return r.cfg.Override.ForwardHeader }
+
+// overrideAllow is a compiled override allowlist.
+type overrideAllow struct {
+	anyone bool
+	tiers  map[string]bool
+	keys   [][]byte
+	cidrs  *accesscontrol.PrefixSet
+}
+
+func newOverrideAllow(a config.OverrideAllow) (overrideAllow, error) {
+	o := overrideAllow{anyone: a.Anyone, tiers: map[string]bool{}}
+	for _, t := range a.Tiers {
+		o.tiers[t] = true
+	}
+	for _, k := range a.APIKeys {
+		o.keys = append(o.keys, []byte(k))
+	}
+	set, err := accesscontrol.NewPrefixSet(a.CIDRs)
+	if err != nil {
+		return o, fmt.Errorf("override.allow.cidrs: %w", err)
+	}
+	o.cidrs = set
+	return o, nil
+}
+
+// allows reports whether c may pick a variant: any listed tier, API key
+// (compared in constant time), or address will do.
+func (o overrideAllow) allows(c Client) bool {
+	if o.anyone || (c.Tier != "" && o.tiers[c.Tier]) {
+		return true
+	}
+	if c.APIKey != "" {
+		for _, k := range o.keys {
+			if subtle.ConstantTimeCompare(k, []byte(c.APIKey)) == 1 {
+				return true
+			}
+		}
+	}
+	if addr, err := netip.ParseAddr(c.IP); err == nil && o.cidrs != nil {
+		return o.cidrs.Contains(addr)
+	}
+	return false
 }

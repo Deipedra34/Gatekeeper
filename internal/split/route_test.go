@@ -195,3 +195,97 @@ func TestRoute_CookieWithoutSecretUsesOneSecretPerProcess(t *testing.T) {
 	req.AddCookie(d.SetCookie)
 	assert.Nil(t, b.Select(req, Client{}).SetCookie, "a rebuilt route still accepts the cookie")
 }
+
+func overrideRoute(t *testing.T, allow config.OverrideAllow) *Route {
+	t.Helper()
+	cfg := twoWay()
+	cfg.Override.Enabled = true
+	cfg.Override.Allow = allow
+	return newRoute(t, cfg)
+}
+
+// stableClient finds a client the weights put on stable.
+func stableClient(t *testing.T, r *Route, base Client) Client {
+	t.Helper()
+	for i := range 1000 {
+		c := base
+		c.IP = fmt.Sprintf("10.9.%d.%d", i/256, i%256)
+		if base.IP != "" {
+			c.IP = base.IP
+		}
+		if r.byWeight(get("/api"), c).Name == "stable" {
+			return c
+		}
+		if base.IP != "" {
+			break
+		}
+	}
+	t.Fatal("no stable client found")
+	return Client{}
+}
+
+func withVariantHeader(v string) *http.Request {
+	req := get("/api")
+	req.Header.Set("X-Gatekeeper-Variant", v)
+	return req
+}
+
+func TestRoute_OverrideAllowed(t *testing.T) {
+	r := overrideRoute(t, config.OverrideAllow{
+		Tiers: []string{"internal"}, APIKeys: []string{"tester-key"}, CIDRs: []string{"10.20.0.0/16", "2001:db8::/32"},
+	})
+	for name, c := range map[string]Client{
+		"tier":      {Tier: "internal", IP: "203.0.113.1"},
+		"api key":   {APIKey: "tester-key", IP: "203.0.113.1"},
+		"ipv4 cidr": {IP: "10.20.3.4"},
+		"ipv6 cidr": {IP: "2001:db8::42"},
+		"mapped":    {IP: "::ffff:10.20.3.4"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := r.Select(withVariantHeader("canary"), c)
+			assert.Equal(t, "canary", d.Name)
+			assert.Equal(t, SourceOverride, d.Source)
+			assert.False(t, d.OverrideRefused)
+
+			// Testers can force stable too, and it beats stickiness.
+			assert.Equal(t, "stable", r.Select(withVariantHeader("stable"), c).Name)
+		})
+	}
+}
+
+func TestRoute_OverrideDenied(t *testing.T) {
+	r := overrideRoute(t, config.OverrideAllow{Tiers: []string{"internal"}, APIKeys: []string{"tester-key"}, CIDRs: []string{"10.20.0.0/16"}})
+	for name, c := range map[string]Client{
+		"public client":  {Tier: "default", IP: "203.0.113.1"},
+		"wrong key":      {APIKey: "tester-key-2", IP: "203.0.113.1"},
+		"key prefix":     {APIKey: "tester", IP: "203.0.113.1"},
+		"outside cidr":   {IP: "10.21.0.1"},
+		"no information": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := stableClient(t, r, c)
+			d := r.Select(withVariantHeader("canary"), c)
+			assert.Equal(t, "stable", d.Name, "the header is ignored")
+			assert.Equal(t, SourceWeight, d.Source)
+			assert.True(t, d.OverrideRefused)
+		})
+	}
+}
+
+func TestRoute_OverrideOfAnUnknownVariantIsIgnored(t *testing.T) {
+	r := overrideRoute(t, config.OverrideAllow{Anyone: true})
+	c := stableClient(t, r, Client{})
+	d := r.Select(withVariantHeader("blue"), c)
+	assert.Equal(t, "stable", d.Name)
+	assert.True(t, d.OverrideRefused)
+}
+
+func TestRoute_OverrideDisabledIgnoresTheHeader(t *testing.T) {
+	r := newRoute(t, twoWay())
+	c := stableClient(t, r, Client{})
+	d := r.Select(withVariantHeader("canary"), c)
+	assert.Equal(t, "stable", d.Name)
+	assert.False(t, d.OverrideRefused, "nothing to refuse when overrides are off")
+	assert.Equal(t, "X-Gatekeeper-Variant", r.OverrideHeader())
+	assert.False(t, r.ForwardOverrideHeader())
+}
