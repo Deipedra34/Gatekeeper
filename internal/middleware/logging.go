@@ -2,9 +2,12 @@ package middleware
 
 import (
 	"bufio"
+	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -35,7 +38,8 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // RequestLogger logs one line per request: method, path, status,
 // duration, and remote address — plus trace_id=<id> when the request is
-// being traced, so a log line leads straight to its trace. A proxied
+// being traced, so a log line leads straight to its trace, and
+// variant=<name> when a split route served it from a variant. A proxied
 // WebSocket connection is logged once it closes, as status 101 with the
 // connection's whole lifetime as its duration.
 func RequestLogger(logger *log.Logger) Middleware {
@@ -43,16 +47,35 @@ func RequestLogger(logger *log.Logger) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			notes := &logNotes{}
+			r = r.WithContext(context.WithValue(r.Context(), logNotesKey{}, notes))
 
 			next.ServeHTTP(rec, r)
 
+			line := fmt.Sprintf("%s %s %d %s %s", r.Method, r.URL.Path, rec.status, time.Since(start), r.RemoteAddr)
 			if sc := trace.SpanContextFromContext(r.Context()); sc.HasTraceID() {
-				logger.Printf("%s %s %d %s %s trace_id=%s",
-					r.Method, r.URL.Path, rec.status, time.Since(start), r.RemoteAddr, sc.TraceID())
-				return
+				line += " trace_id=" + sc.TraceID().String()
 			}
-			logger.Printf("%s %s %d %s %s",
-				r.Method, r.URL.Path, rec.status, time.Since(start), r.RemoteAddr)
+			if v := notes.variant.Load(); v != nil {
+				line += " variant=" + *v
+			}
+			logger.Print(line)
 		})
+	}
+}
+
+// logNotes is what handlers further down tell RequestLogger to add to a
+// request's log line.
+type logNotes struct {
+	variant atomic.Pointer[string]
+}
+
+type logNotesKey struct{}
+
+// NoteVariant records the traffic split variant serving the request, for
+// its log line. Without RequestLogger in the chain it does nothing.
+func NoteVariant(ctx context.Context, variant string) {
+	if n, ok := ctx.Value(logNotesKey{}).(*logNotes); ok {
+		n.variant.Store(&variant)
 	}
 }

@@ -114,6 +114,7 @@ func (r *Router) splitClient(req *http.Request) split.Client {
 // header, unless the route forwards it.
 func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Request) (*route, http.ResponseWriter, *http.Request, func()) {
 	d := rt.split.Select(req, r.splitClient(req))
+	middleware.NoteVariant(req.Context(), rt.variants[d.Index].name)
 	if h := rt.split.OverrideHeader(); !rt.split.ForwardOverrideHeader() && req.Header.Get(h) != "" {
 		// Whether or not it was honoured, the backend never sees it:
 		// it's the gateway's to interpret.
