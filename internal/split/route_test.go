@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -127,4 +128,70 @@ func TestRoute_Accessors(t *testing.T) {
 	_, ok = r.Index("blue")
 	assert.False(t, ok)
 	assert.Equal(t, Weights{90, 10}, r.Weights())
+}
+
+func cookieRoute(t *testing.T, secret string) *Route {
+	t.Helper()
+	cfg := twoWay()
+	cfg.Sticky.By = config.StickyCookie
+	cfg.Sticky.Cookie.Secret = secret
+	cfg.Sticky.Cookie.TTL.Duration = time.Hour
+	return newRoute(t, cfg)
+}
+
+func TestRoute_CookieStickiness(t *testing.T) {
+	r := cookieRoute(t, "0123456789abcdef")
+
+	first := r.Select(get("/api"), Client{IP: "10.0.0.1"})
+	require.NotNil(t, first.SetCookie, "a new client gets a cookie")
+	ck := first.SetCookie
+	assert.Equal(t, "gk_variant", ck.Name)
+	assert.Equal(t, "/", ck.Path)
+	assert.Equal(t, 3600, ck.MaxAge)
+	assert.True(t, ck.HttpOnly)
+
+	// With the cookie, the client keeps its variant from any address,
+	// and isn't sent a new cookie.
+	for i := range 20 {
+		req := get("/api")
+		req.AddCookie(&http.Cookie{Name: ck.Name, Value: ck.Value})
+		d := r.Select(req, Client{IP: fmt.Sprintf("192.0.2.%d", i)})
+		assert.Equal(t, first.Name, d.Name)
+		assert.Nil(t, d.SetCookie)
+	}
+}
+
+func TestRoute_CookieClientsSpreadByWeight(t *testing.T) {
+	r := cookieRoute(t, "0123456789abcdef")
+	canary := 0
+	for range 20000 {
+		if r.Select(get("/api"), Client{IP: "10.0.0.1"}).Name == "canary" {
+			canary++
+		}
+	}
+	assert.InDelta(t, 2000, canary, 300, "new clients are placed at random, by weight, even from one address")
+}
+
+func TestRoute_ForgedOrForeignCookiesAreReplaced(t *testing.T) {
+	r := cookieRoute(t, "0123456789abcdef")
+	other := cookieRoute(t, "fedcba9876543210")
+	for _, v := range []string{"9999", "9999.AAAAAAAAAAAAAAAA", other.signer.Sign("/api", 9999)} {
+		req := get("/api")
+		req.AddCookie(&http.Cookie{Name: "gk_variant", Value: v})
+		d := r.Select(req, Client{IP: "10.0.0.1"})
+		assert.NotNil(t, d.SetCookie, "%q is not trusted", v)
+	}
+}
+
+func TestRoute_CookieWithoutSecretUsesOneSecretPerProcess(t *testing.T) {
+	a := cookieRoute(t, "")
+	b := cookieRoute(t, "") // the same route rebuilt, as a reload would
+	assert.True(t, a.RandomCookieSecret())
+	assert.False(t, cookieRoute(t, "0123456789abcdef").RandomCookieSecret())
+	assert.False(t, newRoute(t, twoWay()).RandomCookieSecret())
+
+	d := a.Select(get("/api"), Client{})
+	req := get("/api")
+	req.AddCookie(d.SetCookie)
+	assert.Nil(t, b.Select(req, Client{}).SetCookie, "a rebuilt route still accepts the cookie")
 }

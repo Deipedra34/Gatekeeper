@@ -39,6 +39,9 @@ type Decision struct {
 	// Source says how it was chosen: SourceWeight, SourceOverride, or
 	// SourceRule.
 	Source string
+	// SetCookie, when non-nil, is a sticky cookie to send the client: it
+	// had none (or an invalid one) on a cookie-sticky route.
+	SetCookie *http.Cookie
 }
 
 // Route is a split route's compiled traffic split and its live state:
@@ -51,6 +54,7 @@ type Route struct {
 	baseline int
 	salt     string
 	now      func() time.Time
+	signer   *CookieSigner
 
 	mu      sync.Mutex
 	weights Weights
@@ -90,7 +94,38 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 	if r.salt == "" {
 		r.salt = label
 	}
+	if cfg.Sticky.By == config.StickyCookie {
+		secret, err := cfg.Sticky.Cookie.SigningSecret()
+		if err != nil {
+			return nil, err
+		}
+		if secret == nil {
+			r.signer = processSigner()
+		} else {
+			r.signer = NewCookieSigner(secret)
+		}
+	}
 	return r, nil
+}
+
+var (
+	processSignerOnce sync.Once
+	processSignerVal  *CookieSigner
+)
+
+// processSigner is the signer for cookie-sticky routes without a secret
+// of their own: one random secret for the whole process, so a reload
+// doesn't invalidate every cookie.
+func processSigner() *CookieSigner {
+	processSignerOnce.Do(func() { processSignerVal = NewCookieSigner(nil) })
+	return processSignerVal
+}
+
+// RandomCookieSecret reports whether the route signs sticky cookies with
+// a secret generated at startup (so they don't survive a restart or
+// reach other instances).
+func (r *Route) RandomCookieSecret() bool {
+	return r.signer != nil && r.signer == processSignerVal
 }
 
 // Label returns the route's label.
@@ -121,7 +156,42 @@ func (r *Route) Weights() Weights {
 
 // Select chooses req's variant.
 func (r *Route) Select(req *http.Request, c Client) Decision {
-	return r.decide(r.Weights().Pick(r.bucket(c)), SourceWeight)
+	w := r.Weights()
+	if r.signer == nil {
+		return r.decide(w.Pick(r.bucket(c)), SourceWeight)
+	}
+	bucket, fresh := r.cookieBucket(req)
+	d := r.decide(w.Pick(bucket), SourceWeight)
+	if fresh {
+		d.SetCookie = r.cookie(bucket)
+	}
+	return d
+}
+
+// cookieBucket returns the bucket the request's sticky cookie holds, or
+// a new random one (fresh) when it has no valid cookie.
+func (r *Route) cookieBucket(req *http.Request) (bucket int, fresh bool) {
+	if ck, err := req.Cookie(r.cfg.Sticky.Cookie.Name); err == nil {
+		if b, ok := r.signer.Verify(r.salt, ck.Value); ok {
+			return b, false
+		}
+	}
+	return RandomBucket(), true
+}
+
+// cookie is the sticky cookie holding bucket. It's HttpOnly: scripts have
+// no business with it.
+func (r *Route) cookie(bucket int) *http.Cookie {
+	ck := r.cfg.Sticky.Cookie
+	return &http.Cookie{
+		Name:     ck.Name,
+		Value:    r.signer.Sign(r.salt, bucket),
+		Path:     ck.Path,
+		MaxAge:   int(ck.TTL.Seconds()),
+		Secure:   ck.Secure,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}
 }
 
 func (r *Route) decide(i int, source string) Decision {
