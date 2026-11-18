@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,8 @@ const (
 	SourceWeight = "weight"
 	// SourceOverride: the override header, from an allowed client.
 	SourceOverride = "override"
+	// SourceRule: a match rule.
+	SourceRule = "rule"
 )
 
 // Client is what the gateway knows about a request's client, for sticky
@@ -179,6 +182,14 @@ func (r *Route) Select(req *http.Request, c Client) Decision {
 		}
 		refused = true
 	}
+	for _, rule := range r.cfg.Rules {
+		if matches(rule.Match, req) {
+			i, _ := r.Index(rule.Variant)
+			d := r.decide(i, SourceRule)
+			d.OverrideRefused = refused
+			return d
+		}
+	}
 	d := r.byWeight(req, c)
 	d.OverrideRefused = refused
 	return d
@@ -313,6 +324,35 @@ func (o overrideAllow) allows(c Client) bool {
 	}
 	if addr, err := netip.ParseAddr(c.IP); err == nil && o.cidrs != nil {
 		return o.cidrs.Contains(addr)
+	}
+	return false
+}
+
+// matches reports whether req meets every condition m sets.
+func matches(m config.SplitMatch, req *http.Request) bool {
+	if m.PathPrefix != "" && !strings.HasPrefix(req.URL.Path, m.PathPrefix) {
+		return false
+	}
+	if h := m.Header; h != nil {
+		vals := req.Header.Values(h.Name)
+		if len(vals) == 0 || (h.Value != "" && !contains(vals, h.Value)) {
+			return false
+		}
+	}
+	if ck := m.Cookie; ck != nil {
+		c, err := req.Cookie(ck.Name)
+		if err != nil || (ck.Value != "" && c.Value != ck.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(vals []string, v string) bool {
+	for _, x := range vals {
+		if x == v {
+			return true
+		}
 	}
 	return false
 }

@@ -289,3 +289,62 @@ func TestRoute_OverrideDisabledIgnoresTheHeader(t *testing.T) {
 	assert.Equal(t, "X-Gatekeeper-Variant", r.OverrideHeader())
 	assert.False(t, r.ForwardOverrideHeader())
 }
+
+func ruleRoute(t *testing.T, rules ...config.SplitRule) *Route {
+	t.Helper()
+	cfg := twoWay()
+	cfg.Rules = rules
+	cfg.Override.Enabled = true
+	cfg.Override.Allow = config.OverrideAllow{Tiers: []string{"internal"}}
+	return newRoute(t, cfg)
+}
+
+func TestRoute_MatchRules(t *testing.T) {
+	r := ruleRoute(t,
+		config.SplitRule{Variant: "canary", Match: config.SplitMatch{Header: &config.ValueMatch{Name: "X-Tester", Value: "yes"}}},
+		config.SplitRule{Variant: "canary", Match: config.SplitMatch{Cookie: &config.ValueMatch{Name: "beta"}}},
+		config.SplitRule{Variant: "canary", Match: config.SplitMatch{PathPrefix: "/api/v2", Header: &config.ValueMatch{Name: "X-Beta"}}},
+	)
+	c := stableClient(t, r, Client{})
+
+	req := get("/api")
+	req.Header.Set("X-Tester", "yes")
+	d := r.Select(req, c)
+	assert.Equal(t, "canary", d.Name)
+	assert.Equal(t, SourceRule, d.Source)
+
+	req = get("/api")
+	req.Header.Set("X-Tester", "no")
+	assert.Equal(t, "stable", r.Select(req, c).Name, "the value must match")
+
+	req = get("/api")
+	req.AddCookie(&http.Cookie{Name: "beta", Value: "anything"})
+	assert.Equal(t, "canary", r.Select(req, c).Name, "a cookie without a value matches by presence")
+
+	req = get("/api/v2/items")
+	assert.Equal(t, "stable", r.Select(req, c).Name, "every condition must hold")
+	req.Header.Set("X-Beta", "1")
+	assert.Equal(t, "canary", r.Select(req, c).Name)
+
+	assert.Equal(t, "stable", r.Select(get("/api/v1"), c).Name)
+}
+
+func TestRoute_RulesComeInOrderAndAfterAnAllowedOverride(t *testing.T) {
+	r := ruleRoute(t,
+		config.SplitRule{Variant: "stable", Match: config.SplitMatch{PathPrefix: "/api/legacy"}},
+		config.SplitRule{Variant: "canary", Match: config.SplitMatch{PathPrefix: "/api"}},
+	)
+	assert.Equal(t, "stable", r.Select(get("/api/legacy/x"), Client{}).Name, "the first matching rule wins")
+	assert.Equal(t, "canary", r.Select(get("/api/new"), Client{}).Name)
+
+	// An allowed override beats a rule; a refused one doesn't.
+	req := withVariantHeader("stable")
+	req.URL.Path = "/api/new"
+	d := r.Select(req, Client{Tier: "internal"})
+	assert.Equal(t, "stable", d.Name)
+	assert.Equal(t, SourceOverride, d.Source)
+	d = r.Select(req, Client{Tier: "default"})
+	assert.Equal(t, "canary", d.Name)
+	assert.Equal(t, SourceRule, d.Source)
+	assert.True(t, d.OverrideRefused)
+}
