@@ -12,3 +12,4 @@ format: Title, Status, Context, Decision, Consequences.
 7. [Admin API on a separate, authenticated listener](0007-admin-api-separate-listener.md)
 8. [Request and response transformation with a fixed variable whitelist](0008-request-response-transformation.md)
 9. [IP access control: sorted range tables and right-most-untrusted client addresses](0009-ip-access-control.md)
+10. [Traffic splitting: bucket hashing in config order and one-way, per-instance rollback](0010-traffic-splitting.md)

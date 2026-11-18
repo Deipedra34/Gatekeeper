@@ -2121,7 +2121,7 @@ A lookup is a binary search over merged ranges, so it stays in the tens of nanos
 
 ## Architecture Decisions
 
-Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address — live in [`docs/adr/`](docs/adr/).
+Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address, how traffic splits assign clients and roll back — live in [`docs/adr/`](docs/adr/).
 
 ## Configuration reference
 
