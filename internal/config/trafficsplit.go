@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"reflect"
+	"time"
 )
 
 // TrafficSplitConfig splits a route's traffic between named variants
@@ -281,4 +282,61 @@ func (ts *TrafficSplitConfig) validateWeights() error {
 		return fmt.Errorf("traffic_split: variant weights must add up to 100, got %d", sum)
 	}
 	return nil
+}
+
+// Traffic split defaults.
+const (
+	DefaultVariantHeader       = "X-Gatekeeper-Variant"
+	DefaultStickyCookieName    = "gk_variant"
+	DefaultStickyCookieTTL     = 24 * time.Hour
+	DefaultRollbackWindow      = 5 * time.Minute
+	DefaultRollbackMinRequests = 100
+	DefaultRollbackCooldown    = 10 * time.Minute
+)
+
+// applyTrafficSplitDefaults fills unset traffic split fields on every
+// split route.
+func (c *Config) applyTrafficSplitDefaults() {
+	for i := range c.Routes {
+		ts := c.Routes[i].TrafficSplit
+		if ts == nil {
+			continue
+		}
+		if ts.Baseline == "" && len(ts.Variants) > 0 {
+			ts.Baseline = ts.Variants[0].Name
+		}
+		if ts.Sticky.By == "" {
+			ts.Sticky.By = StickyClientIP
+		}
+		ck := &ts.Sticky.Cookie
+		if ck.Name == "" {
+			ck.Name = DefaultStickyCookieName
+		}
+		if ck.TTL.Duration == 0 {
+			ck.TTL.Duration = DefaultStickyCookieTTL
+		}
+		if ck.Path == "" {
+			ck.Path = "/"
+		}
+		if ts.Override.Header == "" {
+			ts.Override.Header = DefaultVariantHeader
+		}
+		for j := range ts.Variants {
+			if ar := ts.Variants[j].AutoRollback; ar != nil {
+				ar.applyDefaults()
+			}
+		}
+	}
+}
+
+func (ar *AutoRollbackConfig) applyDefaults() {
+	if ar.Window.Duration == 0 {
+		ar.Window.Duration = DefaultRollbackWindow
+	}
+	if ar.MinRequests == 0 {
+		ar.MinRequests = DefaultRollbackMinRequests
+	}
+	if ar.Cooldown.Duration == 0 {
+		ar.Cooldown.Duration = DefaultRollbackCooldown
+	}
 }

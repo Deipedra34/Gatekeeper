@@ -498,6 +498,7 @@ func (c *Config) applyDefaults() {
 	c.Admin.applyDefaults()
 	c.applyTransformDefaults()
 	c.applyAccessControlDefaults()
+	c.applyTrafficSplitDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
