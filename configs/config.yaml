@@ -246,6 +246,41 @@ cors:
 #     mode: allowlist_only           # off, denylist, or allowlist_only
 #     allow: ["10.0.0.0/8", "2001:db8:ops::/48"]
 #     deny_status: 404               # hide the route from everyone else
+#
+# A route can split its traffic between variants (canary releases, A/B
+# tests; see README.md's "Traffic splitting"). The route then has no
+# target or backends of its own: each variant has its own, configured
+# like a route's (target or backends, lb_strategy, health checks), with
+# retries, health checks, and circuit breakers staying inside it.
+# Weights must add up to 100. A route without traffic_split is proxied
+# exactly as before.
+#   traffic_split:
+#     variants:
+#       - name: stable                 # list the stable variant first
+#         weight: 90
+#         target: "http://localhost:9001"
+#       - name: canary
+#         weight: 10
+#         backends: [{target: "http://localhost:9011"}, {target: "http://localhost:9012"}]
+#         auto_rollback:               # take its traffic away if it does worse than stable
+#           window: 5m                 # default 5m
+#           min_requests: 100          # default 100; smaller samples are never judged
+#           max_error_rate_increase: 0.05   # 5xx rate more than 5 points above stable's
+#           max_p95_latency_ratio: 1.5      # p95 more than 1.5x stable's
+#           cooldown: 10m              # no traffic back without force (default 10m)
+#     baseline: stable                 # default: the first variant
+#     sticky:
+#       by: client_ip                  # client_ip (default), api_key, jwt_subject, client_cert, cookie
+#       # cookie: {name: gk_variant, ttl: 24h, secret_env: GATEKEEPER_SPLIT_COOKIE_SECRET}
+#     override:                        # let testers pick a variant with a header
+#       enabled: false
+#       header: X-Gatekeeper-Variant   # default; removed before forwarding
+#       allow: {tiers: [internal], cidrs: ["10.0.0.0/8"]}
+#     rules:                           # fixed variant for matching requests
+#       - variant: canary
+#         match: {header: {name: X-Tester, value: "true"}}
+#     rollout: {variant: canary, steps: [5, 25, 50, 100], interval: 30m}
+#     response_header: X-Gatekeeper-Variant   # default: off
 routes:
   - path_prefix: "/ws"
     target: "http://localhost:9000"
