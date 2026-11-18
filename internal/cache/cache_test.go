@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,4 +142,17 @@ func TestCache_StatsCountHitsMissesAndEntriesByRoute(t *testing.T) {
 	assert.Equal(t, map[string]int{"/a": 2, "/b": 1}, stats.EntriesByRoute)
 	assert.Equal(t, int64(1), stats.Hits)
 	assert.Equal(t, int64(1), stats.Misses)
+}
+
+func TestVariantKey_SeparatesVariants(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/items?page=2", nil)
+	plain := Key("/api", "http://b:1", req)
+	stable := VariantKey("/api", "stable", "http://b:1", req)
+	canary := VariantKey("/api", "canary", "http://b:1", req)
+
+	assert.NotEqual(t, stable, canary, "the same request on two variants")
+	assert.NotEqual(t, plain, stable, "and neither is the unsplit route's key")
+	assert.Equal(t, plain, VariantKey("/api", "", "http://b:1", req), "no variant is the plain key")
+	assert.Equal(t, canary, VariantKey("/api", "canary", "http://b:1", req), "deterministic")
+	assert.True(t, strings.HasPrefix(canary, keyPrefix))
 }

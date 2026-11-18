@@ -74,6 +74,9 @@ type route struct {
 	// replaced by that variant's (see selectVariant). Nil otherwise.
 	split    *split.Route
 	variants []variant
+	// variant names the variant serving the request, on a route copy
+	// selectVariant made; "" otherwise.
+	variant string
 }
 
 // Router dispatches requests to the backend whose route matches, based
@@ -473,6 +476,9 @@ func (r *Router) cacheableRequest(rt *route, req *http.Request) bool {
 func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, rt *route, vary []string) {
 	ctx := req.Context()
 	key := cache.Key(rt.label, rt.cacheTarget, req, vary...)
+	if rt.variant != "" {
+		key = cache.VariantKey(rt.label, rt.variant, rt.cacheTarget, req, vary...)
+	}
 
 	_, span := tracing.Start(ctx, tracing.SpanCacheLookup, trace.WithAttributes(tracing.AttrHTTPRoute.String(rt.label)))
 	entry, hit, err := r.cache.Get(ctx, key)

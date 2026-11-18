@@ -96,12 +96,27 @@ func New(st store.Store) *Cache {
 // never share an entry. Without extra the key is exactly what it always
 // was, so existing entries stay valid.
 func Key(routeLabel, target string, r *http.Request, extra ...string) string {
+	return key(routeLabel, "", target, r, extra)
+}
+
+// VariantKey is Key for a request a split route served from variant:
+// each variant has entries of its own, so a canary's responses are never
+// served to stable's clients or the other way round, whatever their
+// backends.
+func VariantKey(routeLabel, variant, target string, r *http.Request, extra ...string) string {
+	return key(routeLabel, variant, target, r, extra)
+}
+
+func key(routeLabel, variant, target string, r *http.Request, extra []string) string {
 	h := sha256.New()
 	writePart := func(s string) {
 		h.Write([]byte(s))
 		h.Write([]byte{0})
 	}
 	writePart(routeLabel)
+	if variant != "" {
+		writePart("variant:" + variant)
+	}
 	writePart(target)
 	writePart(r.Method)
 	writePart(r.URL.RequestURI())

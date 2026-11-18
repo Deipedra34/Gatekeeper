@@ -54,11 +54,9 @@ func (r *Router) buildVariants(rt config.Route, label string, proxyCfg config.Pr
 			return nil, nil, err
 		}
 		variants[i] = variant{
-			name: vc.Name,
-			pool: pool,
-			// Two variants never share a cache entry, even if their
-			// backends answered alike.
-			cacheTarget: "variant=" + vc.Name + "," + cacheTarget,
+			name:        vc.Name,
+			pool:        pool,
+			cacheTarget: cacheTarget,
 			proxy: &httputil.ReverseProxy{
 				Director:     director,
 				ErrorHandler: errorHandler(label),
@@ -130,6 +128,7 @@ func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Reque
 
 	vrt := *rt
 	vrt.pool, vrt.proxy, vrt.cacheTarget = v.pool, v.proxy, v.cacheTarget
+	vrt.variant = v.name
 
 	start := time.Now()
 	rec := &variantRecorder{ResponseWriter: w, status: http.StatusOK}
