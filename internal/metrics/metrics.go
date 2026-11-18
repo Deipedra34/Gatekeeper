@@ -2,7 +2,8 @@
 // endpoint: counts of allowed/rejected requests per client and tier,
 // the rate limiter's current remaining allowance per client, request
 // latency, authentication successes/failures by method, WebSocket
-// connection activity per route, and TLS handshake/certificate state.
+// connection activity per route, TLS handshake/certificate state, and
+// traffic split variants' requests, errors, latency, and weights.
 package metrics
 
 import (
@@ -150,8 +151,58 @@ type Metrics struct {
 
 	activeBans *activeBansCollector
 
+	// VariantRequests, VariantErrors, and VariantDuration count the
+	// requests each variant of a split route served, those that ended in
+	// a 5xx, and their latency, by route and variant. Upgraded WebSocket
+	// connections aren't counted.
+	VariantRequests *prometheus.CounterVec
+	VariantErrors   *prometheus.CounterVec
+	VariantDuration *prometheus.HistogramVec
+
+	// VariantRollbacks counts variants rolled back, by route, variant,
+	// and trigger: "error_rate" or "latency" (automatic), or "manual".
+	VariantRollbacks *prometheus.CounterVec
+
+	variantWeights *variantWeightCollector
+
 	backends *backendCollector
 }
+
+// VariantWeight is a variant's current share of its route's traffic.
+type VariantWeight struct {
+	Route, Variant string
+	Weight         int
+}
+
+// variantWeightCollector reports every split route's current weights at
+// scrape time, so rollout steps and rollbacks show up without anything
+// having to push them.
+type variantWeightCollector struct {
+	desc   *prometheus.Desc
+	source atomic.Pointer[func() []VariantWeight]
+}
+
+func (c *variantWeightCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c *variantWeightCollector) Collect(ch chan<- prometheus.Metric) {
+	src := c.source.Load()
+	if src == nil {
+		return
+	}
+	for _, w := range (*src)() {
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(w.Weight), w.Route, w.Variant)
+	}
+}
+
+// SetVariantWeightSource tells /metrics where to read split routes'
+// current weights.
+func (m *Metrics) SetVariantWeightSource(src func() []VariantWeight) {
+	m.variantWeights.source.Store(&src)
+}
+
+// VariantWeightCollector is the collector behind
+// gatekeeper_variant_weight_percent, exposed for tests.
+func (m *Metrics) VariantWeightCollector() prometheus.Collector { return m.variantWeights }
 
 // activeBansCollector reports the number of active bans, read from the
 // shared store at scrape time, so every instance reports the same
@@ -420,6 +471,27 @@ func New() *Metrics {
 			Name: "gatekeeper_access_control_bans_total",
 			Help: "Total number of client address bans issued by this instance, by source (auto or manual).",
 		}, []string{"source"}),
+		VariantRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_variant_requests_total",
+			Help: "Total number of requests each variant of a split route served, by route and variant.",
+		}, []string{"route", "variant"}),
+		VariantErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_variant_errors_total",
+			Help: "Total number of requests each variant of a split route answered with a 5xx, by route and variant.",
+		}, []string{"route", "variant"}),
+		VariantDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gatekeeper_variant_request_duration_seconds",
+			Help:    "Latency of requests served by each variant of a split route, by route and variant.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"route", "variant"}),
+		VariantRollbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_variant_rollbacks_total",
+			Help: "Total number of times a variant of a split route was rolled back, by route, variant, and trigger (error_rate, latency, manual).",
+		}, []string{"route", "variant", "trigger"}),
+		variantWeights: &variantWeightCollector{
+			desc: prometheus.NewDesc("gatekeeper_variant_weight_percent",
+				"Current share of a split route's traffic each variant gets, in percent.", []string{"route", "variant"}, nil),
+		},
 		activeBans: &activeBansCollector{
 			desc: prometheus.NewDesc("gatekeeper_access_control_active_bans",
 				"Number of client addresses currently banned, across every instance sharing the store.", nil, nil),
@@ -462,6 +534,11 @@ func New() *Metrics {
 		m.AccessBlocked,
 		m.BansIssued,
 		m.activeBans,
+		m.VariantRequests,
+		m.VariantErrors,
+		m.VariantDuration,
+		m.VariantRollbacks,
+		m.variantWeights,
 		m.backends,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
