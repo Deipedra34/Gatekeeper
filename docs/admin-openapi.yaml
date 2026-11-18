@@ -411,6 +411,83 @@ paths:
         "429": { $ref: "#/components/responses/TooManyAuthFailures" }
         "502": { $ref: "#/components/responses/StoreError" }
 
+  /admin/v1/routes/{route}/split:
+    get:
+      tags: [read]
+      summary: A route's traffic split
+      description: |
+        The current weight of every variant (with its configured weight
+        and any post-rollback cooldown), the rollout's progress, whether an
+        operator or a rollback is in control of the weights, and the last
+        rollback.
+      operationId: getSplit
+      parameters:
+        - $ref: "#/components/parameters/RouteID"
+      responses:
+        "200":
+          description: The route's split
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Split" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The route has no traffic_split
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+    post:
+      tags: [actions]
+      summary: Change a route's traffic split
+      x-destructive: true
+      description: |
+        - `set`: give every variant a new weight (adding up to 100). The
+          rollout, if any, stops until `resume`.
+        - `pause` / `resume`: freeze the rollout at its step, or carry on.
+          After a `set`, `promote`, or rollback, `resume` returns to the
+          configured behaviour: the rollout starts again from its first
+          step, or the configured weights come back.
+        - `promote`: send all traffic to one variant.
+        - `rollback`: take all of one variant's traffic away and give it
+          to the baseline.
+
+        `promote` and `rollback` default to the rollout's variant, or with
+        two variants to the one that isn't the baseline. Giving traffic to
+        a variant cooling down after an automatic rollback answers 409
+        unless `force` is set. Changes apply to this instance; the weights
+        are kept across config reloads that leave the route's weights,
+        rollout, and guardrails unchanged.
+      operationId: changeSplit
+      parameters:
+        - $ref: "#/components/parameters/RouteID"
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SplitRequest" }
+      responses:
+        "200":
+          description: Applied (or, with dry_run, checked but not applied)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SplitResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            The route has no traffic_split, there's no rollout to pause or
+            nothing to resume, the variant has no traffic to roll back (or
+            is the baseline), or it's cooling down and force wasn't set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
 components:
   securitySchemes:
     bearerToken:
@@ -450,6 +527,16 @@ components:
       required: true
       description: Backend ID from /admin/v1/backends or /admin/v1/routes.
       schema: { type: string, pattern: "^[0-9a-f]{12}$" }
+    RouteID:
+      name: route
+      in: path
+      required: true
+      description: |
+        The route's id from /admin/v1/routes, its label with slashes
+        escaped (%2Fapi), or its path prefix without the leading slash
+        (api).
+      schema: { type: string }
+      example: "%2Fapi"
 
   responses:
     Unauthorized:
@@ -535,6 +622,7 @@ components:
     Route:
       type: object
       properties:
+        id: { type: string, description: "Identifies the route in admin paths", example: "8c8c7e3b2a1f" }
         label: { type: string }
         path_prefix: { type: string }
         host: { type: string }
@@ -549,6 +637,7 @@ components:
               id: { type: string }
               target: { type: string }
               weight: { type: integer }
+              variant: { type: string, description: "On a split route, the variant the backend serves" }
         cache:
           type: object
           properties:
@@ -728,3 +817,61 @@ components:
         - type: object
           properties:
             ip: { type: string }
+
+    Split:
+      type: object
+      properties:
+        route: { type: string }
+        baseline: { type: string }
+        variants:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              weight: { type: integer, minimum: 0, maximum: 100 }
+              configured_weight: { type: integer }
+              cooldown_until: { type: string, format: date-time }
+        manual:
+          type: boolean
+          description: An operator or a rollback set the weights; resume undoes it
+        rollout:
+          type: object
+          properties:
+            variant: { type: string }
+            steps: { type: array, items: { type: integer } }
+            interval: { type: string, example: "10m0s" }
+            step: { type: integer, description: Index into steps }
+            weight: { type: integer }
+            state: { type: string, enum: [running, paused, completed, stopped] }
+            next_step_at: { type: string, format: date-time }
+        last_rollback:
+          type: object
+          properties:
+            variant: { type: string }
+            trigger: { type: string, enum: [error_rate, latency, manual] }
+            reason: { type: string }
+            auto: { type: boolean }
+            at: { type: string, format: date-time }
+
+    SplitRequest:
+      type: object
+      required: [action]
+      additionalProperties: false
+      properties:
+        action: { type: string, enum: [set, pause, resume, promote, rollback] }
+        weights:
+          type: object
+          additionalProperties: { type: integer, minimum: 0, maximum: 100 }
+          description: For set, every variant's weight, adding up to 100
+          example: { stable: 75, canary: 25 }
+        variant: { type: string, description: For promote and rollback }
+        reason: { type: string, maxLength: 200, description: Recorded with a rollback }
+        force: { type: boolean, description: Give traffic to a variant that's cooling down }
+
+    SplitResult:
+      allOf:
+        - $ref: "#/components/schemas/ActionResult"
+        - type: object
+          properties:
+            split: { $ref: "#/components/schemas/Split" }
