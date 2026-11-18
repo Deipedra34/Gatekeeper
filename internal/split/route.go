@@ -2,6 +2,7 @@ package split
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -72,6 +73,14 @@ type Route struct {
 
 	onEvent func(Event)
 
+	// state is what changes while the route serves: shared with the
+	// route that replaces this one on a reload, if that one's weights,
+	// rollout, and guardrails are configured the same (see Adopt).
+	*state
+}
+
+// state is a route's live state.
+type state struct {
 	configured Weights // the weights in the config
 
 	guards   []*guard
@@ -134,7 +143,7 @@ func NewRoute(label string, cfg config.TrafficSplitConfig, opts ...Option) (*Rou
 	if len(cfg.Variants) == 0 {
 		return nil, fmt.Errorf("split: route %s has no variants", label)
 	}
-	r := &Route{label: label, cfg: cfg, now: time.Now, baseline: -1, cooldown: map[int]time.Time{}}
+	r := &Route{label: label, cfg: cfg, now: time.Now, baseline: -1, state: &state{cooldown: map[int]time.Time{}}}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -488,4 +497,39 @@ func contains(vals []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// stateKey is the part of a traffic split its live state depends on:
+// the variants and their weights, the baseline, the rollout, and the
+// guardrails. Stickiness, overrides, rules, the response header, and
+// each variant's backends can change without touching it.
+func stateKey(cfg config.TrafficSplitConfig) string {
+	type variant struct {
+		Name         string
+		Weight       int
+		AutoRollback *config.AutoRollbackConfig
+	}
+	key := struct {
+		Variants []variant
+		Baseline string
+		Rollout  *config.RolloutConfig
+	}{Baseline: cfg.Baseline, Rollout: cfg.Rollout}
+	for _, v := range cfg.Variants {
+		key.Variants = append(key.Variants, variant{v.Name, v.Weight, v.AutoRollback})
+	}
+	b, _ := json.Marshal(key)
+	return string(b)
+}
+
+// Adopt makes r share prev's live state — weights an operator set, the
+// rollout's progress, the last rollback, cooldowns, and the guardrails'
+// windows — when both are configured alike (see stateKey). It reports
+// whether it did; otherwise r keeps the fresh state built from its
+// config. Call it before r serves anything.
+func (r *Route) Adopt(prev *Route) bool {
+	if prev == nil || stateKey(prev.cfg) != stateKey(r.cfg) {
+		return false
+	}
+	r.state = prev.state
+	return true
 }
