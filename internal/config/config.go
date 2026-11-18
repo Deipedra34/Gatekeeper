@@ -285,6 +285,11 @@ type Route struct {
 	// AccessControl overrides the global access_control allow/deny
 	// settings for this route. Nil inherits them.
 	AccessControl *RouteAccessControl `yaml:"access_control,omitempty"`
+
+	// TrafficSplit splits the route's traffic between variants, each with
+	// its own backends; the route then has no target or backends of its
+	// own. Nil proxies the route as before.
+	TrafficSplit *TrafficSplitConfig `yaml:"traffic_split,omitempty"`
 }
 
 // DefaultWSIdleTimeout is the WebSocket idle timeout applied to a route
