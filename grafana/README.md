@@ -17,6 +17,7 @@
 | Response cache | Hit ratio by route, hits vs misses | `gatekeeper_cache_hits_total`, `gatekeeper_cache_misses_total` |
 | Backend retries | Retry rate by route, retry count over the selected range, proxy outcomes after retries | `gatekeeper_proxy_retries_total`, `gatekeeper_proxy_request_outcomes_total` |
 | Load balancing | Backends in rotation per route, per-backend health over time, requests per backend (by outcome), active connections per backend, passive ejections and per-backend circuit breaker state, health check results | `gatekeeper_route_backends_in_rotation`, `gatekeeper_backend_up`, `gatekeeper_backend_requests_total`, `gatekeeper_backend_active_connections`, `gatekeeper_backend_ejections_total`, `gatekeeper_backend_circuit_breaker_state`, `gatekeeper_backend_health_checks_total` |
+| Traffic splitting | Each variant's current weight, requests per variant, 5xx error rate and p95 latency per variant (what the auto-rollback guardrails compare), and rollbacks by trigger | `gatekeeper_variant_weight_percent`, `gatekeeper_variant_requests_total`, `gatekeeper_variant_errors_total`, `gatekeeper_variant_request_duration_seconds`, `gatekeeper_variant_rollbacks_total` |
 
 The dashboard has four variables at the top: **Data source** (any Prometheus data source), **Tier**, **Client**, and **Route**. Tier and Client filter the rate-limiting panels, and Route filters the latency, cache, and retry panels.
 
