@@ -1,0 +1,130 @@
+package split
+
+import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"gatekeeper/internal/config"
+)
+
+// twoWay is a 90/10 stable/canary split.
+func twoWay() config.TrafficSplitConfig {
+	return config.TrafficSplitConfig{
+		Variants: []config.VariantConfig{
+			{Name: "stable", Weight: 90, Target: "http://stable:1"},
+			{Name: "canary", Weight: 10, Target: "http://canary:1"},
+		},
+		Baseline: "stable",
+		Sticky:   config.StickyConfig{By: config.StickyClientIP, Cookie: config.StickyCookieConfig{Name: "gk_variant", Path: "/"}},
+		Override: config.OverrideConfig{Header: config.DefaultVariantHeader},
+	}
+}
+
+func newRoute(t *testing.T, cfg config.TrafficSplitConfig, opts ...Option) *Route {
+	t.Helper()
+	r, err := NewRoute("/api", cfg, opts...)
+	require.NoError(t, err)
+	return r
+}
+
+func get(path string) *http.Request { return httptest.NewRequest(http.MethodGet, path, nil) }
+
+func TestRoute_SameClientSameVariant(t *testing.T) {
+	r := newRoute(t, twoWay())
+	for i := range 500 {
+		c := Client{IP: fmt.Sprintf("198.51.100.%d", i%256), Tier: "default"}
+		first := r.Select(get("/api"), c)
+		assert.Equal(t, SourceWeight, first.Source)
+		for range 5 {
+			assert.Equal(t, first, r.Select(get("/api/other?x=1"), c), "client %s", c.IP)
+		}
+	}
+}
+
+func TestRoute_DistributionFollowsWeights(t *testing.T) {
+	r := newRoute(t, twoWay())
+	const n = 50000
+	canary := 0
+	for i := range n {
+		if r.Select(get("/api"), Client{IP: fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255)}).Name == "canary" {
+			canary++
+		}
+	}
+	assert.InDelta(t, 0.10, float64(canary)/n, 0.01)
+}
+
+func TestRoute_StickyByIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		by     string
+		client func(i int) Client
+	}{
+		{config.StickyAPIKey, func(i int) Client { return Client{APIKey: fmt.Sprintf("key-%d", i), IP: fmt.Sprintf("10.0.0.%d", i%7)} }},
+		{config.StickyJWTSubject, func(i int) Client { return Client{JWTSubject: fmt.Sprintf("user-%d", i), IP: "10.0.0.1"} }},
+		{config.StickyClientCert, func(i int) Client { return Client{CertID: fmt.Sprintf("svc-%d", i), IP: "10.0.0.1"} }},
+	} {
+		t.Run(tc.by, func(t *testing.T) {
+			cfg := twoWay()
+			cfg.Sticky.By = tc.by
+			r := newRoute(t, cfg)
+			canary := 0
+			for i := range 4000 {
+				c := tc.client(i)
+				d := r.Select(get("/api"), c)
+				// The same identity from another address keeps its variant.
+				c.IP = "203.0.113.99"
+				assert.Equal(t, d, r.Select(get("/api"), c))
+				if d.Name == "canary" {
+					canary++
+				}
+			}
+			assert.InDelta(t, 400, canary, 120, "the identity, not the shared IP, decides")
+		})
+	}
+}
+
+func TestRoute_MissingIdentityFallsBackToIP(t *testing.T) {
+	cfg := twoWay()
+	cfg.Sticky.By = config.StickyAPIKey
+	r := newRoute(t, cfg)
+	byIP := newRoute(t, twoWay())
+	for i := range 200 {
+		c := Client{IP: fmt.Sprintf("192.0.2.%d", i)}
+		assert.Equal(t, byIP.Select(get("/"), c), r.Select(get("/"), c))
+	}
+}
+
+func TestRoute_SaltDefaultsToTheLabel(t *testing.T) {
+	cfg := twoWay()
+	a := newRoute(t, cfg)
+	cfg.Sticky.Salt = "/api"
+	b := newRoute(t, cfg)
+	cfg.Sticky.Salt = "reshuffle"
+	c := newRoute(t, cfg)
+	moved := 0
+	for i := range 1000 {
+		cl := Client{IP: fmt.Sprintf("192.0.2.%d", i%256) + fmt.Sprint(i/256)}
+		assert.Equal(t, a.Select(get("/"), cl), b.Select(get("/"), cl))
+		if a.Select(get("/"), cl) != c.Select(get("/"), cl) {
+			moved++
+		}
+	}
+	assert.Positive(t, moved, "a new salt reshuffles")
+}
+
+func TestRoute_Accessors(t *testing.T) {
+	r := newRoute(t, twoWay())
+	assert.Equal(t, "/api", r.Label())
+	assert.Equal(t, []string{"stable", "canary"}, r.Names())
+	assert.Equal(t, 0, r.Baseline())
+	i, ok := r.Index("canary")
+	assert.True(t, ok)
+	assert.Equal(t, 1, i)
+	_, ok = r.Index("blue")
+	assert.False(t, ok)
+	assert.Equal(t, Weights{90, 10}, r.Weights())
+}
