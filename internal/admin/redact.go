@@ -21,6 +21,8 @@ const redacted = "[REDACTED]"
 //     become their fingerprints ("key:<12 hex>"), as in /metrics;
 //   - auth.jwt.secret, storage.redis.password, and each admin token's
 //     sha256 become "[REDACTED]";
+//   - traffic_split.sticky.cookie.secret becomes "[REDACTED]", and
+//     override.allow.api_keys become their fingerprints;
 //   - credentials embedded in backend or collector URLs are dropped.
 //
 // Then, as a safety net, any other string anywhere in the tree that
@@ -84,6 +86,19 @@ func redactedConfig(cfg *config.Config) (map[string]any, error) {
 				}
 			}
 			secrets = append(secrets, redactTransformValues(m)...)
+		}
+	}
+	for _, rt := range cfg.Routes {
+		if ts := rt.TrafficSplit; ts != nil {
+			secrets = append(secrets, ts.Sticky.Cookie.Secret)
+			secrets = append(secrets, ts.Override.Allow.APIKeys...)
+		}
+	}
+	if routes, ok := tree["routes"].([]any); ok {
+		for _, rt := range routes {
+			if m, ok := rt.(map[string]any); ok {
+				secrets = append(secrets, redactTrafficSplit(m)...)
+			}
 		}
 	}
 	if tr, ok := tree["tracing"].(map[string]any); ok {
@@ -223,4 +238,61 @@ func stripURLCredentials(m map[string]any, key string) {
 		u.User = nil
 		m[key] = u.String()
 	}
+}
+
+// redactTrafficSplit removes a route's traffic split secrets: the sticky
+// cookie's signing secret, the API keys allowed to override, credentials
+// in variants' backend URLs, and values matched on sensitive-looking
+// headers or cookies. It returns what it removed.
+func redactTrafficSplit(route map[string]any) []string {
+	ts, ok := route["traffic_split"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var removed []string
+	if v, ok := getPath(ts, "sticky", "cookie", "secret").(string); ok && v != "" {
+		setPath(ts, redacted, "sticky", "cookie", "secret")
+		removed = append(removed, v)
+	}
+	if keys, ok := getPath(ts, "override", "allow", "api_keys").([]any); ok {
+		for i, k := range keys {
+			removed = append(removed, fmt.Sprint(k))
+			keys[i] = middleware.APIKeyFingerprint(fmt.Sprint(k))
+		}
+	}
+	if variants, ok := ts["variants"].([]any); ok {
+		for _, v := range variants {
+			vm, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			stripURLCredentials(vm, "target")
+			if backends, ok := vm["backends"].([]any); ok {
+				for _, b := range backends {
+					if bm, ok := b.(map[string]any); ok {
+						stripURLCredentials(bm, "target")
+					}
+				}
+			}
+		}
+	}
+	if rules, ok := ts["rules"].([]any); ok {
+		for _, r := range rules {
+			rm, ok := r.(map[string]any)
+			if !ok {
+				continue
+			}
+			for _, kind := range []string{"header", "cookie"} {
+				m, ok := getPath(rm, "match", kind).(map[string]any)
+				if !ok || !sensitiveName(fmt.Sprint(m["name"])) {
+					continue
+				}
+				if v, ok := m["value"].(string); ok && v != "" {
+					removed = append(removed, v)
+					m["value"] = redacted
+				}
+			}
+		}
+	}
+	return removed
 }
