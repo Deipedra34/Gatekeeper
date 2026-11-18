@@ -167,6 +167,9 @@ func (p PassiveHealthConfig) WithDefaults() PassiveHealthConfig {
 // validateBackends checks the route's target/backends, strategy, and
 // health settings.
 func (r Route) validateBackends() error {
+	if r.TrafficSplit != nil {
+		return r.validateSplitBackends()
+	}
 	switch {
 	case r.Target != "" && len(r.Backends) > 0:
 		return fmt.Errorf("set either target or backends, not both")

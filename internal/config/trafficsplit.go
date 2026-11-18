@@ -1,5 +1,10 @@
 package config
 
+import (
+	"fmt"
+	"reflect"
+)
+
 // TrafficSplitConfig splits a route's traffic between named variants
 // (for example "stable" and "canary"), each with its own backend group.
 // A route without it is proxied exactly as before.
@@ -176,4 +181,78 @@ type AutoRollbackConfig struct {
 	// be raised again (by a rollout resume or a weight change) without
 	// forcing it. Defaults to 10m.
 	Cooldown Duration `yaml:"cooldown"`
+}
+
+// VariantRoute returns the route as variant i sees it: the route's own
+// settings (auth, cache, circuit breaker, backend TLS, transforms, ...)
+// with the variant's backend group in place of the route's. LB and
+// health check settings the variant leaves unset are the route's.
+func (r Route) VariantRoute(i int) Route {
+	v := r.TrafficSplit.Variants[i]
+	out := r
+	out.TrafficSplit = nil
+	out.Target, out.Backends = v.Target, v.Backends
+	if v.LBStrategy != "" {
+		out.LBStrategy = v.LBStrategy
+		out.LBHashHeader = v.LBHashHeader
+	} else if v.LBHashHeader != "" {
+		out.LBHashHeader = v.LBHashHeader
+	}
+	if !reflect.DeepEqual(v.HealthCheck, HealthCheckConfig{}) {
+		out.HealthCheck = v.HealthCheck
+	}
+	if !reflect.DeepEqual(v.PassiveHealthCheck, PassiveHealthConfig{}) {
+		out.PassiveHealthCheck = v.PassiveHealthCheck
+	}
+	return out
+}
+
+// validVariantName reports whether name can be used as a variant name:
+// it ends up in metrics labels, headers, and log lines.
+func validVariantName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, c := range name {
+		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// validateSplitBackends checks a split route's variants and their
+// backend groups. The route itself must then have no target or backends.
+func (r Route) validateSplitBackends() error {
+	ts := r.TrafficSplit
+	if r.Target != "" || len(r.Backends) > 0 {
+		return fmt.Errorf("traffic_split: a split route takes its backends from its variants; remove the route's target/backends")
+	}
+	if len(ts.Variants) < 2 {
+		return fmt.Errorf("traffic_split.variants: at least two variants are needed")
+	}
+	names := map[string]bool{}
+	targets := map[string]string{}
+	for i, v := range ts.Variants {
+		where := fmt.Sprintf("traffic_split.variants[%d]", i)
+		if !validVariantName(v.Name) {
+			return fmt.Errorf("%s: name %q must be 1-64 letters, digits, '-', '_' or '.'", where, v.Name)
+		}
+		if names[v.Name] {
+			return fmt.Errorf("%s: variant %q is listed twice", where, v.Name)
+		}
+		names[v.Name] = true
+		vr := r.VariantRoute(i)
+		if err := vr.validateBackends(); err != nil {
+			return fmt.Errorf("%s (%s): %w", where, v.Name, err)
+		}
+		for _, b := range vr.EffectiveBackends() {
+			if other, ok := targets[b.Target]; ok {
+				return fmt.Errorf("%s (%s): target %q is also used by variant %q; variants need separate backends", where, v.Name, b.Target, other)
+			}
+			targets[b.Target] = v.Name
+		}
+	}
+	return nil
 }
