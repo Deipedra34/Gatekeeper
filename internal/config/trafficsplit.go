@@ -256,3 +256,29 @@ func (r Route) validateSplitBackends() error {
 	}
 	return nil
 }
+
+// validateTrafficSplit checks everything about a split route except its
+// backend groups (see validateSplitBackends).
+func (r Route) validateTrafficSplit() error {
+	ts := r.TrafficSplit
+	if ts == nil {
+		return nil
+	}
+	return ts.validateWeights()
+}
+
+// validateWeights checks that every weight is a percentage and that they
+// add up to exactly 100.
+func (ts *TrafficSplitConfig) validateWeights() error {
+	sum := 0
+	for i, v := range ts.Variants {
+		if v.Weight < 0 || v.Weight > 100 {
+			return fmt.Errorf("traffic_split.variants[%d] (%s): weight must be between 0 and 100, got %d", i, v.Name, v.Weight)
+		}
+		sum += v.Weight
+	}
+	if sum != 100 {
+		return fmt.Errorf("traffic_split: variant weights must add up to 100, got %d", sum)
+	}
+	return nil
+}

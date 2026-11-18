@@ -602,6 +602,9 @@ func (c *Config) validate() error {
 		if err := r.validateBackends(); err != nil {
 			return fmt.Errorf("routes[%d]: %w", i, err)
 		}
+		if err := r.validateTrafficSplit(); err != nil {
+			return fmt.Errorf("routes[%d]: %w", i, err)
+		}
 		if r.Cache.TTL.Duration < 0 {
 			return fmt.Errorf("routes[%d]: cache.ttl must be >= 0", i)
 		}
