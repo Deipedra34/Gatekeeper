@@ -49,6 +49,13 @@ func (b *splitBackend) hits() int {
 	return len(b.paths)
 }
 
+// seen returns the paths the backend was asked for.
+func (b *splitBackend) seen() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.paths...)
+}
+
 type splitHarness struct {
 	gw      *gateway.Gateway
 	m       *metrics.Metrics
@@ -179,8 +186,8 @@ func TestGatewaySplit_TransformsApplyToEveryVariant(t *testing.T) {
 	h := newSplitHarness(t, splitYAML(stable, canary, 50, 50, 100, `      override: {enabled: true, allow: {anyone: true}}`, ""))
 	h.get("/api/items/7", "10.0.0.1:1", "X-API-Key", "alice", "X-Gatekeeper-Variant", "stable")
 	h.get("/api/items/7", "10.0.0.1:1", "X-API-Key", "bob", "X-Gatekeeper-Variant", "canary")
-	assert.Equal(t, []string{"/items/7"}, stable.paths, "strip_prefix applied")
-	assert.Equal(t, []string{"/items/7"}, canary.paths)
+	assert.Equal(t, []string{"/items/7"}, stable.seen(), "strip_prefix applied")
+	assert.Equal(t, []string{"/items/7"}, canary.seen())
 }
 
 func TestGatewaySplit_MetricsAndLogs(t *testing.T) {
