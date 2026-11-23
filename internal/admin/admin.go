@@ -216,6 +216,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, start time.Time, 
 		Result:     result,
 		Reason:     reason,
 		DryRun:     dryRun(r),
+		Target:     rec.target,
 		DurationMS: float64(time.Since(start).Microseconds()) / 1000,
 		TraceID:    traceID,
 	})
@@ -260,6 +261,7 @@ type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	errCode     string
+	target      string // see noteAuditTarget
 	wroteHeader bool
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net/http"
 	"net/netip"
 	"os"
 	"strings"
@@ -25,6 +26,7 @@ type auditRecord struct {
 	Result     string  `json:"result"`           // "success", "denied", or "error"
 	Reason     string  `json:"reason,omitempty"` // why it was denied, or the error code
 	DryRun     bool    `json:"dry_run,omitempty"`
+	Target     string  `json:"target,omitempty"` // what a change acted on, when the path doesn't say (a fault rule created)
 	DurationMS float64 `json:"duration_ms"`
 	TraceID    string  `json:"trace_id,omitempty"`
 }
@@ -106,3 +108,12 @@ func safeClientLabel(s string) bool {
 }
 
 func auditTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+// noteAuditTarget records what the request acted on, for its audit
+// record, when the path alone doesn't say: e.g. "fault rule chaos-1 on
+// route /api". It must never carry a secret.
+func noteAuditTarget(w http.ResponseWriter, target string) {
+	if rec, ok := w.(*statusRecorder); ok {
+		rec.target = target
+	}
+}
