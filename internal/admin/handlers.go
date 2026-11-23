@@ -29,6 +29,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /admin/v1/cache/stats", s.cacheStats)
 	s.mux.HandleFunc("GET /admin/v1/access-control", s.accessControl)
 	s.mux.HandleFunc("GET /admin/v1/routes/{route}/split", s.getSplit)
+	s.mux.HandleFunc("GET /admin/v1/faults", s.listFaults)
 
 	s.mux.HandleFunc("POST /admin/v1/reload", s.reloadConfig)                 // dry_run
 	s.mux.HandleFunc("POST /admin/v1/cache/purge", s.purgeCache)              // destructive, dry_run
@@ -39,6 +40,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /admin/v1/bans", s.createBan)                           // dry_run
 	s.mux.HandleFunc("DELETE /admin/v1/bans/{ip}", s.deleteBan)                    // dry_run
 	s.mux.HandleFunc("POST /admin/v1/routes/{route}/split", s.postSplit)           // dry_run
+	s.mux.HandleFunc("POST /admin/v1/faults", s.createFault)                       // dry_run
+	s.mux.HandleFunc("DELETE /admin/v1/faults/{id}", s.deleteFault)                // dry_run
 }
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
