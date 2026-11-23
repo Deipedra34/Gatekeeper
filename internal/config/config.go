@@ -294,6 +294,11 @@ type Route struct {
 	// its own backends; the route then has no target or backends of its
 	// own. Nil proxies the route as before.
 	TrafficSplit *TrafficSplitConfig `yaml:"traffic_split,omitempty"`
+
+	// FaultInjection injects delays, aborts, and connection resets into a
+	// share of the route's requests, for resilience testing. Nil (the
+	// default) injects nothing and costs nothing.
+	FaultInjection *RouteFaultConfig `yaml:"fault_injection,omitempty"`
 }
 
 // DefaultWSIdleTimeout is the WebSocket idle timeout applied to a route
@@ -610,6 +615,11 @@ func (c *Config) validate() error {
 		}
 		if err := r.validateTrafficSplit(c.RateLimit.Tiers); err != nil {
 			return fmt.Errorf("routes[%d]: %w", i, err)
+		}
+		if f := r.FaultInjection; f != nil {
+			if err := f.Validate(fmt.Sprintf("routes[%d].fault_injection", i)); err != nil {
+				return err
+			}
 		}
 		if r.Cache.TTL.Duration < 0 {
 			return fmt.Errorf("routes[%d]: cache.ttl must be >= 0", i)
