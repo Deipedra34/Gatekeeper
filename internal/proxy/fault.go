@@ -128,11 +128,11 @@ func (r *Router) faultClient(req *http.Request) fault.Client {
 const FaultHeader = "X-Gatekeeper-Fault"
 
 // roundTrip sends one attempt to b — or, when the request carries a fault
-// decision that applies to b, injects the fault in its place: a delay
-// first, then a connection reset or an abort's response instead of the
-// backend's.
+// decision that applies to b and counts as a backend failure, injects the
+// fault in its place: a delay first, then a connection reset or an
+// abort's response instead of the backend's.
 func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Response, error) {
-	if d, ok := fault.FromContext(req.Context()); ok && d.AppliesTo(b.Label()) {
+	if d, ok := fault.FromContext(req.Context()); ok && d.CountsAsBackendFailure && d.AppliesTo(b.Label()) {
 		if d.Delay > 0 {
 			// The attempt's context: a delay longer than proxy.timeout
 			// fails the attempt as a slow backend would, and a client
@@ -152,6 +152,36 @@ func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Resp
 		}
 	}
 	return b.Settings().Transport.RoundTrip(req)
+}
+
+// injectUncounted injects a fault with count_as_backend_failure: false
+// into req, about to be sent to b, before the attempt starts — so outside
+// its per-attempt timeout, and without its circuit breaker or passive
+// health check ever hearing of it. done reports that req is answered: by
+// an abort's response, a connection reset, or the client going away
+// during the delay. A delay alone leaves the attempt to go ahead.
+func (t *retryTransport) injectUncounted(req *http.Request, b *lb.Backend) (resp *http.Response, done bool, err error) {
+	d, ok := fault.FromContext(req.Context())
+	if !ok || d.CountsAsBackendFailure || !d.AppliesTo(b.Label()) {
+		return nil, false, nil
+	}
+	if d.Delay > 0 {
+		err = sleepContext(req.Context(), d.Delay)
+	}
+	switch {
+	case err != nil:
+	case d.Reset:
+		err = errFaultReset
+	case d.AbortStatus != 0:
+		resp = abortResponse(req, d.AbortStatus)
+	default:
+		return nil, false, nil
+	}
+	// The breaker admitted an attempt that's not going to happen.
+	if cb := b.Breaker(); cb != nil {
+		cb.Release()
+	}
+	return resp, true, err
 }
 
 // abortResponse is the response an abort fault answers req with.

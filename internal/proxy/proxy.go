@@ -760,6 +760,12 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 		}
 
+		// A fault that doesn't count as a backend failure is answered
+		// here, before the attempt starts: never retried, never reported.
+		if resp, done, err := t.injectUncounted(req, b); done {
+			return resp, err
+		}
+
 		tried[b] = true
 		release := b.Acquire()
 		attemptReq := cloneRequestWithBody(req, bodyBytes)
