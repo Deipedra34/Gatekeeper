@@ -7,6 +7,7 @@
 package fault
 
 import (
+	"context"
 	"math/rand/v2"
 	"strings"
 	"time"
@@ -152,3 +153,17 @@ func (d Decision) Types() []string {
 // Label is Types joined with commas ("delay", "abort", "delay,reset"),
 // for log lines and trace attributes.
 func (d Decision) Label() string { return strings.Join(d.Types(), ",") }
+
+type decisionKey struct{}
+
+// WithDecision returns ctx carrying d, for the proxy's retry transport to
+// apply to each backend attempt.
+func WithDecision(ctx context.Context, d Decision) context.Context {
+	return context.WithValue(ctx, decisionKey{}, d)
+}
+
+// FromContext returns the decision ctx carries, if any.
+func FromContext(ctx context.Context) (Decision, bool) {
+	d, ok := ctx.Value(decisionKey{}).(Decision)
+	return d, ok
+}

@@ -26,6 +26,7 @@ import (
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/circuitbreaker"
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/fault"
 	"gatekeeper/internal/lb"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/split"
@@ -94,6 +95,10 @@ type Router struct {
 
 	splits       *split.Registry
 	apiKeyHeader string
+
+	// faults decides which requests get a fault injected; nil injects
+	// nothing (see WithFaultRegistry).
+	faults *fault.Registry
 }
 
 // Option customises a Router built by NewRouter.
@@ -417,6 +422,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		var done func()
 		rt, w, req, done = r.selectVariant(rt, w, req)
 		defer done()
+	}
+
+	// Decided on the request as the client sent it — before transforms
+	// rewrite its path — and once the variant is known.
+	if r.faults != nil && !websocket.IsUpgrade(req) {
+		req = r.decideFault(rt, req)
 	}
 
 	w, req, vars := r.prepare(rt, w, req)
