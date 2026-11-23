@@ -23,6 +23,9 @@ const redacted = "[REDACTED]"
 //     sha256 become "[REDACTED]";
 //   - traffic_split.sticky.cookie.secret becomes "[REDACTED]", and
 //     override.allow.api_keys become their fingerprints;
+//   - fault_injection.match.clients.api_keys become their fingerprints,
+//     and match.header.value becomes "[REDACTED]" when the header looks
+//     like a credential;
 //   - credentials embedded in backend or collector URLs are dropped.
 //
 // Then, as a safety net, any other string anywhere in the tree that
@@ -93,11 +96,20 @@ func redactedConfig(cfg *config.Config) (map[string]any, error) {
 			secrets = append(secrets, ts.Sticky.Cookie.Secret)
 			secrets = append(secrets, ts.Override.Allow.APIKeys...)
 		}
+		if f := rt.FaultInjection; f != nil {
+			if c := f.Match.Clients; c != nil {
+				secrets = append(secrets, c.APIKeys...)
+			}
+			if h := f.Match.Header; h != nil && sensitiveName(h.Name) {
+				secrets = append(secrets, h.Value)
+			}
+		}
 	}
 	if routes, ok := tree["routes"].([]any); ok {
 		for _, rt := range routes {
 			if m, ok := rt.(map[string]any); ok {
 				secrets = append(secrets, redactTrafficSplit(m)...)
+				redactFaultInjection(m)
 			}
 		}
 	}
@@ -295,4 +307,20 @@ func redactTrafficSplit(route map[string]any) []string {
 		}
 	}
 	return removed
+}
+
+// redactFaultInjection replaces the API keys a route's fault rule
+// targets with their fingerprints, and a credential-looking header's
+// value with "[REDACTED]".
+func redactFaultInjection(route map[string]any) {
+	if keys, ok := getPath(route, "fault_injection", "match", "clients", "api_keys").([]any); ok {
+		for i, k := range keys {
+			keys[i] = middleware.APIKeyFingerprint(fmt.Sprint(k))
+		}
+	}
+	if h, ok := getPath(route, "fault_injection", "match", "header").(map[string]any); ok {
+		if name, _ := h["name"].(string); sensitiveName(name) && h["value"] != nil && h["value"] != "" {
+			h["value"] = redacted
+		}
+	}
 }
