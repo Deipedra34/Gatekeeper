@@ -1,10 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"gatekeeper/internal/fault"
+	"gatekeeper/internal/lb"
 	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/transform"
 )
@@ -56,4 +59,34 @@ func (r *Router) faultClient(req *http.Request) fault.Client {
 		c.Tier = info.Tier
 	}
 	return c
+}
+
+// roundTrip sends one attempt to b — or, when the request carries a fault
+// decision that applies to b, injects the fault in its place: a delay
+// first, then the backend call.
+func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Response, error) {
+	if d, ok := fault.FromContext(req.Context()); ok && d.AppliesTo(b.Label()) {
+		if d.Delay > 0 {
+			// The attempt's context: a delay longer than proxy.timeout
+			// fails the attempt as a slow backend would, and a client
+			// that goes away ends it at once.
+			if err := sleepContext(req.Context(), d.Delay); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return b.Settings().Transport.RoundTrip(req)
+}
+
+// sleepContext waits for d, or until ctx is done if that's sooner. It
+// starts no goroutine, so an abandoned request leaves nothing behind.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

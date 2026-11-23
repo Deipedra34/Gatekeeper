@@ -770,7 +770,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			release()
 		}
 
-		resp, rtErr = b.Settings().Transport.RoundTrip(attemptReq)
+		resp, rtErr = t.roundTrip(attemptReq, b)
 		last := attempt == maxAttempts
 
 		if rtErr != nil {
