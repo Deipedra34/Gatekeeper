@@ -281,6 +281,33 @@ cors:
 #         match: {header: {name: X-Tester, value: "true"}}
 #     rollout: {variant: canary, steps: [5, 25, 50, 100], interval: 30m}
 #     response_header: X-Gatekeeper-Variant   # default: off
+#
+# A route can inject faults into a share of its requests, to test how
+# clients and the gateway's own retries, circuit breaker, and health
+# checks cope (see README.md's "Fault injection"). Nothing is injected
+# unless enabled is true here AND fault_injection.global_enabled is true
+# (see the end of this file). Health checks, /metrics, and the admin API
+# are never faulted.
+#   fault_injection:
+#     enabled: false                 # default: off
+#     delay:                         # hold the backend call back
+#       percentage: 10               # 0-100
+#       fixed: 500ms                 # or min: 100ms, max: 2s (random in between)
+#     abort:                         # answer instead of the backend
+#       percentage: 5
+#       status: 503                  # 400-599
+#     connection_reset:              # drop the client connection, no answer
+#       percentage: 1
+#     match:                         # every condition set must hold
+#       header: {name: X-Gatekeeper-Fault, value: "true"}
+#       # path_prefixes: ["/api/orders"]
+#       # methods: [POST]
+#       # variants: [canary]         # traffic_split variants
+#       # backends: ["http://localhost:9011"]
+#       # clients: {tiers: [internal], api_keys: [chaos-key], cidrs: ["10.0.0.0/8"]}
+#     max_duration: 1h               # stop on its own (default: never)
+#     count_as_backend_failure: true # default; false: never retried or counted
+#     # allow_full_abort: true       # needed for a 100% abort or reset in production
 routes:
   - path_prefix: "/ws"
     target: "http://localhost:9000"
@@ -476,3 +503,20 @@ transform:
 #       multiplier: 2
 #       max_duration: 24h
 #       reset_after: 24h        # since the last ban
+
+# Fault injection's kill switch and safety settings, for routes'
+# fault_injection sections and the admin API's /admin/v1/faults. With
+# global_enabled false (the default) nothing is ever injected, whatever
+# the routes say. While any rule is in force, a warning is logged at
+# startup and on every reload, and gatekeeper_fault_injection_active is 1.
+# Reloaded on SIGHUP. See README.md's "Fault injection" section.
+#
+# fault_injection:
+#   global_enabled: false
+#   # production (default) or staging are production-like: a 100% abort
+#   # or connection reset needs the rule's allow_full_abort. development
+#   # and test aren't.
+#   environment: production
+#   # More paths never faulted, on top of /metrics, /healthz, /health,
+#   # /livez, /readyz, and /_dashboard. A trailing "/" exempts a prefix.
+#   exempt_paths: ["/status", "/internal/"]
