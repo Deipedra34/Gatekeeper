@@ -488,6 +488,104 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "429": { $ref: "#/components/responses/TooManyAuthFailures" }
 
+  /admin/v1/faults:
+    get:
+      tags: [read]
+      summary: Fault injection rules and their remaining time
+      description: |
+        The kill switch (fault_injection.global_enabled), the environment,
+        and every fault rule held: config rules (from routes'
+        fault_injection sections) and runtime rules (created here), in
+        force or expired, with how long each has left. API keys a rule
+        targets are shown as fingerprints.
+      operationId: listFaults
+      responses:
+        "200":
+          description: The fault rules
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FaultList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+    post:
+      tags: [actions]
+      summary: Create or replace a runtime fault rule
+      x-destructive: true
+      description: |
+        Starts injecting delays, aborts, or connection resets into a share
+        of a route's requests, for `ttl` (required, at most 24h). The rule
+        has the same shape as a route's fault_injection section; a rule
+        with the same `id` is replaced, and its TTL starts over. Runtime
+        rules are tried before the route's config rule, newest first, and
+        are kept across reloads (dropped only if their route is removed),
+        but not across restarts. Nothing is injected while
+        fault_injection.global_enabled is false: the rule is kept, and the
+        response carries a warning. In a production-like environment a
+        100% abort or connection reset needs `allow_full_abort: true`.
+        Every creation is logged as a warning.
+      operationId: createFault
+      parameters:
+        - $ref: "#/components/parameters/DryRun"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FaultRuleRequest" }
+      responses:
+        "200":
+          description: Replaced an existing rule (or, with dry_run, checked but not applied)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FaultResult" }
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FaultResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: No such route
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: The id belongs to a config rule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
+  /admin/v1/faults/{id}:
+    delete:
+      tags: [actions]
+      summary: Remove a fault rule
+      description: |
+        Takes the rule out of force at once. A config rule is only removed
+        until the next reload or restart, which reads it from the config
+        file again; the response notes this.
+      operationId: deleteFault
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The rule's id, from GET /admin/v1/faults
+          schema: { type: string }
+          example: chaos-1
+        - $ref: "#/components/parameters/DryRun"
+      responses:
+        "200":
+          description: Removed (or, with dry_run, found but not removed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FaultDeleteResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
 components:
   securitySchemes:
     bearerToken:
@@ -875,3 +973,114 @@ components:
         - type: object
           properties:
             split: { $ref: "#/components/schemas/Split" }
+
+    FaultDelay:
+      type: object
+      required: [percentage]
+      properties:
+        percentage: { type: number, minimum: 0, maximum: 100 }
+        fixed: { type: string, description: Go duration; set it or min and max, example: 500ms }
+        min: { type: string, description: Go duration, example: 100ms }
+        max: { type: string, description: Go duration, example: 2s }
+
+    FaultAbort:
+      type: object
+      required: [percentage, status]
+      properties:
+        percentage: { type: number, minimum: 0, maximum: 100 }
+        status: { type: integer, minimum: 400, maximum: 599, example: 503 }
+
+    FaultReset:
+      type: object
+      required: [percentage]
+      properties:
+        percentage: { type: number, minimum: 0, maximum: 100 }
+
+    FaultMatch:
+      type: object
+      description: Every condition set must hold for the rule to apply
+      properties:
+        header:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string, example: X-Gatekeeper-Fault }
+            value: { type: string, description: Any value when left out, example: "true" }
+        path_prefixes: { type: array, items: { type: string } }
+        methods: { type: array, items: { type: string } }
+        variants: { type: array, items: { type: string }, description: Traffic split variants }
+        backends: { type: array, items: { type: string }, description: Backend URLs }
+        clients:
+          type: object
+          description: An allowlist; a client matching any entry matches
+          properties:
+            tiers: { type: array, items: { type: string } }
+            api_keys: { type: array, items: { type: string }, description: Shown as fingerprints }
+            cidrs: { type: array, items: { type: string } }
+
+    FaultRuleRequest:
+      type: object
+      required: [route, ttl]
+      additionalProperties: false
+      properties:
+        id: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", description: "Generated when left out; may not start with config-" }
+        route: { type: string, description: "The route's id, label, or path prefix without the leading slash" }
+        ttl: { type: string, description: "Go duration, above 0 and at most 24h", example: 15m }
+        delay: { $ref: "#/components/schemas/FaultDelay" }
+        abort: { $ref: "#/components/schemas/FaultAbort" }
+        connection_reset: { $ref: "#/components/schemas/FaultReset" }
+        match: { $ref: "#/components/schemas/FaultMatch" }
+        count_as_backend_failure: { type: boolean, default: true }
+        allow_full_abort: { type: boolean, default: false }
+      example:
+        id: chaos-1
+        route: api
+        ttl: 15m
+        delay: { percentage: 10, fixed: 500ms }
+        abort: { percentage: 5, status: 503 }
+        match: { header: { name: X-Gatekeeper-Fault, value: "true" } }
+
+    FaultRule:
+      type: object
+      properties:
+        id: { type: string }
+        route: { type: string }
+        route_id: { type: string }
+        source: { type: string, enum: [config, runtime] }
+        in_force: { type: boolean, description: "The kill switch is on and the rule hasn't expired" }
+        expired: { type: boolean }
+        started_at: { type: string, format: date-time }
+        expires_at: { type: [string, "null"], format: date-time, description: Null for a config rule without max_duration }
+        remaining_seconds: { type: [number, "null"] }
+        summary: { type: string, example: "delay 10% 500ms, abort 5% 503; header X-Gatekeeper-Fault=true" }
+        delay: { $ref: "#/components/schemas/FaultDelay" }
+        abort: { $ref: "#/components/schemas/FaultAbort" }
+        connection_reset: { $ref: "#/components/schemas/FaultReset" }
+        match: { $ref: "#/components/schemas/FaultMatch" }
+        count_as_backend_failure: { type: boolean }
+        allow_full_abort: { type: boolean }
+
+    FaultList:
+      type: object
+      properties:
+        global_enabled: { type: boolean }
+        environment: { type: string, enum: [production, staging, development, test] }
+        production_like: { type: boolean }
+        active: { type: boolean, description: Any rule is in force }
+        rules_in_force: { type: integer }
+        rules: { type: array, items: { $ref: "#/components/schemas/FaultRule" } }
+
+    FaultResult:
+      type: object
+      properties:
+        dry_run: { type: boolean }
+        replaced: { type: boolean }
+        warning: { type: string, description: Set while the kill switch is off }
+        rule: { $ref: "#/components/schemas/FaultRule" }
+
+    FaultDeleteResult:
+      type: object
+      properties:
+        dry_run: { type: boolean }
+        note: { type: string, description: Set for a config rule }
+        rule: { $ref: "#/components/schemas/FaultRule" }
