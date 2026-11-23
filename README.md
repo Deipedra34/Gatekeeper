@@ -1505,6 +1505,168 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"action": "rollback
 
 Weights changed through the admin API, rollout progress, and automatic rollbacks are **per instance**. Stickiness is consistent across a fleet, because it only depends on the client and the route, but run the same admin action against each instance (or let each instance's guardrails judge the traffic it serves). See [ADR 10](docs/adr/0010-traffic-splitting.md) for why.
 
+## Fault injection
+
+Fault injection makes a share of a route's requests fail on purpose, so you can see how clients, and Gatekeeper's own retries, circuit breakers, health checks, and traffic split guardrails, cope before a real outage tests them. A rule can **delay** requests (a fixed time, or random between a minimum and a maximum), **abort** them with a status of your choice, or **reset** the client connection without an answer. Each fault fires for its own percentage of matching requests.
+
+It's off by default, and it takes two switches to turn on. A route's `fault_injection.enabled` turns its rule on, and the global kill switch `fault_injection.global_enabled` has to be on too. Routes without a rule, or with the kill switch off, behave exactly as before, and the per-request check costs one atomic load.
+
+```yaml
+fault_injection:
+  global_enabled: true            # the kill switch: false stops every rule at once
+  environment: staging            # production (default) | staging | development | test
+
+routes:
+  - path_prefix: "/api"
+    target: "http://localhost:9001"
+    fault_injection:
+      enabled: true
+      delay: {percentage: 10, fixed: 500ms}     # or min: 100ms, max: 2s
+      abort: {percentage: 5, status: 503}       # 400-599
+      connection_reset: {percentage: 1}
+      max_duration: 1h                          # stops on its own
+```
+
+Percentages are 0 to 100. A request can get a delay and an abort, or a delay and a reset; when both an abort and a reset fire, the reset wins.
+
+### Examples
+
+**Add 500ms of latency to 10% of requests:**
+
+```yaml
+    fault_injection:
+      enabled: true
+      delay: {percentage: 10, fixed: 500ms}
+```
+
+**Fail 5% of requests with 503:**
+
+```yaml
+    fault_injection:
+      enabled: true
+      abort: {percentage: 5, status: 503}
+```
+
+**Check that the circuit breaker opens.** Injected failures count as backend failures, so a 100% abort trips the route's breaker after `failure_threshold` failed attempts (retries included). Later requests are refused with `503 circuit breaker open` without reaching the fault.
+
+```yaml
+    circuit_breaker: {failure_threshold: 5, open_duration: 30s}
+    fault_injection:
+      enabled: true
+      abort: {percentage: 100, status: 500}
+      allow_full_abort: true            # needed for 100% in production and staging
+      max_duration: 10m
+```
+
+```bash
+for i in $(seq 1 8); do curl -s -o /dev/null -w "%{http_code}\n" -H "X-API-Key: $KEY" http://localhost:8080/api/orders; done
+# 500 500 ... then 503 once the breaker is open
+curl -s http://localhost:8080/metrics | grep -E 'gatekeeper_faults_injected_total|gatekeeper_backend_circuit_breaker_state'
+```
+
+**Only fault requests that ask for it with a header.** Your test client sends `X-Gatekeeper-Fault: true`, and nobody else is affected:
+
+```yaml
+    fault_injection:
+      enabled: true
+      abort: {percentage: 100, status: 503}
+      allow_full_abort: true            # 100% of requests that carry the header
+      match:
+        header: {name: X-Gatekeeper-Fault, value: "true"}
+```
+
+```bash
+curl -i -H "X-API-Key: $KEY" -H "X-Gatekeeper-Fault: true" http://localhost:8080/api/orders
+# HTTP/1.1 503 Service Unavailable
+# X-Gatekeeper-Fault: abort
+```
+
+### Targeting
+
+Every condition under `match` must hold for a rule to apply. Leave `match` out to cover the whole route.
+
+| Field | Matches |
+|---|---|
+| `header: {name, value}` | Requests carrying the header, with that value if `value` is set |
+| `path_prefixes: [...]` | Request paths starting with one of these, as the client sent them |
+| `methods: [...]` | These methods |
+| `variants: [...]` | Requests a [traffic split](#traffic-splitting-canary-and-ab) sends to these variants |
+| `backends: [...]` | Attempts on these backends (by URL), so a retry can move to a healthy one |
+| `clients: {tiers, api_keys, cidrs}` | An allowlist: a client in any of the tiers, with any of the keys, or from any of the ranges |
+
+Some requests are **never faulted**, whatever a rule says:
+
+- the admin API, which has its own listener;
+- the metrics path (`/metrics`) and `/healthz`, `/health`, `/livez`, `/readyz`, and `/_dashboard`, plus anything listed in `fault_injection.exempt_paths`;
+- health check probes, recognised by their User-Agent: Gatekeeper's own active checks, Kubernetes, AWS ELB, Google Cloud, and Consul;
+- WebSocket upgrades.
+
+### Safety rails
+
+- **Off twice over.** Nothing is injected unless both the rule and the kill switch are on. A reload that turns `global_enabled` off stops everything at once.
+- **Warnings you can't miss.** While any rule is in force, startup and every reload log a warning for each rule, with what it injects, what it targets, and when it expires. `gatekeeper_fault_injection_active` is 1, and the dashboard's **Fault injection** panel turns red.
+- **It ends on its own.** `max_duration` takes a rule out of force after that long, and the expiry is logged. A reload that leaves the rule unchanged doesn't restart its countdown. Rules created through the admin API always have a TTL, at most 24 hours.
+- **No full outage by mistake.** In a production-like `environment` (`production`, the default, or `staging`), a 100% abort or reset is rejected at load unless the rule sets `allow_full_abort: true`.
+- **Validated like the rest of the config.** A bad percentage, status, delay, header, CIDR, tier, variant, or backend rejects the config (or the reload), even while the rule is disabled.
+
+### How it fits with the rest of the pipeline
+
+The fault is decided once per request inside the router: after access control, auth, CORS, and rate limiting, and after a traffic split picks the variant. It's then applied to each **backend attempt**, after the load balancer picked the backend and its circuit breaker let the attempt through, in place of the call to the backend. See [ADR 11](docs/adr/0011-fault-injection.md).
+
+- **Auth and rate limiting run first.** An unauthenticated request gets its 401, and a faulted request still spends rate limit budget.
+- **Retries:** an injected 5xx or reset is retried like a real one, and each attempt can be faulted again. A 4xx abort is returned at once, as a real 4xx would be.
+- **Circuit breakers and passive health checks** count injected failures, so they can trip and eject.
+- **Timeouts:** a delay longer than `proxy.timeout` fails the attempt like a slow backend. A client that disconnects ends the delay straight away, and nothing is left running.
+- **Caching:** a request served from the cache never reaches the fault, and a faulted response is never cached.
+- **Traffic splits:** a fault on a variant counts against that variant's guardrails. A reset counts as a failed request.
+- **Load balancing:** with `match.backends`, only attempts on those backends are faulted, and retries fail over as they would in a real outage.
+
+Set `count_as_backend_failure: false` to test clients without tripping the gateway's own protections. The fault is then answered straight away: it's never retried, never reported to the circuit breaker or health checks, and its delay doesn't count toward `proxy.timeout`.
+
+An aborted response carries `X-Gatekeeper-Fault: abort` and a short plain-text body (`fault injected: 503 Service Unavailable`). A reset closes the client connection with a TCP RST once retries are exhausted. Over HTTP/2, the stream is reset.
+
+### Logs, metrics, and tracing
+
+Request log lines end with the faults injected, and a reset connection is logged with `reset` in place of the status:
+
+```
+GET /api/orders 503 1.2ms 203.0.113.7:51544 fault=abort
+GET /api/orders reset 0.9ms 203.0.113.7:51545 fault=reset
+GET /api/orders 200 512.4ms 203.0.113.7:51546 fault=delay
+```
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gatekeeper_faults_injected_total` | `route`, `fault`: `delay`, `abort`, `reset` | Faults injected into backend attempts. A retried request counts once per attempt |
+| `gatekeeper_fault_injection_active` | | 1 while any rule is in force, else 0 |
+| `gatekeeper_fault_injection_rules` | `route` | Rules in force per route |
+
+With [tracing](#distributed-tracing) on, the server span and every backend attempt span the fault was injected into carry `fault.injected` (`delay`, `abort`, `reset`, or e.g. `delay,abort`) and `gatekeeper.fault.rule` (the rule's ID). The [Grafana dashboard](#grafana-dashboard) has a **Fault injection** row.
+
+### Fault endpoints
+
+With the [admin API](#admin-api) enabled, rules can be added and removed at runtime, with no reload:
+
+| Method & path | What it does |
+|---|---|
+| `GET /admin/v1/faults` | The kill switch and every rule (config and runtime) with its targeting, whether it's in force, and its remaining time |
+| `POST /admin/v1/faults` | Creates a rule, or replaces the one with the same `id`. The body is a route's `fault_injection` section plus `route` and a required `ttl` (at most `24h`) |
+| `DELETE /admin/v1/faults/{id}` | Removes a rule. A config rule comes back on the next reload |
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -d '{
+  "id": "orders-latency", "route": "api", "ttl": "15m",
+  "delay": {"percentage": 10, "fixed": "500ms"},
+  "match": {"header": {"name": "X-Gatekeeper-Fault", "value": "true"}}
+}' http://127.0.0.1:9090/admin/v1/faults
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/faults
+curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/faults/orders-latency
+```
+
+`route` is the route's ID from `GET /admin/v1/routes`, or its path prefix without the leading slash. Runtime rules are tried before the route's config rule, newest first, and the first matching rule decides. They're validated like config rules, need the kill switch on to inject anything (the response warns you if it's off), and are logged as warnings. Like every admin endpoint, these are authenticated and audited, and the audit record names the rule and route. `POST` and `DELETE` accept `?dry_run=true`.
+
+Runtime rules are **per instance** and live in memory. They survive reloads (unless their route is removed), but not restarts. API keys a rule targets are shown as fingerprints, here and in `/admin/v1/config`.
+
 ## Setup
 
 Requires Go 1.26+ (see `go.mod`). Redis is optional, only needed if you set `storage.backend: redis`.
