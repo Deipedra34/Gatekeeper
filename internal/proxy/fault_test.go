@@ -351,3 +351,22 @@ func TestFault_NoRegistryInjectsNothing(t *testing.T) {
 	assert.Equal(t, http.StatusOK, get(router, "/x").Code)
 	assert.Equal(t, int32(1), calls.Load())
 }
+
+func TestFault_ResetCountsAgainstTheVariant(t *testing.T) {
+	stable, canary := newVariantBackend(t, "stable"), newVariantBackend(t, "canary")
+	rt := splitRoute(stable, canary, 100)
+	rt.FaultInjection = &config.RouteFaultConfig{
+		Enabled:         true,
+		ConnectionReset: &config.FaultReset{Percentage: 100},
+		Match:           config.FaultMatch{Variants: []string{"canary"}},
+	}
+	m := metrics.New()
+	router := faultRouter(t, []config.Route{rt}, noRetryProxyConfig(), m, nil)
+
+	require.Error(t, resetFrom(t, router, "/api/x"))
+	assert.Zero(t, canary.hits.Load())
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.VariantRequests.WithLabelValues("/api", "canary")),
+		"a reset connection is still a request the variant served")
+	assert.Equal(t, 1.0, testutil.ToFloat64(m.VariantErrors.WithLabelValues("/api", "canary")),
+		"and a failed one, for the split's guardrails")
+}
