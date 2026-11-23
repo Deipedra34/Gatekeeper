@@ -23,14 +23,36 @@ import (
 type Registry struct {
 	sample Sampler
 	now    func() time.Time
+	events func(Event)
 
 	mu      sync.Mutex
 	enabled bool
 	config  map[string]*Rule // config rules, by route label
 	exempt  exemptions
 
+	// expiry fires when the next rule in force expires; reported holds
+	// the rules whose expiry has been reported, so each is reported once.
+	expiry   *time.Timer
+	reported map[*Rule]bool
+
 	// snap is what Decide reads; nil whenever nothing can be injected.
 	snap atomic.Pointer[snapshot]
+}
+
+// EventKind says what happened to a rule.
+type EventKind string
+
+// Event kinds.
+const (
+	// EventExpired: the rule's max_duration (or TTL) ran out.
+	EventExpired EventKind = "expired"
+)
+
+// Event reports a change to a rule that happened on its own, for the
+// gateway to log.
+type Event struct {
+	Kind EventKind
+	Rule *Rule
 }
 
 // snapshot is the rules in force, by route label, in the order they're
@@ -50,9 +72,13 @@ func WithSampler(s Sampler) Option { return func(g *Registry) { g.sample = s } }
 // WithClock makes the registry tell the time with now.
 func WithClock(now func() time.Time) Option { return func(g *Registry) { g.now = now } }
 
+// WithEvents has the registry report rules expiring to fn. It's called
+// without the registry's lock held.
+func WithEvents(fn func(Event)) Option { return func(g *Registry) { g.events = fn } }
+
 // NewRegistry returns a registry with no rules and the kill switch off.
 func NewRegistry(opts ...Option) *Registry {
-	g := &Registry{sample: DefaultSampler, now: time.Now, config: map[string]*Rule{}}
+	g := &Registry{sample: DefaultSampler, now: time.Now, config: map[string]*Rule{}, reported: map[*Rule]bool{}}
 	for _, opt := range opts {
 		opt(g)
 	}
@@ -92,19 +118,93 @@ func (g *Registry) Configure(cfg *config.Config) {
 	}
 	g.config = rules
 	g.rebuild()
+	g.forget()
 }
 
-// rebuild recomputes the snapshot Decide reads. Called with mu held.
+// rebuild recomputes the snapshot Decide reads, leaving out expired
+// rules, and sets the timer for the next expiry. Called with mu held.
 func (g *Registry) rebuild() {
-	if !g.enabled || len(g.config) == 0 {
-		g.snap.Store(nil)
-		return
+	if g.expiry != nil {
+		g.expiry.Stop()
+		g.expiry = nil
 	}
+	now := g.now()
 	s := &snapshot{byRoute: map[string][]*Rule{}, exempt: g.exempt}
-	for label, r := range g.config {
-		s.byRoute[label] = append(s.byRoute[label], r)
+	var next time.Time
+	for _, r := range g.all() {
+		if r.ExpiredAt(now) {
+			continue
+		}
+		s.byRoute[r.Route] = append(s.byRoute[r.Route], r)
+		if !r.Expires.IsZero() && (next.IsZero() || r.Expires.Before(next)) {
+			next = r.Expires
+		}
 	}
-	g.snap.Store(s)
+	if !g.enabled || len(s.byRoute) == 0 {
+		g.snap.Store(nil)
+	} else {
+		g.snap.Store(s)
+	}
+	if !next.IsZero() {
+		g.expiry = time.AfterFunc(next.Sub(now), g.ExpireDue)
+	}
+}
+
+// all returns every rule held, in the order they're tried on a route.
+// Called with mu held.
+func (g *Registry) all() []*Rule {
+	out := make([]*Rule, 0, len(g.config))
+	for _, r := range g.config {
+		out = append(out, r)
+	}
+	return out
+}
+
+// ExpireDue takes rules whose max_duration (or TTL) has run out out of
+// force, reporting each once. It runs on its own when the next rule
+// expires; tests with a fake clock call it directly.
+func (g *Registry) ExpireDue() {
+	g.mu.Lock()
+	now := g.now()
+	var expired []*Rule
+	for _, r := range g.all() {
+		if r.ExpiredAt(now) && !g.reported[r] {
+			g.reported[r] = true
+			expired = append(expired, r)
+		}
+	}
+	g.rebuild()
+	g.forget()
+	g.mu.Unlock()
+	if g.events != nil {
+		for _, r := range expired {
+			g.events(Event{Kind: EventExpired, Rule: r})
+		}
+	}
+}
+
+// forget drops reported expiries of rules no longer held. Called with mu
+// held.
+func (g *Registry) forget() {
+	held := map[*Rule]bool{}
+	for _, r := range g.all() {
+		held[r] = true
+	}
+	for r := range g.reported {
+		if !held[r] {
+			delete(g.reported, r)
+		}
+	}
+}
+
+// Close stops the expiry timer.
+func (g *Registry) Close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.expiry != nil {
+		g.expiry.Stop()
+		g.expiry = nil
+	}
 }
 
 // Enabled reports whether the kill switch is on.
@@ -147,10 +247,7 @@ func (r *Rule) ExpiredAt(now time.Time) bool {
 // or held back by the kill switch), sorted by route then ID.
 func (g *Registry) Rules() []*Rule {
 	g.mu.Lock()
-	out := make([]*Rule, 0, len(g.config))
-	for _, r := range g.config {
-		out = append(out, r)
-	}
+	out := g.all()
 	g.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Route != out[j].Route {
