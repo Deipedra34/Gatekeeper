@@ -89,6 +89,29 @@ type RouteFaultConfig struct {
 	// Match limits the rule to some of the route's requests. Left empty,
 	// it applies to all of them.
 	Match FaultMatch `yaml:"match"`
+
+	// MaxDuration makes the rule expire on its own this long after it was
+	// loaded; it then injects nothing until it's changed (or the gateway
+	// restarts). 0, the default, means it never expires.
+	MaxDuration Duration `yaml:"max_duration"`
+
+	// AllowFullAbort permits an abort or connection_reset percentage of
+	// 100 in a production-like environment, where it's refused otherwise:
+	// it takes the route down for every request the rule matches.
+	AllowFullAbort bool `yaml:"allow_full_abort,omitempty"`
+
+	// CountAsBackendFailure makes injected faults count as failures of
+	// the backend they stand in for: retried, and counted by its circuit
+	// breaker and passive health check, so those can be tested. Defaults
+	// to true; with false, a fault is answered right away and the backend
+	// is left out of it.
+	CountAsBackendFailure *bool `yaml:"count_as_backend_failure,omitempty"`
+}
+
+// CountsAsBackendFailure reports whether injected faults count as backend
+// failures, applying the "true by default" rule.
+func (f *RouteFaultConfig) CountsAsBackendFailure() bool {
+	return f.CountAsBackendFailure == nil || *f.CountAsBackendFailure
 }
 
 // DefaultFaultHeader is the request header the README's examples use to
@@ -126,12 +149,14 @@ type FaultClients struct {
 	CIDRs []string `yaml:"cidrs,omitempty"`
 }
 
-// FaultScope is what a rule's targeting is checked against: the rate
-// limit tiers, and the variants and backend targets of the rule's route.
+// FaultScope is what a rule is checked against: the rate limit tiers,
+// the variants and backend targets of the rule's route, and whether the
+// environment is production-like.
 type FaultScope struct {
-	Tiers    map[string]TierLimit
-	Variants []string
-	Backends []string
+	Tiers          map[string]TierLimit
+	Variants       []string
+	Backends       []string
+	ProductionLike bool
 }
 
 // FaultScope returns the scope rules on r are checked against.
@@ -216,6 +241,17 @@ func (f *RouteFaultConfig) Validate(where string, scope FaultScope) error {
 	if r := f.ConnectionReset; r != nil {
 		if err := validPercentage(where+".connection_reset", r.Percentage); err != nil {
 			return err
+		}
+	}
+	if f.MaxDuration.Duration < 0 {
+		return fmt.Errorf("%s.max_duration must be >= 0", where)
+	}
+	if scope.ProductionLike && !f.AllowFullAbort {
+		if a := f.Abort; a != nil && a.Percentage >= 100 {
+			return fmt.Errorf("%s.abort.percentage is 100, which fails every request the rule matches; in a production-like environment set allow_full_abort: true to mean it", where)
+		}
+		if r := f.ConnectionReset; r != nil && r.Percentage >= 100 {
+			return fmt.Errorf("%s.connection_reset.percentage is 100, which fails every request the rule matches; in a production-like environment set allow_full_abort: true to mean it", where)
 		}
 	}
 	return f.Match.validate(where+".match", scope)
