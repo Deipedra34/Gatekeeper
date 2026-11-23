@@ -31,6 +31,14 @@ func TestRule_Summary(t *testing.T) {
 	assert.Equal(t, "delay 100% 100ms-1s, reset 1%; every request", ranged.Summary())
 }
 
+func TestRule_SummaryRedactsCredentialHeaders(t *testing.T) {
+	r := NewRule("r", "/", SourceConfig, config.RouteFaultConfig{
+		Abort: &config.FaultAbort{Percentage: 5, Status: 500},
+		Match: config.FaultMatch{Header: &config.ValueMatch{Name: "X-Chaos-Token", Value: "s3cret-value"}},
+	}, time.Now())
+	assert.Equal(t, "abort 5% 500; header X-Chaos-Token=[REDACTED]", r.Summary())
+}
+
 func TestRule_Remaining(t *testing.T) {
 	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	r := NewRule("r", "/", SourceConfig, config.RouteFaultConfig{

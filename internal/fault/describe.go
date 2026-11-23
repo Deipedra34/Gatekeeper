@@ -31,7 +31,11 @@ func (r *Rule) Summary() string {
 	m := c.Match
 	if h := m.Header; h != nil {
 		t := "header " + h.Name
-		if h.Value != "" {
+		switch {
+		case h.Value == "":
+		case credentialHeader(h.Name):
+			t += "=[REDACTED]" // a credential: never logged
+		default:
 			t += "=" + h.Value
 		}
 		targets = append(targets, t)
@@ -82,6 +86,19 @@ func (r *Rule) Remaining(now time.Time) time.Duration {
 		return 0
 	}
 	return r.Expires.Sub(now)
+}
+
+// credentialNameParts mark a header whose value may be a credential.
+var credentialNameParts = []string{"auth", "cookie", "token", "secret", "key", "password", "passwd", "credential", "signature", "session"}
+
+func credentialHeader(name string) bool {
+	lower := strings.ToLower(name)
+	for _, p := range credentialNameParts {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func percent(p float64) string {
