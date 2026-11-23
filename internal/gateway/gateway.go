@@ -20,6 +20,7 @@ import (
 	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/fault"
 	"gatekeeper/internal/lb"
 	"gatekeeper/internal/metrics"
 	"gatekeeper/internal/middleware"
@@ -60,6 +61,11 @@ type Gateway struct {
 	// reloads, so weights an operator set, a rollout's progress, and
 	// rollbacks survive a reload that leaves a route's split alone.
 	splits *split.Registry
+
+	// faults holds the fault injection rules. It outlives reloads, so a
+	// rule's max_duration counts from when it came into force, not from
+	// the last reload, and rules added through the admin API survive one.
+	faults *fault.Registry
 
 	configPath string
 
@@ -120,10 +126,12 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		accessLog:  accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
 	}
 	g.splits = split.NewRegistry(split.WithEvents(g.onSplitEvent))
+	g.faults = fault.NewRegistry(fault.WithEvents(g.onFaultEvent))
 	if m != nil {
 		m.SetBackendSource(g.backends.Snapshot)
 		m.SetActiveBansSource(g.activeBans)
 		m.SetVariantWeightSource(g.variantWeights)
+		m.SetFaultSource(g.faultRoutes)
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -149,17 +157,20 @@ func (g *Gateway) install(cfg *config.Config, b *built, tp *tracing.Provider) {
 	g.limiters.Store(&b.limiters)
 	g.access.Store(b.access)
 	g.splits.Commit(b.router.SplitRoutes())
+	g.configureFaults(cfg)
 	g.tracer.Store(tp)
 	now := time.Now()
 	g.loadedAt.Store(&now)
 }
 
 // Close stops background work tied to the current config — active
-// health checks on backends. Call it on shutdown.
+// health checks on backends, and fault rules' expiry timer. Call it on
+// shutdown.
 func (g *Gateway) Close() {
 	if r := g.router.Load(); r != nil {
 		r.Close()
 	}
+	g.faults.Close()
 }
 
 // ServeHTTP dispatches the request to the currently active pipeline.
@@ -318,6 +329,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 	opts := []proxy.Option{
 		proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends), proxy.WithTransformConfig(cfg.Transform),
 		proxy.WithSplitRegistry(g.splits), proxy.WithAPIKeyHeader(cfg.Auth.Header),
+		proxy.WithFaultRegistry(g.faults),
 	}
 	if prev != nil {
 		opts = append(opts, proxy.WithPrevious(prev))
