@@ -165,8 +165,59 @@ type Metrics struct {
 
 	variantWeights *variantWeightCollector
 
+	// FaultsInjected counts faults injected into backend attempts, by
+	// route and fault: "delay", "abort", or "reset". An attempt given a
+	// delay and an abort counts once for each.
+	FaultsInjected *prometheus.CounterVec
+
+	faults *faultCollector
+
 	backends *backendCollector
 }
+
+// FaultRoute is how many fault rules are in force on a route.
+type FaultRoute struct {
+	Route string
+	Rules int
+}
+
+// faultCollector reports, at scrape time, whether fault injection is
+// active — any rule in force, with the kill switch on — and how many
+// rules are in force on each route, so an injection left running can't
+// go unnoticed on a dashboard.
+type faultCollector struct {
+	active, rules *prometheus.Desc
+	source        atomic.Pointer[func() []FaultRoute]
+}
+
+func (c *faultCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.active
+	ch <- c.rules
+}
+
+func (c *faultCollector) Collect(ch chan<- prometheus.Metric) {
+	var routes []FaultRoute
+	if src := c.source.Load(); src != nil {
+		routes = (*src)()
+	}
+	active := 0.0
+	for _, r := range routes {
+		if r.Rules > 0 {
+			active = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.rules, prometheus.GaugeValue, float64(r.Rules), r.Route)
+	}
+	ch <- prometheus.MustNewConstMetric(c.active, prometheus.GaugeValue, active)
+}
+
+// SetFaultSource tells /metrics where to read the fault rules in force.
+func (m *Metrics) SetFaultSource(src func() []FaultRoute) {
+	m.faults.source.Store(&src)
+}
+
+// FaultCollector is the collector behind gatekeeper_fault_injection_active
+// and gatekeeper_fault_injection_rules, exposed for tests.
+func (m *Metrics) FaultCollector() prometheus.Collector { return m.faults }
 
 // VariantWeight is a variant's current share of its route's traffic.
 type VariantWeight struct {
@@ -492,6 +543,16 @@ func New() *Metrics {
 			desc: prometheus.NewDesc("gatekeeper_variant_weight_percent",
 				"Current share of a split route's traffic each variant gets, in percent.", []string{"route", "variant"}, nil),
 		},
+		FaultsInjected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_faults_injected_total",
+			Help: "Total number of faults injected into backend attempts, by route and fault (delay, abort, reset).",
+		}, []string{"route", "fault"}),
+		faults: &faultCollector{
+			active: prometheus.NewDesc("gatekeeper_fault_injection_active",
+				"1 while any fault injection rule is in force, else 0.", nil, nil),
+			rules: prometheus.NewDesc("gatekeeper_fault_injection_rules",
+				"Number of fault injection rules in force on a route.", []string{"route"}, nil),
+		},
 		activeBans: &activeBansCollector{
 			desc: prometheus.NewDesc("gatekeeper_access_control_active_bans",
 				"Number of client addresses currently banned, across every instance sharing the store.", nil, nil),
@@ -539,6 +600,8 @@ func New() *Metrics {
 		m.VariantDuration,
 		m.VariantRollbacks,
 		m.variantWeights,
+		m.FaultsInjected,
+		m.faults,
 		m.backends,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
