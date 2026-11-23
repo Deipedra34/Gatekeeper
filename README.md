@@ -34,6 +34,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **Authenticated admin API.** Optional, on its own listener (never the proxy port). It shows status, redacted config, routes, backend health, per-client rate limit state, and cache stats. It can reload the config, purge the cache, reset rate limits, drain and re-enable backends, and reset circuit breakers. Bearer tokens are stored as SHA-256 hashes; mTLS, a CIDR allowlist, failed-login lockout, a JSON audit log, tracing, and metrics are all included.
 - **IP access control and auto-ban.** Optional allow and deny lists of IPv4/IPv6 addresses and CIDR ranges, global and per route, checked first so a blocked address costs one lookup and no rate limit tokens. The client address comes from the connection, and `X-Forwarded-For` is believed only from configured trusted proxies. Addresses that keep hitting the rate limiter, failing auth, or getting denied are banned for a while, with escalating bans for repeat offenders, shared across instances through Redis. There are metrics, rate-limited logs, and admin endpoints to list, ban, and unban.
 - **Traffic splitting for canary and A/B releases.** Optional per-route variants, each with its own load-balanced backend group, split by weight. Clients stay on their variant through a stable hash of their IP, API key, JWT subject, or certificate, or a signed cookie. Allowlisted testers can force a variant with a header, match rules pin requests by header, cookie, or path, and a rollout raises a canary's weight in steps. Guardrails roll a variant back automatically when its 5xx rate or p95 latency gets worse than the baseline's, with a minimum sample and a cooldown. Per-variant metrics, log fields, span attributes, Grafana panels, and admin endpoints to set weights, pause, resume, promote, and roll back.
+- **Fault injection for resilience testing.** Optional per-route rules delay, abort, or reset a percentage of requests, targeted by header, path, method, variant, backend, or client allowlist. Faults go through the same retries, circuit breakers, and health checks a real failure would. A global kill switch, automatic expiry, startup and reload warnings, an "active" gauge, and a guard against 100% aborts in production keep it from causing harm. Includes metrics, log fields, span attributes, Grafana panels, and admin endpoints to add and remove rules at runtime.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
 ## Installation
@@ -158,6 +159,7 @@ internal/circuitbreaker/ the Closed/Open/Half-Open state machine wrapped around 
 internal/server/       the listeners: plain HTTP or HTTPS (mTLS, certificate hot reload, HSTS), plus the HTTP→HTTPS redirect
 internal/lb/           load balancing: backend pools, strategies, consistent hashing, active/passive health checks, draining
 internal/split/        traffic splitting: stable hashing, sticky assignment, overrides and rules, rollouts, auto-rollback guardrails
+internal/fault/        fault injection: rules, targeting, percentages, exemptions, expiry, and the registry the router asks per request
 internal/admin/        the admin API: its own listener, token/mTLS auth, audit log, and the status/config/backends/cache/ratelimit endpoints
 internal/tracing/      OpenTelemetry setup (exporters, sampling, OTEL_* overrides), the server span, and span/propagation helpers
 internal/certgen/      throwaway CA / server / client certificate generation for tests and scripts/gencerts
@@ -1843,8 +1845,11 @@ All responses are JSON. Errors always have the same shape:
 | `DELETE /admin/v1/bans/{ip}` | Lifts a ban |
 | `GET /admin/v1/routes/{route}/split` | A split route's current weights, rollout, cooldowns, and last rollback |
 | `POST /admin/v1/routes/{route}/split` | **Destructive.** Sets weights, pauses or resumes the rollout, promotes a variant, or rolls one back. See [Traffic split endpoints](#traffic-split-endpoints) |
+| `GET /admin/v1/faults` | Fault injection rules, whether each is in force, and its remaining time |
+| `POST /admin/v1/faults` | **Destructive.** Creates or replaces a fault injection rule with a TTL. See [Fault endpoints](#fault-endpoints) |
+| `DELETE /admin/v1/faults/{id}` | Removes a fault injection rule |
 
-`reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, `circuit-breakers/{id}/reset`, both ban endpoints, and `POST routes/{route}/split` accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
+`reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, `circuit-breakers/{id}/reset`, both ban endpoints, `POST routes/{route}/split`, and `POST` and `DELETE faults` accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
 
 **Identifiers:**
 
@@ -1929,7 +1934,7 @@ Two counters are added to the existing `/metrics` endpoint:
 `/admin/v1/config` returns the config with the same keys as the YAML file. Before it's returned:
 
 - **API keys** are replaced by their `key:` fingerprints. That covers `auth.api_keys`, and the keys of `rate_limit.clients` when the scope is `api_key`.
-- **Other secrets** become `[REDACTED]`: `auth.jwt.secret`, `storage.redis.password`, every admin token hash, and traffic split cookie secrets. The API keys allowed to override a traffic split are shown as fingerprints, and match rule values on credential-like headers or cookies are redacted.
+- **Other secrets** become `[REDACTED]`: `auth.jwt.secret`, `storage.redis.password`, every admin token hash, and traffic split cookie secrets. The API keys allowed to override a traffic split are shown as fingerprints, and match rule values on credential-like headers or cookies are redacted. API keys a fault injection rule targets are shown as fingerprints, and its header value is redacted when the header looks like a credential.
 - **Credentials in URLs** (`user:password@` in backend targets or the tracing endpoint) are removed.
 - **Transform credentials:** header and query values in route `transform` sections whose names look like credentials (`Authorization`, `X-Api-Token`, ...) become `[REDACTED]`.
 - **Safety net:** any other value that contains one of those secrets is redacted too.
@@ -2084,7 +2089,7 @@ gatekeeper_tls_certificate_reloads_total{result="success"} 2
 
 The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
-Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). Access control metrics (`gatekeeper_access_control_*`) are described in [Logging, metrics, and tracing](#logging-metrics-and-tracing). Traffic split metrics (`gatekeeper_variant_*`) are described in [Logs, metrics, and tracing](#logs-metrics-and-tracing). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
+Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). Access control metrics (`gatekeeper_access_control_*`) are described in [Logging, metrics, and tracing](#logging-metrics-and-tracing). Traffic split metrics (`gatekeeper_variant_*`) are described in [Logs, metrics, and tracing](#logs-metrics-and-tracing). Fault injection metrics (`gatekeeper_fault*`) are described in [Fault injection](#logs-metrics-and-tracing-1). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
 
 **Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
 
@@ -2283,7 +2288,7 @@ A lookup is a binary search over merged ranges, so it stays in the tens of nanos
 
 ## Architecture Decisions
 
-Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address, how traffic splits assign clients and roll back — live in [`docs/adr/`](docs/adr/).
+Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address, how traffic splits assign clients and roll back, where injected faults take effect and how they're kept safe — live in [`docs/adr/`](docs/adr/).
 
 ## Configuration reference
 
@@ -2304,6 +2309,8 @@ transform:   { trust_forwarded_headers, request_id: { enabled, header }, securit
              # per route: transform: { request: { strip_prefix, rewrite: { pattern, replacement }, add_headers, set_headers, remove_headers, add_query_params, remove_query_params }, response: { add_headers, set_headers, remove_headers, security_headers } }
 access_control: { mode: off|denylist|allowlist_only, allow: [...], deny: [...], deny_status, trusted_proxies: [...], auto_ban: { enabled, threshold, window, ban_duration, triggers: [rate_limit|auth_failure|denied], never_ban: [...], escalation: { enabled, multiplier, max_duration, reset_after } } }
              # per route: access_control: { mode, allow, deny, deny_status }
+fault_injection: { global_enabled, environment: production|staging|development|test, exempt_paths: [...] }
+             # per route: fault_injection: { enabled, delay: { percentage, fixed | min, max }, abort: { percentage, status }, connection_reset: { percentage }, match: { header: { name, value }, path_prefixes, methods, variants, backends, clients: { tiers, api_keys, cidrs } }, max_duration, count_as_backend_failure, allow_full_abort }
 admin:       { enabled, listen, tokens: [ { id, sha256 } ], mtls: { enabled, allowed_cns: [...] }, allowed_cidrs: [...], tls: { ...same as tls... }, auth_failures: { max_failures, window }, read_timeout, write_timeout, idle_timeout, max_body_bytes, audit_log }
 ```
 
