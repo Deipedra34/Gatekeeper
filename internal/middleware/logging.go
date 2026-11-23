@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -39,9 +40,12 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // RequestLogger logs one line per request: method, path, status,
 // duration, and remote address — plus trace_id=<id> when the request is
 // being traced, so a log line leads straight to its trace, and
-// variant=<name> when a split route served it from a variant. A proxied
-// WebSocket connection is logged once it closes, as status 101 with the
-// connection's whole lifetime as its duration.
+// variant=<name> when a split route served it from a variant, and
+// fault=<faults> when a fault was injected into it (fault=delay,abort). A
+// proxied WebSocket connection is logged once it closes, as status 101
+// with the connection's whole lifetime as its duration; a request whose
+// connection was reset by an injected fault is logged with "reset" for
+// its status.
 func RequestLogger(logger *log.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,12 +56,19 @@ func RequestLogger(logger *log.Logger) Middleware {
 
 			next.ServeHTTP(rec, r)
 
-			line := fmt.Sprintf("%s %s %d %s %s", r.Method, r.URL.Path, rec.status, time.Since(start), r.RemoteAddr)
+			status := strconv.Itoa(rec.status)
+			if notes.reset.Load() {
+				status = "reset"
+			}
+			line := fmt.Sprintf("%s %s %s %s %s", r.Method, r.URL.Path, status, time.Since(start), r.RemoteAddr)
 			if sc := trace.SpanContextFromContext(r.Context()); sc.HasTraceID() {
 				line += " trace_id=" + sc.TraceID().String()
 			}
 			if v := notes.variant.Load(); v != nil {
 				line += " variant=" + *v
+			}
+			if f := notes.fault.Load(); f != nil {
+				line += " fault=" + *f
 			}
 			logger.Print(line)
 		})
@@ -68,6 +79,8 @@ func RequestLogger(logger *log.Logger) Middleware {
 // request's log line.
 type logNotes struct {
 	variant atomic.Pointer[string]
+	fault   atomic.Pointer[string]
+	reset   atomic.Bool
 }
 
 type logNotesKey struct{}
@@ -77,5 +90,22 @@ type logNotesKey struct{}
 func NoteVariant(ctx context.Context, variant string) {
 	if n, ok := ctx.Value(logNotesKey{}).(*logNotes); ok {
 		n.variant.Store(&variant)
+	}
+}
+
+// NoteFault records the faults injected into the request ("delay",
+// "abort,delay", ...), for its log line. Without RequestLogger in the
+// chain it does nothing.
+func NoteFault(ctx context.Context, faults string) {
+	if n, ok := ctx.Value(logNotesKey{}).(*logNotes); ok {
+		n.fault.Store(&faults)
+	}
+}
+
+// NoteConnectionReset records that the request's client connection was
+// reset rather than answered, for its log line.
+func NoteConnectionReset(ctx context.Context) {
+	if n, ok := ctx.Value(logNotesKey{}).(*logNotes); ok {
+		n.reset.Store(true)
 	}
 }

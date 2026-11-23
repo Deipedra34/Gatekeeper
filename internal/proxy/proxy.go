@@ -448,7 +448,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// An injected connection reset failed the last attempt: nothing was
 	// written, and the client gets the reset instead of an answer.
 	if resetRequested(req) {
-		resetClient(client)
+		resetClient(client, req)
 	}
 }
 

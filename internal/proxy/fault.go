@@ -54,6 +54,7 @@ func (r *Router) decideFault(rt *route, req *http.Request) *http.Request {
 	}
 	ctx := fault.WithDecision(req.Context(), d)
 	trace.SpanFromContext(ctx).SetAttributes(faultAttributes(d)...)
+	middleware.NoteFault(ctx, d.Label())
 	if d.Reset {
 		ctx = context.WithValue(ctx, resetKey{}, &resetState{})
 	}
@@ -88,12 +89,13 @@ func resetRequested(req *http.Request) bool {
 	return ok && s.requested.Load()
 }
 
-// resetClient abruptly closes the client connection behind w: hijacked
+// resetClient abruptly closes req's client connection, behind w: hijacked
 // and closed with SO_LINGER 0, so the client sees a TCP reset rather
 // than an orderly close. Where the connection can't be hijacked (HTTP/2)
 // the stream is aborted instead. A split route's guardrails count it as
 // a failed request.
-func resetClient(w http.ResponseWriter) {
+func resetClient(w http.ResponseWriter, req *http.Request) {
+	middleware.NoteConnectionReset(req.Context())
 	if vr, ok := w.(*variantRecorder); ok {
 		vr.status, vr.reset = http.StatusBadGateway, true
 	}
