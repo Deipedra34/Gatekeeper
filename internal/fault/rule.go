@@ -41,12 +41,14 @@ type Rule struct {
 	// Start is when the rule came into force; Expires, when it stops (the
 	// zero time when it never does).
 	Start, Expires time.Time
+
+	match *matcher
 }
 
 // NewRule compiles cfg, already validated, into a rule for route that
 // came into force at start.
 func NewRule(id, route, source string, cfg config.RouteFaultConfig, start time.Time) *Rule {
-	r := &Rule{ID: id, Route: route, Source: source, Config: cfg, Start: start}
+	r := &Rule{ID: id, Route: route, Source: source, Config: cfg, Start: start, match: newMatcher(cfg.Match)}
 	if d := cfg.MaxDuration.Duration; d > 0 {
 		r.Expires = start.Add(d)
 	}
@@ -65,13 +67,19 @@ func hit(sample Sampler, pct float64) bool {
 	return pct > 0 && sample()*100 < pct
 }
 
+// Matches reports whether req meets the rule's request-level targeting.
+func (r *Rule) Matches(req Request) bool { return r.match.matches(req) }
+
 // decide rolls each of the rule's faults for one request, independently
 // of one another, and returns what to inject; ok is false when nothing
 // is. A connection reset takes precedence over an abort; a delay is
 // applied before either.
 func (r *Rule) decide(sample Sampler) (d Decision, ok bool) {
 	cfg := r.Config
-	d = Decision{Rule: r.ID, Route: r.Route, CountsAsBackendFailure: cfg.CountsAsBackendFailure()}
+	d = Decision{
+		Rule: r.ID, Route: r.Route, CountsAsBackendFailure: cfg.CountsAsBackendFailure(),
+		backends: r.match.backends,
+	}
 	if dl := cfg.Delay; dl != nil && hit(sample, dl.Percentage) {
 		d.Delay = delayFor(dl, sample)
 	}
@@ -107,6 +115,17 @@ type Decision struct {
 	// CountsAsBackendFailure makes the faults count against the backend:
 	// retried, and reported to its circuit breaker and passive health.
 	CountsAsBackendFailure bool
+
+	// backends limits the decision to attempts on these backends, by
+	// lb.Label; nil means every backend.
+	backends map[string]bool
+}
+
+// AppliesTo reports whether the decision applies to an attempt on the
+// backend labelled backend (see lb.Backend.Label). A retry that lands on
+// a backend the rule doesn't target goes through untouched.
+func (d Decision) AppliesTo(backend string) bool {
+	return d.backends == nil || d.backends[backend]
 }
 
 // Empty reports whether the decision injects nothing.
