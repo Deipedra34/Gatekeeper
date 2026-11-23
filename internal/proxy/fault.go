@@ -2,8 +2,11 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 
 	"gatekeeper/internal/fault"
@@ -61,9 +64,13 @@ func (r *Router) faultClient(req *http.Request) fault.Client {
 	return c
 }
 
+// FaultHeader marks a response whose status was injected by an abort
+// fault ("X-Gatekeeper-Fault: abort").
+const FaultHeader = "X-Gatekeeper-Fault"
+
 // roundTrip sends one attempt to b — or, when the request carries a fault
 // decision that applies to b, injects the fault in its place: a delay
-// first, then the backend call.
+// first, then an abort's response instead of the backend's.
 func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Response, error) {
 	if d, ok := fault.FromContext(req.Context()); ok && d.AppliesTo(b.Label()) {
 		if d.Delay > 0 {
@@ -74,8 +81,34 @@ func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Resp
 				return nil, err
 			}
 		}
+		if d.AbortStatus != 0 {
+			// Answered as if the backend had: a 5xx is retried and counted
+			// by the circuit breaker and passive health check, a 4xx is
+			// passed to the client, exactly like a real one.
+			return abortResponse(req, d.AbortStatus), nil
+		}
 	}
 	return b.Settings().Transport.RoundTrip(req)
+}
+
+// abortResponse is the response an abort fault answers req with.
+func abortResponse(req *http.Request, status int) *http.Response {
+	body := "fault injected: " + strconv.Itoa(status) + " " + http.StatusText(status) + "\n"
+	return &http.Response{
+		Status:     strconv.Itoa(status) + " " + http.StatusText(status),
+		StatusCode: status,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Content-Type":           {"text/plain; charset=utf-8"},
+			"X-Content-Type-Options": {"nosniff"},
+			FaultHeader:              {fault.TypeAbort},
+		},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
+	}
 }
 
 // sleepContext waits for d, or until ctx is done if that's sooner. It
