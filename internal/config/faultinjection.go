@@ -1,8 +1,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+
+	"gatekeeper/internal/accesscontrol"
 )
 
 // Fault injection environments, for FaultInjectionConfig.Environment.
@@ -82,6 +85,71 @@ type RouteFaultConfig struct {
 	// ConnectionReset abruptly closes the client connection instead of
 	// answering.
 	ConnectionReset *FaultReset `yaml:"connection_reset,omitempty"`
+
+	// Match limits the rule to some of the route's requests. Left empty,
+	// it applies to all of them.
+	Match FaultMatch `yaml:"match"`
+}
+
+// DefaultFaultHeader is the request header the README's examples use to
+// ask for a fault: "X-Gatekeeper-Fault: true".
+const DefaultFaultHeader = "X-Gatekeeper-Fault"
+
+// FaultMatch limits a rule to requests meeting every condition set.
+type FaultMatch struct {
+	// Header limits the rule to requests carrying this header, with
+	// Value if it's set (e.g. X-Gatekeeper-Fault: true).
+	Header *ValueMatch `yaml:"header,omitempty"`
+	// PathPrefixes limits the rule to request paths with one of these
+	// prefixes.
+	PathPrefixes []string `yaml:"path_prefixes,omitempty"`
+	// Methods limits the rule to these request methods (GET, POST, ...).
+	Methods []string `yaml:"methods,omitempty"`
+	// Variants limits the rule to requests a split route sends to one of
+	// these variants.
+	Variants []string `yaml:"variants,omitempty"`
+	// Backends limits the rule to attempts on these backends (their
+	// targets, as configured): a retry on another backend isn't faulted.
+	Backends []string `yaml:"backends,omitempty"`
+	// Clients limits the rule to allowlisted clients.
+	Clients *FaultClients `yaml:"clients,omitempty"`
+}
+
+// FaultClients lists the clients a rule applies to: a client matching
+// any entry does.
+type FaultClients struct {
+	// Tiers are rate limit tiers.
+	Tiers []string `yaml:"tiers,omitempty"`
+	// APIKeys are raw API keys, compared with the auth header.
+	APIKeys []string `yaml:"api_keys,omitempty"`
+	// CIDRs are client addresses or ranges.
+	CIDRs []string `yaml:"cidrs,omitempty"`
+}
+
+// FaultScope is what a rule's targeting is checked against: the rate
+// limit tiers, and the variants and backend targets of the rule's route.
+type FaultScope struct {
+	Tiers    map[string]TierLimit
+	Variants []string
+	Backends []string
+}
+
+// FaultScope returns the scope rules on r are checked against.
+func (r Route) FaultScope(tiers map[string]TierLimit) FaultScope {
+	scope := FaultScope{Tiers: tiers}
+	if ts := r.TrafficSplit; ts != nil {
+		for i, v := range ts.Variants {
+			scope.Variants = append(scope.Variants, v.Name)
+			for _, b := range r.VariantRoute(i).EffectiveBackends() {
+				scope.Backends = append(scope.Backends, b.Target)
+			}
+		}
+		return scope
+	}
+	for _, b := range r.EffectiveBackends() {
+		scope.Backends = append(scope.Backends, b.Target)
+	}
+	return scope
 }
 
 // FaultDelay delays a percentage of requests by a fixed duration or by a
@@ -115,7 +183,7 @@ type FaultReset struct {
 // "routes[2].fault_injection"). A rule is checked even while it's
 // disabled, so a typo surfaces at load rather than the day it's turned
 // on.
-func (f *RouteFaultConfig) Validate(where string) error {
+func (f *RouteFaultConfig) Validate(where string, scope FaultScope) error {
 	if f.Delay == nil && f.Abort == nil && f.ConnectionReset == nil {
 		return fmt.Errorf("%s: set at least one of delay, abort, connection_reset", where)
 	}
@@ -150,7 +218,68 @@ func (f *RouteFaultConfig) Validate(where string) error {
 			return err
 		}
 	}
+	return f.Match.validate(where+".match", scope)
+}
+
+func (m FaultMatch) validate(where string, scope FaultScope) error {
+	if h := m.Header; h != nil && !validHeaderName(h.Name) {
+		return fmt.Errorf("%s.header.name %q is not a valid header name", where, h.Name)
+	}
+	for i, p := range m.PathPrefixes {
+		if !strings.HasPrefix(p, "/") {
+			return fmt.Errorf("%s.path_prefixes[%d]: %q must start with /", where, i, p)
+		}
+	}
+	for i, method := range m.Methods {
+		if method == "" || method != strings.ToUpper(method) || !validHeaderName(method) {
+			return fmt.Errorf("%s.methods[%d]: %q is not an upper-case HTTP method", where, i, method)
+		}
+	}
+	for i, v := range m.Variants {
+		if !contains(scope.Variants, v) {
+			if len(scope.Variants) == 0 {
+				return fmt.Errorf("%s.variants[%d]: the route has no traffic_split, so it has no variant %q", where, i, v)
+			}
+			return fmt.Errorf("%s.variants[%d]: no variant is called %q; the route has %s", where, i, v, strings.Join(scope.Variants, ", "))
+		}
+	}
+	for i, b := range m.Backends {
+		if !contains(scope.Backends, b) {
+			return fmt.Errorf("%s.backends[%d]: %q is not one of the route's backends (%s)", where, i, b, strings.Join(scope.Backends, ", "))
+		}
+	}
+	if c := m.Clients; c != nil {
+		if len(c.Tiers) == 0 && len(c.APIKeys) == 0 && len(c.CIDRs) == 0 {
+			return fmt.Errorf("%s.clients: list the tiers, api_keys, or cidrs the rule applies to", where)
+		}
+		for i, t := range c.Tiers {
+			if _, ok := scope.Tiers[t]; !ok {
+				return fmt.Errorf("%s.clients.tiers[%d]: no rate_limit tier is called %q", where, i, t)
+			}
+		}
+		for i, k := range c.APIKeys {
+			if k == "" {
+				return fmt.Errorf("%s.clients.api_keys[%d] must not be empty", where, i)
+			}
+		}
+		if _, err := accesscontrol.NewPrefixSet(c.CIDRs); err != nil {
+			var ee *accesscontrol.EntryError
+			if errors.As(err, &ee) {
+				return fmt.Errorf("%s.clients.cidrs[%d]: %w", where, ee.Index, ee.Err)
+			}
+			return fmt.Errorf("%s.clients.cidrs: %w", where, err)
+		}
+	}
 	return nil
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // validPercentage checks that p is a percentage, 0 to 100.

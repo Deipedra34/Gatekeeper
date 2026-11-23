@@ -617,7 +617,7 @@ func (c *Config) validate() error {
 			return fmt.Errorf("routes[%d]: %w", i, err)
 		}
 		if f := r.FaultInjection; f != nil {
-			if err := f.Validate(fmt.Sprintf("routes[%d].fault_injection", i)); err != nil {
+			if err := f.Validate(fmt.Sprintf("routes[%d].fault_injection", i), r.FaultScope(c.RateLimit.Tiers)); err != nil {
 				return err
 			}
 		}
