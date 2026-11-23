@@ -13,3 +13,4 @@ format: Title, Status, Context, Decision, Consequences.
 8. [Request and response transformation with a fixed variable whitelist](0008-request-response-transformation.md)
 9. [IP access control: sorted range tables and right-most-untrusted client addresses](0009-ip-access-control.md)
 10. [Traffic splitting: bucket hashing in config order and one-way, per-instance rollback](0010-traffic-splitting.md)
+11. [Fault injection: decided in the router, injected per backend attempt, off by default](0011-fault-injection.md)
