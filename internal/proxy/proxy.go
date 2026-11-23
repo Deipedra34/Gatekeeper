@@ -430,6 +430,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		req = r.decideFault(rt, req)
 	}
 
+	client := w // as the router got it, for a connection reset
 	w, req, vars := r.prepare(rt, w, req)
 
 	// Checked before caching and before the retry transport: an upgrade
@@ -441,9 +442,14 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if r.cacheableRequest(rt, req) {
 		r.serveWithCache(w, req, rt, rt.reqTransform.CacheVary(req, vars))
-		return
+	} else {
+		rt.proxy.ServeHTTP(w, req)
 	}
-	rt.proxy.ServeHTTP(w, req)
+	// An injected connection reset failed the last attempt: nothing was
+	// written, and the client gets the reset instead of an answer.
+	if resetRequested(req) {
+		resetClient(client)
+	}
 }
 
 // AuthModeFor returns the auth mode of the route req will be dispatched
@@ -509,6 +515,9 @@ func (r *Router) serveWithCache(w http.ResponseWriter, req *http.Request, rt *ro
 
 	rec := newResponseRecorder()
 	rt.proxy.ServeHTTP(rec, req)
+	if resetRequested(req) {
+		return // nothing to store or send: the router resets the connection
+	}
 
 	if rec.statusCode == http.StatusOK && cache.Storable(rec.Header()) {
 		fresh := &cache.Entry{
@@ -655,6 +664,8 @@ func (e *backendError) Unwrap() error { return e.err }
 func errorHandler(routeLabel string) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, req *http.Request, err error) {
 		switch {
+		case errors.Is(err, errFaultReset) && requestReset(req):
+			return // written nothing: the router resets the client connection
 		case errors.Is(err, errCircuitOpen):
 			http.Error(w, "circuit breaker open: backend temporarily unavailable", http.StatusServiceUnavailable)
 			return

@@ -2,11 +2,15 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gatekeeper/internal/fault"
@@ -44,7 +48,62 @@ func (r *Router) decideFault(rt *route, req *http.Request) *http.Request {
 	if !ok {
 		return req
 	}
-	return req.WithContext(fault.WithDecision(req.Context(), d))
+	ctx := fault.WithDecision(req.Context(), d)
+	if d.Reset {
+		ctx = context.WithValue(ctx, resetKey{}, &resetState{})
+	}
+	return req.WithContext(ctx)
+}
+
+// errFaultReset is what a backend attempt fails with when a connection
+// reset is injected: a connection error, as if the backend had dropped
+// it, so it's retried and counted like one.
+var errFaultReset = errors.New("fault injected: connection reset")
+
+// resetState records that a request's last attempt failed with an
+// injected connection reset, so the router resets the client connection
+// instead of answering.
+type resetState struct{ requested atomic.Bool }
+
+type resetKey struct{}
+
+// requestReset marks req's client connection for a reset; false if req
+// wasn't given a reset fault.
+func requestReset(req *http.Request) bool {
+	s, ok := req.Context().Value(resetKey{}).(*resetState)
+	if ok {
+		s.requested.Store(true)
+	}
+	return ok
+}
+
+// resetRequested reports whether req's client connection is to be reset.
+func resetRequested(req *http.Request) bool {
+	s, ok := req.Context().Value(resetKey{}).(*resetState)
+	return ok && s.requested.Load()
+}
+
+// resetClient abruptly closes the client connection behind w: hijacked
+// and closed with SO_LINGER 0, so the client sees a TCP reset rather
+// than an orderly close. Where the connection can't be hijacked (HTTP/2)
+// the stream is aborted instead. A split route's guardrails count it as
+// a failed request.
+func resetClient(w http.ResponseWriter) {
+	if vr, ok := w.(*variantRecorder); ok {
+		vr.status, vr.reset = http.StatusBadGateway, true
+	}
+	conn, _, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		panic(http.ErrAbortHandler) // net/http resets the stream, and logs nothing
+	}
+	raw := conn
+	if tc, ok := conn.(*tls.Conn); ok {
+		raw = tc.NetConn()
+	}
+	if tcp, ok := raw.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
+	}
+	_ = raw.Close()
 }
 
 // faultClient collects what a fault rule's client allowlist needs to
@@ -70,7 +129,8 @@ const FaultHeader = "X-Gatekeeper-Fault"
 
 // roundTrip sends one attempt to b — or, when the request carries a fault
 // decision that applies to b, injects the fault in its place: a delay
-// first, then an abort's response instead of the backend's.
+// first, then a connection reset or an abort's response instead of the
+// backend's.
 func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Response, error) {
 	if d, ok := fault.FromContext(req.Context()); ok && d.AppliesTo(b.Label()) {
 		if d.Delay > 0 {
@@ -80,6 +140,9 @@ func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Resp
 			if err := sleepContext(req.Context(), d.Delay); err != nil {
 				return nil, err
 			}
+		}
+		if d.Reset {
+			return nil, errFaultReset
 		}
 		if d.AbortStatus != 0 {
 			// Answered as if the backend had: a 5xx is retried and counted

@@ -146,7 +146,7 @@ func (r *Router) selectVariant(rt *route, w http.ResponseWriter, req *http.Reque
 	start := time.Now()
 	rec := &variantRecorder{ResponseWriter: w, status: http.StatusOK}
 	done := func() {
-		if rec.hijacked {
+		if rec.hijacked && !rec.reset {
 			return // a WebSocket: its handshake isn't a request to judge
 		}
 		elapsed := time.Since(start)
@@ -163,6 +163,7 @@ type variantRecorder struct {
 	status      int
 	wroteHeader bool
 	hijacked    bool
+	reset       bool // hijacked for an injected connection reset
 }
 
 func (rec *variantRecorder) WriteHeader(status int) {
