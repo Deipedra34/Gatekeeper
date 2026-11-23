@@ -27,15 +27,17 @@ type Registry struct {
 	mu      sync.Mutex
 	enabled bool
 	config  map[string]*Rule // config rules, by route label
+	exempt  exemptions
 
 	// snap is what Decide reads; nil whenever nothing can be injected.
 	snap atomic.Pointer[snapshot]
 }
 
 // snapshot is the rules in force, by route label, in the order they're
-// tried.
+// tried, and the requests that are never faulted.
 type snapshot struct {
 	byRoute map[string][]*Rule
+	exempt  exemptions
 }
 
 // Option customises a Registry.
@@ -65,13 +67,15 @@ func ConfigRuleID(label string) string {
 	return "config-" + hex.EncodeToString(sum[:])[:12]
 }
 
-// Configure applies a config: the kill switch, and every route's enabled
-// fault_injection section as a config rule. A rule a reload leaves
-// unchanged keeps its start time; a changed one starts over.
+// Configure applies a config: the kill switch, the exempt paths, and
+// every route's enabled fault_injection section as a config rule. A rule
+// a reload leaves unchanged keeps its start time; a changed one starts
+// over.
 func (g *Registry) Configure(cfg *config.Config) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.enabled = cfg.FaultInjection.GlobalEnabled
+	g.exempt = newExemptions(cfg.Metrics.Path, cfg.FaultInjection.ExemptPaths)
 	now := g.now()
 	rules := map[string]*Rule{}
 	for _, rt := range cfg.Routes {
@@ -96,7 +100,7 @@ func (g *Registry) rebuild() {
 		g.snap.Store(nil)
 		return
 	}
-	s := &snapshot{byRoute: map[string][]*Rule{}}
+	s := &snapshot{byRoute: map[string][]*Rule{}, exempt: g.exempt}
 	for label, r := range g.config {
 		s.byRoute[label] = append(s.byRoute[label], r)
 	}
@@ -113,14 +117,15 @@ func (g *Registry) Enabled() bool {
 // Decide returns what to inject into req on the route labelled route:
 // the first of the route's rules in force whose targeting matches
 // decides, by rolling its percentages. ok is false when nothing is
-// injected.
+// injected — always for the metrics and health check paths and for
+// health check probes (see BuiltinExemptPaths).
 func (g *Registry) Decide(route string, req Request) (d Decision, ok bool) {
 	s := g.snap.Load()
 	if s == nil {
 		return Decision{}, false
 	}
 	rules := s.byRoute[route]
-	if len(rules) == 0 {
+	if len(rules) == 0 || s.exempt.exempt(req.HTTP) {
 		return Decision{}, false
 	}
 	now := g.now()
