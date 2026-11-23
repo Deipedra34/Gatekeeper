@@ -133,6 +133,7 @@ const FaultHeader = "X-Gatekeeper-Fault"
 // abort's response instead of the backend's.
 func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Response, error) {
 	if d, ok := fault.FromContext(req.Context()); ok && d.CountsAsBackendFailure && d.AppliesTo(b.Label()) {
+		t.recordFault(d)
 		if d.Delay > 0 {
 			// The attempt's context: a delay longer than proxy.timeout
 			// fails the attempt as a slow backend would, and a client
@@ -165,6 +166,7 @@ func (t *retryTransport) injectUncounted(req *http.Request, b *lb.Backend) (resp
 	if !ok || d.CountsAsBackendFailure || !d.AppliesTo(b.Label()) {
 		return nil, false, nil
 	}
+	t.recordFault(d)
 	if d.Delay > 0 {
 		err = sleepContext(req.Context(), d.Delay)
 	}
@@ -182,6 +184,16 @@ func (t *retryTransport) injectUncounted(req *http.Request, b *lb.Backend) (resp
 		cb.Release()
 	}
 	return resp, true, err
+}
+
+// recordFault counts the faults d injects into an attempt.
+func (t *retryTransport) recordFault(d fault.Decision) {
+	if t.metrics == nil {
+		return
+	}
+	for _, typ := range d.Types() {
+		t.metrics.FaultsInjected.WithLabelValues(t.route, typ).Inc()
+	}
 }
 
 // abortResponse is the response an abort fault answers req with.
