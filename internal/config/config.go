@@ -55,6 +55,10 @@ type Config struct {
 	// AccessControl holds the IP allow/deny lists, trusted proxies, and
 	// auto-ban settings. Nil (the section left out) means none of it.
 	AccessControl *AccessControlConfig `yaml:"access_control,omitempty"`
+
+	// FaultInjection is the global kill switch and safety settings for
+	// the routes' fault_injection sections. Left out, nothing is faulted.
+	FaultInjection FaultInjectionConfig `yaml:"fault_injection"`
 }
 
 // ServerConfig controls the HTTP listener Gatekeeper itself exposes.
@@ -499,6 +503,7 @@ func (c *Config) applyDefaults() {
 	c.applyTransformDefaults()
 	c.applyAccessControlDefaults()
 	c.applyTrafficSplitDefaults()
+	c.FaultInjection.applyDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -655,6 +660,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.validateAccessControl(); err != nil {
+		return err
+	}
+	if err := c.FaultInjection.validate(); err != nil {
 		return err
 	}
 
