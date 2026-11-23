@@ -105,6 +105,14 @@ const (
 	AttrVariant       = attribute.Key("gatekeeper.variant")
 	AttrVariantSource = attribute.Key("gatekeeper.variant.source")
 
+	// AttrFaultInjected is the fault injected into the request — "delay",
+	// "abort", or "reset", or a delay with one of the others
+	// ("delay,abort") — and AttrFaultRule the ID of the rule that decided
+	// it. Set on the server span of faulted requests, and on each backend
+	// attempt span the fault was injected into.
+	AttrFaultInjected = attribute.Key("fault.injected")
+	AttrFaultRule     = attribute.Key("gatekeeper.fault.rule")
+
 	AttrWSRejectReason = attribute.Key("gatekeeper.websocket.reject_reason")
 	AttrWSCloseReason  = attribute.Key("gatekeeper.websocket.close_reason")
 )

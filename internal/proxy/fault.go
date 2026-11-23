@@ -13,9 +13,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"gatekeeper/internal/fault"
 	"gatekeeper/internal/lb"
 	"gatekeeper/internal/middleware"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/transform"
 )
 
@@ -49,6 +53,7 @@ func (r *Router) decideFault(rt *route, req *http.Request) *http.Request {
 		return req
 	}
 	ctx := fault.WithDecision(req.Context(), d)
+	trace.SpanFromContext(ctx).SetAttributes(faultAttributes(d)...)
 	if d.Reset {
 		ctx = context.WithValue(ctx, resetKey{}, &resetState{})
 	}
@@ -134,6 +139,7 @@ const FaultHeader = "X-Gatekeeper-Fault"
 func (t *retryTransport) roundTrip(req *http.Request, b *lb.Backend) (*http.Response, error) {
 	if d, ok := fault.FromContext(req.Context()); ok && d.CountsAsBackendFailure && d.AppliesTo(b.Label()) {
 		t.recordFault(d)
+		trace.SpanFromContext(req.Context()).SetAttributes(faultAttributes(d)...)
 		if d.Delay > 0 {
 			// The attempt's context: a delay longer than proxy.timeout
 			// fails the attempt as a slow backend would, and a client
@@ -184,6 +190,14 @@ func (t *retryTransport) injectUncounted(req *http.Request, b *lb.Backend) (resp
 		cb.Release()
 	}
 	return resp, true, err
+}
+
+// faultAttributes describe d on a span.
+func faultAttributes(d fault.Decision) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		tracing.AttrFaultInjected.String(d.Label()),
+		tracing.AttrFaultRule.String(d.Rule),
+	}
 }
 
 // recordFault counts the faults d injects into an attempt.
