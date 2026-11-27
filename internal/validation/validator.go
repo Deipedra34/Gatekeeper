@@ -46,6 +46,9 @@ const (
 	// ReasonParameter: a path, query, or header parameter is missing or
 	// doesn't match its schema.
 	ReasonParameter = "parameter"
+	// ReasonBody: the body is missing, malformed, or doesn't match its
+	// schema.
+	ReasonBody = "body"
 )
 
 // Violation is one way a request fails its spec. It names the part of
@@ -146,6 +149,12 @@ func (v *Validator) Check(ctx context.Context, req *http.Request) Result {
 	in.Body = http.NoBody
 	in.Header = v.spec.withoutSecrets(req.Header)
 	opts := v.options
+	if rb := requestBody(route); rb != nil {
+		if fail := v.prepareBody(req, in, rb, &opts); fail != nil {
+			fail.Operation = res.Operation
+			return *fail
+		}
+	}
 	err = openapi3filter.ValidateRequest(ctx, &openapi3filter.RequestValidationInput{
 		Request:    in,
 		PathParams: params,

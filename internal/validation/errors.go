@@ -57,11 +57,31 @@ func (c *collector) add(err error) {
 }
 
 func (c *collector) requestError(re *openapi3filter.RequestError) {
-	if p := re.Parameter; p != nil {
-		c.parameterError(p, re.Err)
-		return
+	switch {
+	case re.Parameter != nil:
+		c.parameterError(re.Parameter, re.Err)
+	case re.RequestBody != nil:
+		c.bodyError(re.Err)
+	default:
+		c.note(ReasonParameter, Violation{In: "request", Message: "does not match the API specification"})
 	}
-	c.note(ReasonParameter, Violation{In: "request", Message: "does not match the API specification"})
+}
+
+// bodyError adds the violations of a body that failed with err.
+func (c *collector) bodyError(err error) {
+	var perr *openapi3filter.ParseError
+	switch {
+	case errors.Is(err, openapi3filter.ErrInvalidRequired):
+		c.note(ReasonBody, Violation{In: "body", Message: "is required"})
+	case hasSchemaError(err):
+		walkSchemaErrors(err, func(se *openapi3.SchemaError) {
+			c.note(ReasonBody, Violation{In: "body", Field: joinField("", se.JSONPointer()), Message: schemaMessage(se)})
+		})
+	case errors.As(err, &perr):
+		c.note(ReasonBody, Violation{In: "body", Message: "is not well-formed for its Content-Type"})
+	default:
+		c.note(ReasonBody, Violation{In: "body", Message: "does not match the API specification"})
+	}
 }
 
 // parameterError adds the violations of parameter p, which failed with
@@ -109,7 +129,7 @@ func (c *collector) note(reason string, v Violation) {
 
 // reasonOrder is the precedence of reasons: a request failing several
 // ways is reported under the first that applies.
-var reasonOrder = []string{ReasonUnknownOperation, ReasonParameter}
+var reasonOrder = []string{ReasonUnknownOperation, ReasonParameter, ReasonBody}
 
 func reasonRank(reason string) int {
 	for i, r := range reasonOrder {
