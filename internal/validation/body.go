@@ -37,10 +37,13 @@ func hasBody(req *http.Request) bool {
 //
 // A body is checked when it's JSON and its Content-Type is one the
 // operation declares; a body without a Content-Type is checked as the
-// operation's JSON media type, when it has one. Any other body goes to
-// the backend unread — unless validate_content_type is on, which makes
-// a missing or undeclared Content-Type invalid. A missing body is left
-// to kin-openapi, which reports it if the operation requires one.
+// operation's JSON media type, when it has one. With
+// validate_non_json_bodies, bodies of the operation's other declared
+// media types are checked too (form data, plain text, and the others
+// kin-openapi can decode). Any other body goes to the backend unread —
+// unless validate_content_type is on, which makes a missing or
+// undeclared Content-Type invalid. A missing body is left to
+// kin-openapi, which reports it if the operation requires one.
 func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody, opts *openapi3filter.Options) *Result {
 	if !hasBody(req) {
 		opts.ExcludeRequestBody = false
@@ -51,7 +54,8 @@ func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody,
 	if v.cfg.ValidateContentType && (ct == "" || !declared) {
 		return contentTypeResult(rb, ct)
 	}
-	if !declared || !isJSON(mediaType) {
+	json := isJSON(mediaType)
+	if !declared || (!json && !v.cfg.ValidateNonJSONBodies) {
 		return nil
 	}
 
@@ -63,7 +67,7 @@ func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody,
 	if !complete {
 		return v.tooLarge()
 	}
-	if nestsDeeper(data, v.cfg.MaxJSONDepth) {
+	if json && nestsDeeper(data, v.cfg.MaxJSONDepth) {
 		return &Result{Outcome: Invalid, Reason: ReasonBody, Violations: []Violation{{In: "body",
 			Message: "nests objects and arrays deeper than " + strconv.Itoa(v.cfg.MaxJSONDepth) + " levels"}}}
 	}
