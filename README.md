@@ -940,6 +940,7 @@ GET /api/users                    server  http.route=/api/users  http.response.s
   - It records the route, method, scheme, backend host and port, attempt number, and status.
   - A transport failure is recorded as a classified `error.type`: `timeout`, `connection_refused`, `tls`, `dns`, `connection_closed`, `canceled`, or `other`.
   - A circuit breaker that is open fails `circuit_breaker.check` and no attempt is made.
+- **OpenAPI validation**, on a route that has it, gets a `validation` span after `rate_limit` with `validation.result` (`passed`, `rejected`, `report_only`, `unmatched`), the reason, and the operation from the spec. A rejection marks it `ERROR` (`request invalid: <reason>`), and no later stage span appears. The server span carries `validation.result` too. See [OpenAPI request validation](#logs-metrics-and-tracing-2).
 - **WebSocket upgrades** get a `websocket.handshake` span (policy checks, backend dial, `101`) and a `websocket.connection` span from the `101` until the tunnel closes. The connection span's `gatekeeper.websocket.close_reason` is `client`, `backend`, `idle_timeout`, or `shutdown`. The backend's upgrade request carries the handshake span's `traceparent`.
 
 ### Privacy and safety guarantees
@@ -2112,7 +2113,7 @@ All responses are JSON. Errors always have the same shape:
 | `GET /admin/v1/backends` | Every backend: health, in rotation, drained, in-flight count, circuit breaker state |
 | `GET /admin/v1/ratelimits/{client}` | A client's current quota, without spending any of it |
 | `GET /admin/v1/cache/stats` | Cached entries (total and per route), hits, misses, writes, purges |
-| `POST /admin/v1/reload` | Same as `SIGHUP`. An invalid config gets `422` with the validation error, and the old config stays |
+| `POST /admin/v1/reload` | Same as `SIGHUP`. An invalid config (or OpenAPI spec) gets `422` with the validation error, and the old config stays |
 | `POST /admin/v1/cache/purge` | **Destructive.** Purges by route, by URL prefix, or everything |
 | `POST /admin/v1/ratelimits/{client}/reset` | **Destructive.** Gives a client its full allowance back |
 | `POST /admin/v1/backends/{id}/drain` | **Destructive.** Takes a backend out of rotation; in-flight requests finish |
@@ -2126,6 +2127,7 @@ All responses are JSON. Errors always have the same shape:
 | `GET /admin/v1/faults` | Fault injection rules, whether each is in force, and its remaining time |
 | `POST /admin/v1/faults` | **Destructive.** Creates or replaces a fault injection rule with a TTL. See [Fault endpoints](#fault-endpoints) |
 | `DELETE /admin/v1/faults/{id}` | Removes a fault injection rule |
+| `GET /admin/v1/validation` | Routes validated against an OpenAPI spec: the spec in force, settings, and counts. See [Validation endpoint](#validation-endpoint) |
 
 `reload`, `cache/purge`, `ratelimits/{client}/reset`, `backends/{id}/drain`, `circuit-breakers/{id}/reset`, both ban endpoints, `POST routes/{route}/split`, and `POST` and `DELETE faults` accept `?dry_run=true`. A dry run reports what would happen and changes nothing. For `reload`, it validates the config file without applying it.
 
@@ -2367,7 +2369,7 @@ gatekeeper_tls_certificate_reloads_total{result="success"} 2
 
 The TLS metrics (`gatekeeper_tls_*`, `gatekeeper_mtls_verifications_total`) only appear with `tls.enabled`. See the table in [TLS metrics](#tls-metrics) for what each one means.
 
-Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). Access control metrics (`gatekeeper_access_control_*`) are described in [Logging, metrics, and tracing](#logging-metrics-and-tracing). Traffic split metrics (`gatekeeper_variant_*`) are described in [Logs, metrics, and tracing](#logs-metrics-and-tracing). Fault injection metrics (`gatekeeper_fault*`) are described in [Fault injection](#logs-metrics-and-tracing-1). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
+Per-backend load-balancing metrics (`gatekeeper_backend_*`, `gatekeeper_route_backends_in_rotation`) are described in [Load balancing metrics](#load-balancing-metrics). Admin API metrics (`gatekeeper_admin_*`) are described in [Admin metrics](#admin-metrics). Access control metrics (`gatekeeper_access_control_*`) are described in [Logging, metrics, and tracing](#logging-metrics-and-tracing). Traffic split metrics (`gatekeeper_variant_*`) are described in [Logs, metrics, and tracing](#logs-metrics-and-tracing). Fault injection metrics (`gatekeeper_fault*`) are described in [Fault injection](#logs-metrics-and-tracing-1). Request validation metrics (`gatekeeper_validation_*`) are described in [OpenAPI request validation](#logs-metrics-and-tracing-2). `gatekeeper_transforms_applied_total` is described in [Caching, tracing, and metrics](#caching-tracing-and-metrics).
 
 **Client labels never contain API keys.** With `rate_limit.scope: api_key`, the `client` label of `gatekeeper_requests_allowed_total`, `gatekeeper_requests_rejected_total`, and `gatekeeper_limiter_remaining` is the key's *fingerprint*: `key:` followed by the first 12 hex characters of its SHA-256. Rate limiter log lines use the same fingerprint. It stays the same across restarts and replicas, so the series continue, and you can work out which key it is without the key ever appearing in Prometheus:
 
