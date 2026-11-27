@@ -47,28 +47,31 @@ func TestHub_ReserveEnforcesLimits(t *testing.T) {
 
 	a1, err := h.Reserve("/ws", "alice", lim)
 	require.NoError(t, err)
-	_, err = h.Reserve("/ws", "alice", lim)
+	a2, err := h.Reserve("/ws", "alice", lim)
 	require.NoError(t, err)
 	_, err = h.Reserve("/ws", "alice", lim)
 	assert.ErrorIs(t, err, ErrClientFull)
 
-	_, err = h.Reserve("/ws", "bob", lim)
+	b, err := h.Reserve("/ws", "bob", lim)
 	require.NoError(t, err)
 	_, err = h.Reserve("/ws", "carol", lim)
 	assert.ErrorIs(t, err, ErrRouteFull)
 
 	// Limits are per route.
-	_, err = h.Reserve("/other", "alice", lim)
+	other, err := h.Reserve("/other", "alice", lim)
 	require.NoError(t, err)
 
 	// Releasing (even twice) frees exactly one slot.
 	a1.Release()
 	a1.Release()
-	_, err = h.Reserve("/ws", "carol", lim)
+	c, err := h.Reserve("/ws", "carol", lim)
 	require.NoError(t, err)
 	_, err = h.Reserve("/ws", "dave", lim)
 	assert.ErrorIs(t, err, ErrRouteFull)
 
+	for _, s := range []*Slot{a2, b, other, c} {
+		s.Release()
+	}
 	require.NoError(t, h.Shutdown(context.Background()))
 	_, err = h.Reserve("/new", "erin", Limits{})
 	assert.ErrorIs(t, err, ErrShuttingDown)

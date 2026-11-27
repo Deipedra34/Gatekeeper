@@ -44,8 +44,14 @@ type Hub struct {
 	perClient   map[routeClient]int
 	tunnels     map[*tunnel]struct{}
 	closing     bool
-	drained     chan struct{} // closed when the last tunnel exits after Shutdown began
+	drained     chan struct{} // closed once nothing is reserved or open after Shutdown began
 	drainedOnce sync.Once
+
+	// reserved counts slots handed out and not yet released: connections
+	// still in their handshake as well as open ones. A connection whose
+	// client already has its 101 may not have reached Serve yet, so
+	// Shutdown waits for reservations, not just for open tunnels.
+	reserved int
 }
 
 type routeClient struct {
@@ -89,6 +95,7 @@ func (h *Hub) Reserve(route, client string, lim Limits) (*Slot, error) {
 	}
 	h.perRoute[route]++
 	h.perClient[key]++
+	h.reserved++
 	return &Slot{hub: h, route: route, client: client}, nil
 }
 
@@ -105,7 +112,17 @@ func (s *Slot) Release() {
 		if h.perClient[key]--; h.perClient[key] <= 0 {
 			delete(h.perClient, key)
 		}
+		h.reserved--
+		h.signalDrainedLocked()
 	})
+}
+
+// signalDrainedLocked closes drained once Shutdown has begun and nothing
+// is reserved or open any more. h.mu must be held.
+func (h *Hub) signalDrainedLocked() {
+	if h.closing && h.reserved == 0 && len(h.tunnels) == 0 && h.drained != nil {
+		h.drainedOnce.Do(func() { close(h.drained) })
+	}
 }
 
 // Serve relays frames between client and backend until the connection
@@ -153,9 +170,7 @@ func (h *Hub) Serve(ctx context.Context, slot *Slot, client, backend Endpoint, i
 
 	h.mu.Lock()
 	delete(h.tunnels, t)
-	if h.closing && len(h.tunnels) == 0 && h.drained != nil {
-		h.drainedOnce.Do(func() { close(h.drained) })
-	}
+	h.signalDrainedLocked()
 	h.mu.Unlock()
 	return reason
 }
@@ -169,13 +184,15 @@ func (h *Hub) Active() int {
 
 // Shutdown stops new connections from being reserved and closes every
 // open one gracefully: each side is sent a Close frame (1001, going away)
-// and given until ctx's deadline to complete the closing handshake. Any
-// connection still open when ctx is done is torn down forcibly, and
-// ctx's error is returned.
+// and given until ctx's deadline to complete the closing handshake. A
+// connection still in its handshake is waited for too: once it's
+// established it's closed the same way, and if its handshake fails its
+// slot is simply released. Any connection still open when ctx is done is
+// torn down forcibly, and ctx's error is returned.
 func (h *Hub) Shutdown(ctx context.Context) error {
 	h.mu.Lock()
 	h.closing = true
-	if len(h.tunnels) == 0 {
+	if h.reserved == 0 && len(h.tunnels) == 0 {
 		h.mu.Unlock()
 		return nil
 	}
