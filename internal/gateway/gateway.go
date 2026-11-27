@@ -201,10 +201,14 @@ func (g *Gateway) ConfigPath() string { return g.configPath }
 func (g *Gateway) ConfigLoadedAt() time.Time { return *g.loadedAt.Load() }
 
 // ValidateConfigFile loads and validates the config file Reload would
-// read, without applying it.
+// read, and the OpenAPI specs its routes validate against, without
+// applying any of it.
 func (g *Gateway) ValidateConfigFile() error {
-	_, err := config.Load(g.configPath)
-	return err
+	cfg, err := config.Load(g.configPath)
+	if err != nil {
+		return err
+	}
+	return checkSpecs(cfg)
 }
 
 // Limiter returns the live rate limiter for tier.
@@ -242,7 +246,9 @@ func (g *Gateway) ShutdownWebSockets(ctx context.Context) error {
 // with, then atomically swaps the resulting pipeline into place. If the
 // file is missing, malformed, or fails validation, the active pipeline is
 // left untouched and the error is returned; callers should log it and
-// keep serving with the existing config.
+// keep serving with the existing config. The OpenAPI specs routes
+// validate against are re-read too, and a missing or invalid one fails
+// the reload the same way, keeping the specs already in force.
 func (g *Gateway) Reload() error {
 	g.reloadMu.Lock()
 	defer g.reloadMu.Unlock()
@@ -371,6 +377,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 	}
 	g.logAccessControl(cfg)
 	g.logTrafficSplits(router.SplitRoutes())
+	g.logValidation(router.Validators())
 
 	mws := []middleware.Middleware{middleware.RequestMetrics(g.metrics, router.RouteLabelFor)}
 	if access != nil {

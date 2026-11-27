@@ -221,3 +221,22 @@ func traceValidation(span trace.Span, req *http.Request, res validation.Result, 
 	span.End()
 	trace.SpanFromContext(req.Context()).SetAttributes(tracing.AttrValidationResult.String(result))
 }
+
+// RouteValidator is a route's validator and its counts, as the gateway
+// and the admin API see them.
+type RouteValidator struct {
+	Route     string
+	Validator *validation.Validator
+	Stats     *validation.Stats
+}
+
+// Validators returns the router's validated routes, in config order.
+func (r *Router) Validators() []RouteValidator {
+	var out []RouteValidator
+	for i := range r.routes {
+		if rt := &r.routes[i]; rt.validator != nil {
+			out = append(out, RouteValidator{Route: rt.label, Validator: rt.validator, Stats: rt.validationStats})
+		}
+	}
+	return out
+}
