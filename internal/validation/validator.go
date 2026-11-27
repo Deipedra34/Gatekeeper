@@ -54,6 +54,10 @@ const (
 	// ReasonBody: the body is missing, malformed, or doesn't match its
 	// schema.
 	ReasonBody = "body"
+	// ReasonTimeout: checking the request took longer than the timeout.
+	ReasonTimeout = "timeout"
+	// ReasonInternal: the validator itself failed (kin-openapi panicked).
+	ReasonInternal = "internal"
 )
 
 // Violation is one way a request fails its spec. It names the part of
@@ -147,10 +151,13 @@ func (v *Validator) Check(ctx context.Context, req *http.Request) Result {
 	}
 	res := Result{Outcome: Passed, Operation: operationName(route)}
 
-	// kin-openapi gets a shallow copy of its own, with no body and no
+	// kin-openapi gets a copy of its own, with no body and no
 	// credentials: it never touches the request that goes on to the
-	// backend, and never sees a secret.
+	// backend, and never sees a secret. Its URL is its own too, since a
+	// check that times out goes on running after Check returns.
 	in := req.WithContext(ctx)
+	u := *req.URL
+	in.URL = &u
 	in.Body = http.NoBody
 	in.Header = v.spec.withoutSecrets(req.Header)
 	opts := v.options
@@ -160,17 +167,60 @@ func (v *Validator) Check(ctx context.Context, req *http.Request) Result {
 			return *fail
 		}
 	}
-	err = openapi3filter.ValidateRequest(ctx, &openapi3filter.RequestValidationInput{
+	err = v.run(ctx, &openapi3filter.RequestValidationInput{
 		Request:    in,
 		PathParams: params,
 		Route:      route,
 		Options:    &opts,
 	})
-	if err != nil {
+	switch {
+	case err == nil:
+	case errors.Is(err, errTimeout):
+		res.Outcome, res.Reason = Invalid, ReasonTimeout
+		res.Violations = []Violation{{In: "request", Message: "could not be validated within the time limit"}}
+	case errors.Is(err, errPanic):
+		res.Outcome, res.Reason = Invalid, ReasonInternal
+		res.Violations = []Violation{{In: "request", Message: "could not be validated"}}
+	default:
 		res.Outcome = Invalid
 		res.Reason, res.Violations = collect(err)
 	}
 	return res
+}
+
+// validateRequest is kin-openapi's check, a variable so tests can make
+// it slow or panic.
+var validateRequest = openapi3filter.ValidateRequest
+
+var (
+	errTimeout = errors.New("validation: timed out")
+	errPanic   = errors.New("validation: validator panicked")
+)
+
+// run checks input against the spec on a goroutine of its own, giving up
+// once the timeout is up (or ctx is done). The body was read and bounded
+// before this, so what the timeout bounds is the checking itself; a
+// check that is given up on finishes in the background, on its own copy
+// of the request, and its result is dropped. A panic in kin-openapi is
+// recovered and reported as errPanic.
+func (v *Validator) run(ctx context.Context, input *openapi3filter.RequestValidationInput) error {
+	ctx, cancel := context.WithTimeout(ctx, v.cfg.Timeout.Duration)
+	defer cancel()
+	done := make(chan error, 1) // buffered: an abandoned check never blocks
+	go func() {
+		defer func() {
+			if recover() != nil {
+				done <- errPanic
+			}
+		}()
+		done <- validateRequest(ctx, input)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return errTimeout
+	}
 }
 
 // unknownOperation is the result for a request that resolved to no
