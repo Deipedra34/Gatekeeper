@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/getkin/kin-openapi/routers"
 
 	"gatekeeper/internal/config"
@@ -41,6 +43,9 @@ func (o Outcome) String() string {
 const (
 	// ReasonUnknownOperation: no operation matches the method and path.
 	ReasonUnknownOperation = "unknown_operation"
+	// ReasonParameter: a path, query, or header parameter is missing or
+	// doesn't match its schema.
+	ReasonParameter = "parameter"
 )
 
 // Violation is one way a request fails its spec. It names the part of
@@ -75,12 +80,48 @@ type Result struct {
 type Validator struct {
 	spec *Spec
 	cfg  config.RouteValidation
+
+	// options are the kin-openapi settings every check starts from.
+	options openapi3filter.Options
 }
 
 // New returns a Validator checking requests against spec with cfg's
 // settings (defaults filled in for any left unset).
 func New(spec *Spec, cfg config.RouteValidation) *Validator {
-	return &Validator{spec: spec, cfg: cfg.WithDefaults()}
+	v := &Validator{spec: spec, cfg: cfg.WithDefaults()}
+	v.options = openapi3filter.Options{
+		// Every fault, not just the first, so a client can fix them all
+		// at once.
+		MultiError: true,
+		// Authentication is the gateway's job, done before validation.
+		AuthenticationFunc: openapi3filter.NoopAuthenticationFunc,
+		// The backend gets the request as the client sent it: nothing
+		// the spec defaults is added to it.
+		SkipSettingDefaults:     true,
+		ExcludeRequestBody:      true,
+		SchemaValidationOptions: schemaOptions(spec),
+	}
+	return v
+}
+
+// schemaOptions are the schema checks used with spec: the common string
+// formats kin-openapi leaves undefined by default, and — on OpenAPI 3.0,
+// where it's supported — schema errors without the offending value.
+func schemaOptions(spec *Spec) []openapi3.SchemaValidationOption {
+	opts := []openapi3.SchemaValidationOption{openapi3.WithStringFormatValidators(stringFormats)}
+	if !spec.doc.IsOpenAPI31OrLater() {
+		opts = append(opts, openapi3.DisableSchemaErrorDetails())
+	}
+	return opts
+}
+
+// stringFormats validate the string formats kin-openapi doesn't check
+// by default (it does date, date-time, and byte itself).
+var stringFormats = map[string]openapi3.StringFormatValidator{
+	"email": openapi3.NewRegexpFormatValidator(openapi3.FormatOfStringForEmail),
+	"uuid":  openapi3.NewRegexpFormatValidator(openapi3.FormatOfStringForUUIDOfRFC9562),
+	"ipv4":  openapi3.NewIPValidator(true),
+	"ipv6":  openapi3.NewIPValidator(false),
 }
 
 // Spec returns the spec requests are checked against.
@@ -92,11 +133,28 @@ func (v *Validator) Config() config.RouteValidation { return v.cfg }
 // Check checks req, which must carry the path the backend will receive
 // (after the route's strip_prefix and rewrite).
 func (v *Validator) Check(ctx context.Context, req *http.Request) Result {
-	route, _, err := v.spec.findRoute(req)
+	route, params, err := v.spec.findRoute(req)
 	if err != nil {
 		return v.unknownOperation(err)
 	}
-	return Result{Outcome: Passed, Operation: operationName(route)}
+	res := Result{Outcome: Passed, Operation: operationName(route)}
+
+	// kin-openapi gets a shallow copy of its own, with no body: it never
+	// touches the request that goes on to the backend.
+	in := req.WithContext(ctx)
+	in.Body = http.NoBody
+	opts := v.options
+	err = openapi3filter.ValidateRequest(ctx, &openapi3filter.RequestValidationInput{
+		Request:    in,
+		PathParams: params,
+		Route:      route,
+		Options:    &opts,
+	})
+	if err != nil {
+		res.Outcome = Invalid
+		res.Reason, res.Violations = collect(err)
+	}
+	return res
 }
 
 // unknownOperation is the result for a request that resolved to no
