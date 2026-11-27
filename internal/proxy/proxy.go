@@ -104,6 +104,9 @@ type Router struct {
 	// faults decides which requests get a fault injected; nil injects
 	// nothing (see WithFaultRegistry).
 	faults *fault.Registry
+
+	// metricsPath is never validated (see WithMetricsPath).
+	metricsPath string
 }
 
 // Option customises a Router built by NewRouter.

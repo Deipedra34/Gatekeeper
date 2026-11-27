@@ -329,7 +329,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 	opts := []proxy.Option{
 		proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends), proxy.WithTransformConfig(cfg.Transform),
 		proxy.WithSplitRegistry(g.splits), proxy.WithAPIKeyHeader(cfg.Auth.Header),
-		proxy.WithFaultRegistry(g.faults),
+		proxy.WithFaultRegistry(g.faults), proxy.WithMetricsPath(cfg.Metrics.Path),
 	}
 	if prev != nil {
 		opts = append(opts, proxy.WithPrevious(prev))

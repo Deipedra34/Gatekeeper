@@ -3,10 +3,13 @@ package proxy
 import (
 	"fmt"
 	"net/http"
+	"slices"
 
 	"gatekeeper/internal/config"
+	"gatekeeper/internal/fault"
 	"gatekeeper/internal/middleware"
 	"gatekeeper/internal/validation"
+	"gatekeeper/internal/websocket"
 )
 
 // Where validation runs: in the router, once the request's route is
@@ -17,6 +20,28 @@ import (
 // those. Running after the rate limiter means validation's cost — the
 // costliest per-request step before the backend — is bounded per client
 // by the rate limit, and an invalid request still counts against it.
+
+// WithMetricsPath names the metrics endpoint's path, which is never
+// validated even when a route's prefix covers it.
+func WithMetricsPath(path string) Option {
+	return func(r *Router) { r.metricsPath = path }
+}
+
+// skipValidation reports whether req is never validated, whatever its
+// route says: a WebSocket upgrade (its handshake isn't an API call a
+// spec describes), or a request for the metrics path or one of the
+// usual health check paths, matched exactly. Health check probes aren't
+// recognised by User-Agent here, as fault injection does, since any
+// client could claim to be one to get past validation. The admin API is
+// never validated: it has a listener of its own and never reaches the
+// router.
+func (r *Router) skipValidation(req *http.Request) bool {
+	if websocket.IsUpgrade(req) {
+		return true
+	}
+	path := req.URL.Path
+	return (r.metricsPath != "" && path == r.metricsPath) || slices.Contains(fault.BuiltinExemptPaths, path)
+}
 
 // buildValidator compiles rt's validation section, if it has one that's
 // enabled: its spec is loaded (once per file for the whole router) and
@@ -42,6 +67,9 @@ func (r *Router) buildValidator(rt config.Route, label string, specs map[string]
 // req was invalid and has been answered. In report_only mode an invalid
 // request carries on too, exactly as the client sent it.
 func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (*http.Request, bool) {
+	if r.skipValidation(req) {
+		return req, true
+	}
 	// A copy, so the body validation puts back is this request's alone.
 	req = req.WithContext(req.Context())
 	cfg := rt.validator.Config()
