@@ -114,6 +114,8 @@ func TestNestsDeeper(t *testing.T) {
 	} {
 		assert.Equal(t, tc.deep, nestsDeeper([]byte(tc.json), tc.max), tc.label)
 	}
+	data := []byte(strings.Repeat(`{"a":["b",{"c":1}]},`, 10000))
+	assert.Zero(t, testing.AllocsPerRun(20, func() { nestsDeeper(data, 32) }), "one pass, no allocations")
 }
 
 // swapValidateRequest replaces kin-openapi's check for a test and
