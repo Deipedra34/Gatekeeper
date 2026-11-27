@@ -2012,6 +2012,9 @@ so are the `access_control` lists; bans, which live in the store, are kept
 rebuilt as well, keeping sticky clients in place and, when a route's weights,
 rollout, and guardrails are unchanged, its live state (see
 [Reloading and multiple instances](#reloading-and-multiple-instances)).
+The OpenAPI specs routes validate against are re-read and checked too, and
+a missing or invalid spec rejects the reload like any other config error,
+keeping the specs in force (see [Reloading specs](#reloading-specs)).
 
 ## Admin API
 
