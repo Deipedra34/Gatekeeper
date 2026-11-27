@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -132,4 +133,48 @@ func TestCloseFrame(t *testing.T) {
 
 	long := closeFrame(1000, string(bytes.Repeat([]byte("x"), 300)), false)
 	assert.LessOrEqual(t, int(long[1]), 125, "control frame payload capped at 125 bytes")
+}
+
+func TestHub_ShutdownWaitsForHandshakesInProgress(t *testing.T) {
+	// A connection whose client already has its 101 but which hasn't
+	// reached Serve yet holds only a reservation. Shutdown must wait for
+	// it rather than report everything closed.
+	h := NewHub(nil)
+	slot, err := h.Reserve("/ws", "alice", Limits{})
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		done <- h.Shutdown(ctx)
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Shutdown returned %v with a handshake still in progress", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_, err = h.Reserve("/ws", "bob", Limits{})
+	assert.ErrorIs(t, err, ErrShuttingDown, "no new handshakes once Shutdown began")
+
+	slot.Release() // the handshake failed: nothing left to wait for
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown kept waiting after the last reservation was released")
+	}
+}
+
+func TestHub_ShutdownDeadlineWithAHandshakeInProgress(t *testing.T) {
+	h := NewHub(nil)
+	_, err := h.Reserve("/ws", "alice", Limits{}) // never finishes
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	assert.ErrorIs(t, h.Shutdown(ctx), context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 3*time.Second, "bounded by the deadline")
 }
