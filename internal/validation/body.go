@@ -59,6 +59,10 @@ func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody,
 	if !complete {
 		return v.tooLarge()
 	}
+	if nestsDeeper(data, v.cfg.MaxJSONDepth) {
+		return &Result{Outcome: Invalid, Reason: ReasonBody, Violations: []Violation{{In: "body",
+			Message: "nests objects and arrays deeper than " + strconv.Itoa(v.cfg.MaxJSONDepth) + " levels"}}}
+	}
 
 	in.Body = io.NopCloser(bytes.NewReader(data))
 	in.ContentLength = int64(len(data))
@@ -113,6 +117,41 @@ func (v *Validator) tooLarge() *Result {
 		Violations: []Violation{{In: "body",
 			Message: "is larger than the " + strconv.FormatInt(v.cfg.MaxBodyBytes, 10) + " bytes this route validates"}},
 	}
+}
+
+// nestsDeeper reports whether the JSON in data nests objects and arrays
+// more than max levels deep. It's a single pass over the bytes that
+// allocates nothing, run before the body is decoded, so a deeply nested
+// payload never reaches the decoder or the schema walk, both of which
+// recurse once per level. Malformed JSON is left for the decoder to
+// report.
+func nestsDeeper(data []byte, max int) bool {
+	depth := 0
+	inString, escaped := false, false
+	for _, c := range data {
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			if depth++; depth > max {
+				return true
+			}
+		case '}', ']':
+			depth--
+		}
+	}
+	return false
 }
 
 // declaredMediaType returns the media type of a body sent with
