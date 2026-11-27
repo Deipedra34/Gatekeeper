@@ -779,7 +779,7 @@ components:
         healthy: { type: boolean, description: Passing health checks and not ejected }
         in_rotation: { type: boolean, description: Receiving new traffic }
         disabled: { type: boolean, description: Drained through the admin API }
-        draining: { type: boolean, description: Removed by a reload, finishing in-flight work }
+        draining: { type: boolean, description: "Removed by a reload, finishing in-flight work" }
         in_flight: { type: integer }
         circuit_breaker: { type: string, enum: [closed, open, half_open, disabled] }
 
@@ -827,7 +827,7 @@ components:
       additionalProperties: false
       properties:
         all: { type: boolean, description: Purge everything. Can't be combined with route or url_prefix. }
-        route: { type: string, description: Route label (its path prefix, or host) }
+        route: { type: string, description: "Route label (its path prefix, or host)" }
         url_prefix: { type: string, description: Prefix of the cached request URI (path and query) }
 
     PurgeResult:
