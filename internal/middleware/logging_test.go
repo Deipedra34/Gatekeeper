@@ -42,3 +42,20 @@ func TestNoteVariant_WithoutTheLoggerIsHarmless(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	NoteVariant(req.Context(), "canary") // must not panic
 }
+
+func TestRequestLogger_AddsTheValidationResult(t *testing.T) {
+	line := logLine(t, func(w http.ResponseWriter, r *http.Request) {
+		NoteValidation(r.Context(), "rejected")
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	assert.True(t, strings.HasPrefix(line, "GET /api/items 400 "), line)
+	assert.True(t, strings.HasSuffix(line, " 203.0.113.7:4000 validation=rejected"), line)
+
+	line = logLine(t, func(w http.ResponseWriter, r *http.Request) {
+		NoteVariant(r.Context(), "canary")
+		NoteValidation(r.Context(), "report_only")
+	})
+	assert.True(t, strings.HasSuffix(line, " variant=canary validation=report_only"), line)
+
+	NoteValidation(httptest.NewRequest(http.MethodGet, "/", nil).Context(), "rejected") // without the logger: harmless
+}
