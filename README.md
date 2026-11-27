@@ -2259,7 +2259,7 @@ The image exposes port `8080`, matching the default `server.listen_addr` in [`co
 - **`redis`** (`redis:alpine`) — backs the rate limiter's shared counters.
 - **`mock-backend`** — a tiny standalone HTTP server in [`mockbackend/`](mockbackend/) that echoes back the request it received as JSON, standing in for a real upstream so requests have somewhere to be proxied to. It also serves a WebSocket echo endpoint at `/ws/echo` (see [WebSocket proxying](#websocket-proxying)).
 
-Gatekeeper runs against [`configs/config.docker.yaml`](configs/config.docker.yaml) inside the stack (mounted over the image's baked-in config), not `configs/config.yaml`. It's identical except `storage.redis.addr` points at `redis:6379` and every route's `target` points at `http://mock-backend:9000` — both reached by their compose service name rather than `localhost`, since each service is its own container on the compose network.
+Gatekeeper runs against [`configs/config.docker.yaml`](configs/config.docker.yaml) inside the stack (mounted over the image's baked-in config), not `configs/config.yaml`. It's identical except `storage.redis.addr` points at `redis:6379` and every route's `target` points at `http://mock-backend:9000` — both reached by their compose service name rather than `localhost`, since each service is its own container on the compose network — and `/api/orders` is validated against [`examples/openapi/orders.yaml`](examples/openapi/orders.yaml), which the compose file mounts into the container. See [OpenAPI request validation](#trying-it-out-2) for requests to try.
 
 Start everything with:
 
@@ -2285,7 +2285,20 @@ X-Ratelimit-Remaining: 9
 {"message":"hello from mock-backend","method":"GET","path":"/api/ping", ...}
 ```
 
-The JSON body comes from `mock-backend`, confirming the request actually made it through Gatekeeper's auth and rate-limit middleware and was proxied end-to-end. Send more than 10 requests in quick succession with the same key and you'll start getting `429 Too Many Requests` back, same as in [Example usage](#example-usage). `curl http://localhost:8080/metrics` and the gateway's own logs (`docker-compose logs gatekeeper`) work as usual too.
+The JSON body comes from `mock-backend`, confirming the request actually made it through Gatekeeper's auth and rate-limit middleware and was proxied end-to-end. A request the orders spec doesn't allow never gets that far:
+
+```bash
+curl -i "http://localhost:8080/api/orders?limit=500" -H "X-API-Key: demo-free-key"
+```
+
+```
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","request_id":"...","violations":[{"in":"query","field":"limit","message":"must be at most 100"}]}}
+```
+
+Send more than 10 requests in quick succession with the same key and you'll start getting `429 Too Many Requests` back, same as in [Example usage](#example-usage). `curl http://localhost:8080/metrics` and the gateway's own logs (`docker-compose logs gatekeeper`) work as usual too.
 
 ## Example usage
 
