@@ -145,6 +145,7 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 		return req, true
 	}
 	r.logValidation(rt, req, res, result)
+	middleware.NoteValidation(req.Context(), result)
 	if cfg.ReportOnly() {
 		return req, true
 	}

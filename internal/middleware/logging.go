@@ -41,7 +41,10 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // duration, and remote address — plus trace_id=<id> when the request is
 // being traced, so a log line leads straight to its trace, and
 // variant=<name> when a split route served it from a variant, and
-// fault=<faults> when a fault was injected into it (fault=delay,abort). A
+// fault=<faults> when a fault was injected into it (fault=delay,abort),
+// and validation=<result> when it failed OpenAPI validation
+// (validation=rejected, or validation=report_only when it was forwarded
+// anyway). A
 // proxied WebSocket connection is logged once it closes, as status 101
 // with the connection's whole lifetime as its duration; a request whose
 // connection was reset by an injected fault is logged with "reset" for
@@ -70,6 +73,9 @@ func RequestLogger(logger *log.Logger) Middleware {
 			if f := notes.fault.Load(); f != nil {
 				line += " fault=" + *f
 			}
+			if v := notes.validation.Load(); v != nil {
+				line += " validation=" + *v
+			}
 			logger.Print(line)
 		})
 	}
@@ -78,9 +84,10 @@ func RequestLogger(logger *log.Logger) Middleware {
 // logNotes is what handlers further down tell RequestLogger to add to a
 // request's log line.
 type logNotes struct {
-	variant atomic.Pointer[string]
-	fault   atomic.Pointer[string]
-	reset   atomic.Bool
+	variant    atomic.Pointer[string]
+	fault      atomic.Pointer[string]
+	validation atomic.Pointer[string]
+	reset      atomic.Bool
 }
 
 type logNotesKey struct{}
@@ -99,6 +106,15 @@ func NoteVariant(ctx context.Context, variant string) {
 func NoteFault(ctx context.Context, faults string) {
 	if n, ok := ctx.Value(logNotesKey{}).(*logNotes); ok {
 		n.fault.Store(&faults)
+	}
+}
+
+// NoteValidation records what OpenAPI validation made of an invalid
+// request ("rejected", "report_only"), for its log line. Without
+// RequestLogger in the chain it does nothing.
+func NoteValidation(ctx context.Context, result string) {
+	if n, ok := ctx.Value(logNotesKey{}).(*logNotes); ok {
+		n.validation.Store(&result)
 	}
 }
 
