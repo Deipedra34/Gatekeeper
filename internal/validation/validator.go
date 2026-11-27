@@ -37,6 +37,30 @@ func (o Outcome) String() string {
 	return "unknown"
 }
 
+// What became of a validated request: the "result" label of
+// gatekeeper_validation_requests_total and the validation.result span
+// attribute.
+const (
+	ResultPassed     = "passed"
+	ResultRejected   = "rejected"    // invalid, in enforce mode
+	ResultReportOnly = "report_only" // invalid, forwarded anyway
+	ResultUnmatched  = "unmatched"   // no operation matched; forwarded unchecked
+)
+
+// Label names what becomes of the request r is for, on a route in
+// report_only mode or not.
+func (r Result) Label(reportOnly bool) string {
+	switch {
+	case r.Outcome == Passed:
+		return ResultPassed
+	case r.Outcome == Unmatched:
+		return ResultUnmatched
+	case reportOnly:
+		return ResultReportOnly
+	}
+	return ResultRejected
+}
+
 // Reasons a request is invalid: the bounded "reason" label of the
 // validation metrics and the "reason" of an error response. A request
 // failing several ways gets the first that applies, in this order.

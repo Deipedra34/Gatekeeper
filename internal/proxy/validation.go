@@ -138,7 +138,7 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	view := r.validationView(rt, req)
 	res := rt.validator.Check(ctx, view)
 	req.Body = view.Body
-	result := validationResult(res, cfg)
+	result := res.Label(cfg.ReportOnly())
 	r.recordValidation(rt, res, result, time.Since(start))
 	traceValidation(span, req, res, result)
 	if res.Outcome != validation.Invalid {
@@ -173,29 +173,6 @@ func (r *Router) validationView(rt *route, req *http.Request) *http.Request {
 	return view
 }
 
-// Validation results, the "result" label of
-// gatekeeper_validation_requests_total.
-const (
-	validationPassed     = "passed"
-	validationRejected   = "rejected"
-	validationReportOnly = "report_only"
-	validationUnmatched  = "unmatched"
-)
-
-// validationResult names what became of a request validation found res
-// for.
-func validationResult(res validation.Result, cfg config.RouteValidation) string {
-	switch {
-	case res.Outcome == validation.Passed:
-		return validationPassed
-	case res.Outcome == validation.Unmatched:
-		return validationUnmatched
-	case cfg.ReportOnly():
-		return validationReportOnly
-	}
-	return validationRejected
-}
-
 // recordValidation counts res in /metrics.
 func (r *Router) recordValidation(rt *route, res validation.Result, result string, took time.Duration) {
 	if r.metrics == nil {
@@ -204,9 +181,9 @@ func (r *Router) recordValidation(rt *route, res validation.Result, result strin
 	r.metrics.ValidationDuration.WithLabelValues(rt.label).Observe(took.Seconds())
 	r.metrics.ValidationRequests.WithLabelValues(rt.label, result).Inc()
 	switch result {
-	case validationRejected:
+	case validation.ResultRejected:
 		r.metrics.ValidationRejected.WithLabelValues(rt.label, res.Reason).Inc()
-	case validationReportOnly:
+	case validation.ResultReportOnly:
 		r.metrics.ValidationReportOnly.WithLabelValues(rt.label, res.Reason).Inc()
 	}
 }
@@ -223,7 +200,7 @@ func traceValidation(span trace.Span, req *http.Request, res validation.Result, 
 		attrs = append(attrs, tracing.AttrValidationReason.String(res.Reason))
 	}
 	span.SetAttributes(attrs...)
-	if result == validationRejected {
+	if result == validation.ResultRejected {
 		tracing.Fail(span, "request invalid: "+res.Reason)
 	}
 	span.End()
