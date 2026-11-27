@@ -39,15 +39,17 @@ func (r *Router) buildValidator(rt config.Route, label string, specs map[string]
 
 // validate checks req against rt's spec. It returns the request to carry
 // on with — its body put back for the backend — and true, or false when
-// req was invalid and has been answered.
+// req was invalid and has been answered. In report_only mode an invalid
+// request carries on too, exactly as the client sent it.
 func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (*http.Request, bool) {
 	// A copy, so the body validation puts back is this request's alone.
 	req = req.WithContext(req.Context())
+	cfg := rt.validator.Config()
 	res := rt.validator.Check(req.Context(), req)
-	if res.Outcome != validation.Invalid {
+	if res.Outcome != validation.Invalid || cfg.ReportOnly() {
 		return req, true
 	}
 	rid, _ := middleware.RequestIDFrom(req.Context())
-	validation.WriteError(w, res.Status(rt.validator.Config().RejectStatus), res, rid)
+	validation.WriteError(w, res.Status(cfg.RejectStatus), res, rid)
 	return req, false
 }
