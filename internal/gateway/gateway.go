@@ -29,6 +29,7 @@ import (
 	"gatekeeper/internal/ratelimiter/store"
 	"gatekeeper/internal/split"
 	"gatekeeper/internal/tracing"
+	"gatekeeper/internal/validation"
 	"gatekeeper/internal/websocket"
 )
 
@@ -82,8 +83,10 @@ type Gateway struct {
 	// reloads, so a reload mid-flood doesn't reset the limit.
 	accessLog *accesscontrol.LogThrottle
 	// validationLog does the same for the log lines of requests that
-	// fail OpenAPI validation.
-	validationLog *accesscontrol.LogThrottle
+	// fail OpenAPI validation, and validationStats keeps each route's
+	// validation counts across reloads.
+	validationLog   *accesscontrol.LogThrottle
+	validationStats *validation.StatsRegistry
 
 	// tracer is the tracing pipeline the current request pipeline uses.
 	// It's rebuilt on Reload only when the tracing section changed.
@@ -128,7 +131,8 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		retiring:   map[*tracing.Provider]*time.Timer{},
 		accessLog:  accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
 
-		validationLog: accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
+		validationLog:   accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
+		validationStats: validation.NewStatsRegistry(),
 	}
 	g.splits = split.NewRegistry(split.WithEvents(g.onSplitEvent))
 	g.faults = fault.NewRegistry(fault.WithEvents(g.onFaultEvent))
@@ -335,7 +339,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends), proxy.WithTransformConfig(cfg.Transform),
 		proxy.WithSplitRegistry(g.splits), proxy.WithAPIKeyHeader(cfg.Auth.Header),
 		proxy.WithFaultRegistry(g.faults), proxy.WithMetricsPath(cfg.Metrics.Path),
-		proxy.WithValidationLog(g.validationLog),
+		proxy.WithValidationLog(g.validationLog), proxy.WithValidationStats(g.validationStats),
 	}
 	if prev != nil {
 		opts = append(opts, proxy.WithPrevious(prev))

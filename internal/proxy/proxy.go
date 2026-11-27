@@ -82,8 +82,10 @@ type route struct {
 	variant string
 
 	// validator checks requests against the route's OpenAPI spec; nil
-	// when it has no validation enabled.
-	validator *validation.Validator
+	// when it has no validation enabled. validationStats counts its
+	// results.
+	validator       *validation.Validator
+	validationStats *validation.Stats
 }
 
 // Router dispatches requests to the backend whose route matches, based
@@ -109,8 +111,10 @@ type Router struct {
 	// metricsPath is never validated (see WithMetricsPath).
 	metricsPath string
 	// validationLog rate limits the log lines of invalid requests (see
-	// WithValidationLog).
-	validationLog *accesscontrol.LogThrottle
+	// WithValidationLog), and validationStats counts validation results
+	// per route (see WithValidationStats).
+	validationLog   *accesscontrol.LogThrottle
+	validationStats *validation.StatsRegistry
 }
 
 // Option customises a Router built by NewRouter.
@@ -177,6 +181,9 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 	if r.validationLog == nil {
 		r.validationLog = accesscontrol.NewLogThrottle(log.Default(), validationLogInterval, validationLogBurst)
 	}
+	if r.validationStats == nil {
+		r.validationStats = validation.NewStatsRegistry()
+	}
 	if r.registry == nil {
 		r.registry = lb.NewRegistry()
 		if m != nil {
@@ -222,6 +229,10 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			r.backends.Discard()
 			return nil, err
 		}
+		var validationStats *validation.Stats
+		if validator != nil {
+			validationStats = r.validationStats.For(label)
+		}
 		proxy := &httputil.ReverseProxy{
 			Director:     director,
 			ErrorHandler: errorHandler(label),
@@ -244,6 +255,7 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			split:            sr,
 			variants:         variants,
 			validator:        validator,
+			validationStats:  validationStats,
 		})
 	}
 	if r.prev == nil {

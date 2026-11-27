@@ -34,6 +34,14 @@ func WithMetricsPath(path string) Option {
 	return func(r *Router) { r.metricsPath = path }
 }
 
+// WithValidationStats has the router count validation results in reg,
+// which feeds GET /admin/v1/validation. The gateway passes one
+// long-lived registry to every router it builds, so counts survive
+// reloads.
+func WithValidationStats(reg *validation.StatsRegistry) Option {
+	return func(r *Router) { r.validationStats = reg }
+}
+
 // WithValidationLog has the router log invalid requests through t,
 // which rate limits them, instead of a throttle of its own. The gateway
 // passes one long-lived throttle to every router it builds, so a reload
@@ -139,6 +147,7 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	res := rt.validator.Check(ctx, view)
 	req.Body = view.Body
 	result := res.Label(cfg.ReportOnly())
+	rt.validationStats.Record(res, result)
 	r.recordValidation(rt, res, result, time.Since(start))
 	traceValidation(span, req, res, result)
 	if res.Outcome != validation.Invalid {
