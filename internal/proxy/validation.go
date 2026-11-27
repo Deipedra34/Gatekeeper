@@ -76,6 +76,7 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	view := r.validationView(rt, req)
 	res := rt.validator.Check(req.Context(), view)
 	req.Body = view.Body
+	r.recordValidation(rt, res, cfg)
 	if res.Outcome != validation.Invalid || cfg.ReportOnly() {
 		return req, true
 	}
@@ -101,4 +102,42 @@ func (r *Router) validationView(rt *route, req *http.Request) *http.Request {
 	view := req.Clone(req.Context())
 	rt.reqTransform.Apply(view, r.transformVars(rt, req))
 	return view
+}
+
+// Validation results, the "result" label of
+// gatekeeper_validation_requests_total.
+const (
+	validationPassed     = "passed"
+	validationRejected   = "rejected"
+	validationReportOnly = "report_only"
+	validationUnmatched  = "unmatched"
+)
+
+// validationResult names what became of a request validation found res
+// for.
+func validationResult(res validation.Result, cfg config.RouteValidation) string {
+	switch {
+	case res.Outcome == validation.Passed:
+		return validationPassed
+	case res.Outcome == validation.Unmatched:
+		return validationUnmatched
+	case cfg.ReportOnly():
+		return validationReportOnly
+	}
+	return validationRejected
+}
+
+// recordValidation counts res in /metrics.
+func (r *Router) recordValidation(rt *route, res validation.Result, cfg config.RouteValidation) {
+	if r.metrics == nil {
+		return
+	}
+	result := validationResult(res, cfg)
+	r.metrics.ValidationRequests.WithLabelValues(rt.label, result).Inc()
+	switch result {
+	case validationRejected:
+		r.metrics.ValidationRejected.WithLabelValues(rt.label, res.Reason).Inc()
+	case validationReportOnly:
+		r.metrics.ValidationReportOnly.WithLabelValues(rt.label, res.Reason).Inc()
+	}
 }

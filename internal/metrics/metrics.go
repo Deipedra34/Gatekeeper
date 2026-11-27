@@ -3,7 +3,8 @@
 // the rate limiter's current remaining allowance per client, request
 // latency, authentication successes/failures by method, WebSocket
 // connection activity per route, TLS handshake/certificate state, and
-// traffic split variants' requests, errors, latency, and weights.
+// traffic split variants' requests, errors, latency, and weights, and
+// OpenAPI request validation results.
 package metrics
 
 import (
@@ -171,6 +172,21 @@ type Metrics struct {
 	FaultsInjected *prometheus.CounterVec
 
 	faults *faultCollector
+
+	// ValidationRequests counts requests checked against a route's
+	// OpenAPI spec, by route and result: "passed", "rejected" (invalid,
+	// in enforce mode), "report_only" (invalid, forwarded anyway), or
+	// "unmatched" (no operation matched, forwarded unchecked). Requests
+	// never validated — on routes without validation, WebSocket
+	// upgrades, health checks — aren't counted.
+	ValidationRequests *prometheus.CounterVec
+
+	// ValidationRejected and ValidationReportOnly count invalid requests
+	// rejected in enforce mode and forwarded in report_only mode, by route
+	// and reason: "unknown_operation", "content_type", "body_too_large",
+	// "parameter", "body", "timeout", or "internal".
+	ValidationRejected   *prometheus.CounterVec
+	ValidationReportOnly *prometheus.CounterVec
 
 	backends *backendCollector
 }
@@ -553,6 +569,18 @@ func New() *Metrics {
 			rules: prometheus.NewDesc("gatekeeper_fault_injection_rules",
 				"Number of fault injection rules in force on a route.", []string{"route"}, nil),
 		},
+		ValidationRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_validation_requests_total",
+			Help: "Total number of requests checked against a route's OpenAPI spec, by route and result (passed, rejected, report_only, unmatched).",
+		}, []string{"route", "result"}),
+		ValidationRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_validation_rejected_total",
+			Help: "Total number of requests rejected by OpenAPI validation in enforce mode, by route and reason.",
+		}, []string{"route", "reason"}),
+		ValidationReportOnly: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gatekeeper_validation_report_only_violations_total",
+			Help: "Total number of requests that failed OpenAPI validation in report_only mode and were forwarded anyway, by route and reason.",
+		}, []string{"route", "reason"}),
 		activeBans: &activeBansCollector{
 			desc: prometheus.NewDesc("gatekeeper_access_control_active_bans",
 				"Number of client addresses currently banned, across every instance sharing the store.", nil, nil),
@@ -602,6 +630,9 @@ func New() *Metrics {
 		m.variantWeights,
 		m.FaultsInjected,
 		m.faults,
+		m.ValidationRequests,
+		m.ValidationRejected,
+		m.ValidationReportOnly,
 		m.backends,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
