@@ -308,6 +308,27 @@ cors:
 #     max_duration: 1h               # stop on its own (default: never)
 #     count_as_backend_failure: true # default; false: never retried or counted
 #     # allow_full_abort: true       # needed for a 100% abort or reset in production
+#
+# A route can check its requests against an OpenAPI 3.x spec before
+# forwarding them (see README.md's "OpenAPI request validation"): the
+# operation the method and path resolve to, its path, query, and header
+# parameters, and its JSON body. The spec is loaded at startup and on
+# every reload; a missing or invalid one fails the load. Paths are
+# matched as the backend receives them, after strip_prefix and rewrite.
+# Credentials (Authorization, Cookie, the API key header) are left to
+# auth and never validated. WebSocket upgrades, health checks, /metrics,
+# and the admin API are never validated.
+#   validation:
+#     enabled: false                    # default: off
+#     openapi_file: examples/openapi/orders.yaml   # YAML or JSON
+#     mode: enforce                     # enforce (default: reject) or report_only (log, count, forward)
+#     reject_status: 400                # 400 (default) or 422; 413 for a body over max_body_bytes
+#     reject_unknown_operations: false  # default: forward requests no operation matches
+#     validate_content_type: false      # default: a body of an undeclared type isn't checked
+#     validate_non_json_bodies: false   # default: only JSON bodies are checked
+#     max_body_bytes: 1048576           # default 1 MiB; larger bodies are invalid
+#     max_json_depth: 32                # default; deeper JSON is invalid without being decoded
+#     timeout: 100ms                    # default; a slower check is invalid
 routes:
   - path_prefix: "/ws"
     target: "http://localhost:9000"
