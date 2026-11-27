@@ -110,6 +110,9 @@ type Router struct {
 
 	// metricsPath is never validated (see WithMetricsPath).
 	metricsPath string
+	// specs are the OpenAPI specs the routes validate against, by file,
+	// kept so the next reload can reuse those that haven't changed.
+	specs map[string]*validation.Spec
 	// validationLog rate limits the log lines of invalid requests (see
 	// WithValidationLog), and validationStats counts validation results
 	// per route (see WithValidationStats).
@@ -258,6 +261,7 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			validationStats:  validationStats,
 		})
 	}
+	r.specs = specs
 	if r.prev == nil {
 		r.backends.Activate()
 	}

@@ -114,6 +114,8 @@ func (r *Router) skipValidation(req *http.Request) bool {
 // buildValidator compiles rt's validation section, if it has one that's
 // enabled: its spec is loaded (once per file for the whole router) and
 // checked now, so a missing or broken spec fails startup or the reload.
+// On a reload, a spec whose files haven't changed is reused from the
+// router being replaced rather than compiled again.
 func (r *Router) buildValidator(rt config.Route, label string, specs map[string]*validation.Spec) (*validation.Validator, error) {
 	vc := rt.Validation
 	if vc == nil || !vc.Enabled {
@@ -121,8 +123,12 @@ func (r *Router) buildValidator(rt config.Route, label string, specs map[string]
 	}
 	spec, ok := specs[vc.OpenAPIFile]
 	if !ok {
+		var prev *validation.Spec
+		if r.prev != nil {
+			prev = r.prev.specs[vc.OpenAPIFile]
+		}
 		var err error
-		if spec, err = validation.LoadSpec(vc.OpenAPIFile, r.apiKeyHeader); err != nil {
+		if spec, _, err = validation.LoadSpecReusing(vc.OpenAPIFile, prev, r.apiKeyHeader); err != nil {
 			return nil, fmt.Errorf("proxy: route %s: validation: %w", label, err)
 		}
 		specs[vc.OpenAPIFile] = spec

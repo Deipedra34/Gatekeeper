@@ -55,10 +55,50 @@ type Spec struct {
 	// secretHeaders are the canonical names of the headers that carry
 	// credentials, which validation never sees.
 	secretHeaders []string
+	// refs are the other files the spec's $refs pulled in, with the
+	// digest of each, so a reload can tell whether any of them changed.
+	refs map[string]string
 }
 
 // builtinSecretHeaders always carry credentials, whatever the config.
 var builtinSecretHeaders = []string{"Authorization", "Proxy-Authorization", "Cookie"}
+
+// LoadSpecReusing is LoadSpec, except that it returns prev itself when
+// prev was loaded from the same path, with the same secretHeaders, and
+// neither the file nor any file its $refs pulled in has changed since:
+// a reload then costs reading the files, not compiling the spec again.
+// reused reports which happened.
+func LoadSpecReusing(path string, prev *Spec, secretHeaders ...string) (spec *Spec, reused bool, err error) {
+	data, err := readSpecFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if prev != nil && prev.unchanged(path, data, canonicalSecrets(secretHeaders)) {
+		return prev, true, nil
+	}
+	spec, err = ParseSpec(path, data, secretHeaders...)
+	return spec, false, err
+}
+
+// unchanged reports whether s is what loading data, the contents of
+// path, with secrets would produce.
+func (s *Spec) unchanged(path string, data []byte, secrets []string) bool {
+	if s.Path != path || s.Digest != digest(data) || !slices.Equal(s.secretHeaders, secrets) {
+		return false
+	}
+	for file, sum := range s.refs {
+		ref, err := os.ReadFile(file)
+		if err != nil || digest(ref) != sum {
+			return false
+		}
+	}
+	return true
+}
+
+func digest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
 
 // LoadSpec reads, parses, and checks the OpenAPI spec at path.
 // secretHeaders are headers carrying credentials besides Authorization,
@@ -121,7 +161,15 @@ func ParseSpec(path string, data []byte, secretHeaders ...string) (*Spec, error)
 	}
 	loader := openapi3.NewLoader()
 	loader.IsExternalRefsAllowed = true
-	loader.ReadFromURIFunc = openapi3.ReadFromFile // local files only
+	refs := map[string]string{}
+	// Local files only, each recorded with its digest.
+	loader.ReadFromURIFunc = func(l *openapi3.Loader, location *url.URL) ([]byte, error) {
+		data, err := openapi3.ReadFromFile(l, location)
+		if err == nil {
+			refs[filepath.FromSlash(location.Path)] = digest(data)
+		}
+		return data, err
+	}
 	doc, err := loader.LoadFromDataWithPath(data, &url.URL{Path: filepath.ToSlash(abs)})
 	if err != nil {
 		return nil, fmt.Errorf("OpenAPI spec %s could not be parsed: %w", path, err)
@@ -143,10 +191,9 @@ func ParseSpec(path string, data []byte, secretHeaders ...string) (*Spec, error)
 		return nil, fmt.Errorf("OpenAPI spec %s: compiling its paths: %w", path, err)
 	}
 
-	sum := sha256.Sum256(data)
 	s := &Spec{
 		Path:     path,
-		Digest:   hex.EncodeToString(sum[:]),
+		Digest:   digest(data),
 		OpenAPI:  doc.OpenAPI,
 		LoadedAt: time.Now(),
 		doc:      doc,
@@ -154,6 +201,7 @@ func ParseSpec(path string, data []byte, secretHeaders ...string) (*Spec, error)
 
 		IgnoredParameters: ignored,
 		secretHeaders:     secrets,
+		refs:              refs,
 	}
 	if doc.Info != nil {
 		s.Title, s.Version = doc.Info.Title, doc.Info.Version
