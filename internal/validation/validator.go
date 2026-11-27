@@ -233,13 +233,14 @@ func (v *Validator) run(ctx context.Context, input *openapi3filter.RequestValida
 	ctx, cancel := context.WithTimeout(ctx, v.cfg.Timeout.Duration)
 	defer cancel()
 	done := make(chan error, 1) // buffered: an abandoned check never blocks
+	validate := validateRequest // read here, not on the goroutine, which may outlive Check
 	go func() {
 		defer func() {
 			if recover() != nil {
 				done <- errPanic
 			}
 		}()
-		done <- validateRequest(ctx, input)
+		done <- validate(ctx, input)
 	}()
 	select {
 	case err := <-done:
