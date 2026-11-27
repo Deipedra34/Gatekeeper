@@ -45,6 +45,7 @@ const ScopeName = "gatekeeper"
 const (
 	SpanAuth                = "auth"
 	SpanRateLimit           = "rate_limit"
+	SpanValidation          = "validation"
 	SpanCacheLookup         = "cache.lookup"
 	SpanCircuitBreaker      = "circuit_breaker.check"
 	SpanBackendAttempt      = "backend.attempt"
@@ -112,6 +113,18 @@ const (
 	// attempt span the fault was injected into.
 	AttrFaultInjected = attribute.Key("fault.injected")
 	AttrFaultRule     = attribute.Key("gatekeeper.fault.rule")
+
+	// AttrValidationResult is what OpenAPI validation made of the
+	// request: "passed", "rejected", "report_only" (invalid, forwarded
+	// anyway), or "unmatched" (no operation matched). Set on the
+	// validation span and the server span of validated requests.
+	// AttrValidationReason is why an invalid one failed (parameter,
+	// body, ...), and AttrValidationOperation the operation it resolved
+	// to: its operationId, or its method and path template from the spec.
+	// None of them carries anything the client sent.
+	AttrValidationResult    = attribute.Key("validation.result")
+	AttrValidationReason    = attribute.Key("gatekeeper.validation.reason")
+	AttrValidationOperation = attribute.Key("gatekeeper.validation.operation")
 
 	AttrWSRejectReason = attribute.Key("gatekeeper.websocket.reject_reason")
 	AttrWSCloseReason  = attribute.Key("gatekeeper.websocket.close_reason")

@@ -6,9 +6,13 @@ import (
 	"slices"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/fault"
 	"gatekeeper/internal/middleware"
+	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/validation"
 	"gatekeeper/internal/websocket"
 )
@@ -75,10 +79,13 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	req = req.WithContext(req.Context())
 	cfg := rt.validator.Config()
 	start := time.Now()
+	ctx, span := tracing.Start(req.Context(), tracing.SpanValidation, trace.WithAttributes(tracing.AttrHTTPRoute.String(rt.label)))
 	view := r.validationView(rt, req)
-	res := rt.validator.Check(req.Context(), view)
+	res := rt.validator.Check(ctx, view)
 	req.Body = view.Body
-	r.recordValidation(rt, res, cfg, time.Since(start))
+	result := validationResult(res, cfg)
+	r.recordValidation(rt, res, result, time.Since(start))
+	traceValidation(span, req, res, result)
 	if res.Outcome != validation.Invalid || cfg.ReportOnly() {
 		return req, true
 	}
@@ -130,12 +137,11 @@ func validationResult(res validation.Result, cfg config.RouteValidation) string 
 }
 
 // recordValidation counts res in /metrics.
-func (r *Router) recordValidation(rt *route, res validation.Result, cfg config.RouteValidation, took time.Duration) {
+func (r *Router) recordValidation(rt *route, res validation.Result, result string, took time.Duration) {
 	if r.metrics == nil {
 		return
 	}
 	r.metrics.ValidationDuration.WithLabelValues(rt.label).Observe(took.Seconds())
-	result := validationResult(res, cfg)
 	r.metrics.ValidationRequests.WithLabelValues(rt.label, result).Inc()
 	switch result {
 	case validationRejected:
@@ -143,4 +149,23 @@ func (r *Router) recordValidation(rt *route, res validation.Result, cfg config.R
 	case validationReportOnly:
 		r.metrics.ValidationReportOnly.WithLabelValues(rt.label, res.Reason).Inc()
 	}
+}
+
+// traceValidation records res on the validation span, and its result on
+// the server span too, so traces can be searched by it. A rejection
+// marks the validation span failed.
+func traceValidation(span trace.Span, req *http.Request, res validation.Result, result string) {
+	attrs := []attribute.KeyValue{tracing.AttrValidationResult.String(result)}
+	if res.Operation != "" {
+		attrs = append(attrs, tracing.AttrValidationOperation.String(res.Operation))
+	}
+	if res.Reason != "" {
+		attrs = append(attrs, tracing.AttrValidationReason.String(res.Reason))
+	}
+	span.SetAttributes(attrs...)
+	if result == validationRejected {
+		tracing.Fail(span, "request invalid: "+res.Reason)
+	}
+	span.End()
+	trace.SpanFromContext(req.Context()).SetAttributes(tracing.AttrValidationResult.String(result))
 }
