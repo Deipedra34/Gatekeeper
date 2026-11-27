@@ -27,16 +27,17 @@ const (
 // pattern, format — and never taken from kin-openapi's error text or
 // built from the request's values, so nothing the client sent (a
 // credential pasted into the wrong field, say) is echoed back or logged.
-func collect(err error) (reason string, out []Violation) {
+func collect(err error) (reason string, out []Violation, truncated bool) {
 	c := collector{}
 	c.add(err)
-	return c.reason, c.out
+	return c.reason, c.out, c.truncated
 }
 
 type collector struct {
-	reason string
-	out    []Violation
-	seen   map[Violation]bool
+	reason    string
+	out       []Violation
+	seen      map[Violation]bool
+	truncated bool
 }
 
 func (c *collector) add(err error) {
@@ -120,7 +121,11 @@ func (c *collector) note(reason string, v Violation) {
 	if c.seen == nil {
 		c.seen = map[Violation]bool{}
 	}
-	if c.seen[v] || len(c.out) >= maxViolations {
+	if c.seen[v] {
+		return
+	}
+	if len(c.out) >= maxViolations {
+		c.truncated = true
 		return
 	}
 	c.seen[v] = true

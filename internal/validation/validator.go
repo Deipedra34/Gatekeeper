@@ -79,8 +79,10 @@ type Result struct {
 	// Reason is why the request is Invalid (one of the Reason
 	// constants); "" otherwise.
 	Reason string
-	// Violations lists what's wrong with an Invalid request.
+	// Violations lists what's wrong with an Invalid request, at most 20
+	// of them; Truncated is set when there were more.
 	Violations []Violation
+	Truncated  bool
 	// Operation names the operation the request resolved to — its
 	// operationId, or its method and path template — and is "" when it
 	// resolved to none.
@@ -183,7 +185,7 @@ func (v *Validator) Check(ctx context.Context, req *http.Request) Result {
 		res.Violations = []Violation{{In: "request", Message: "could not be validated"}}
 	default:
 		res.Outcome = Invalid
-		res.Reason, res.Violations = collect(err)
+		res.Reason, res.Violations, res.Truncated = collect(err)
 	}
 	return res
 }
