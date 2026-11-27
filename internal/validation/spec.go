@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +23,8 @@ import (
 	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/routers"
+	"github.com/getkin/kin-openapi/routers/gorillamux"
 )
 
 // maxSpecBytes bounds the spec file read at load time.
@@ -42,7 +45,8 @@ type Spec struct {
 	// LoadedAt is when the file was loaded.
 	LoadedAt time.Time
 
-	doc *openapi3.T
+	doc    *openapi3.T
+	router routers.Router
 }
 
 // LoadSpec reads, parses, and checks the OpenAPI spec at path.
@@ -108,6 +112,14 @@ func ParseSpec(path string, data []byte) (*Spec, error) {
 		return nil, fmt.Errorf("OpenAPI spec %s is invalid: %w", path, err)
 	}
 
+	// Only the path of a server URL matters here: the gateway, not the
+	// spec, decides which host and scheme a request arrived on.
+	pathOnlyServers(doc)
+	router, err := gorillamux.NewRouter(doc)
+	if err != nil {
+		return nil, fmt.Errorf("OpenAPI spec %s: compiling its paths: %w", path, err)
+	}
+
 	sum := sha256.Sum256(data)
 	s := &Spec{
 		Path:     path,
@@ -115,6 +127,7 @@ func ParseSpec(path string, data []byte) (*Spec, error) {
 		OpenAPI:  doc.OpenAPI,
 		LoadedAt: time.Now(),
 		doc:      doc,
+		router:   router,
 	}
 	if doc.Info != nil {
 		s.Title, s.Version = doc.Info.Title, doc.Info.Version
@@ -125,4 +138,61 @@ func ParseSpec(path string, data []byte) (*Spec, error) {
 		}
 	}
 	return s, nil
+}
+
+// pathOnlyServers reduces every server URL in doc, top-level and per
+// path, to its path ("https://api.example.com/v1" becomes "/v1"), so
+// operations match on the request path alone. Server variables in the
+// path are kept.
+func pathOnlyServers(doc *openapi3.T) {
+	doc.Servers = pathOnly(doc.Servers)
+	if doc.Paths == nil {
+		return
+	}
+	for _, item := range doc.Paths.Map() {
+		item.Servers = pathOnly(item.Servers)
+	}
+}
+
+func pathOnly(servers openapi3.Servers) openapi3.Servers {
+	if len(servers) == 0 {
+		return servers
+	}
+	out := make(openapi3.Servers, 0, len(servers))
+	seen := map[string]bool{}
+	for _, srv := range servers {
+		if srv == nil {
+			continue
+		}
+		u := srv.URL
+		if _, rest, ok := strings.Cut(u, "://"); ok {
+			u = "/"
+			if i := strings.IndexByte(rest, '/'); i >= 0 {
+				u = rest[i:]
+			}
+		}
+		if u == "" {
+			u = "/"
+		}
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		cp := *srv
+		cp.URL = u
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// findRoute resolves req to an operation of the spec. A HEAD request
+// resolves to the path's GET operation when it has no HEAD of its own.
+func (s *Spec) findRoute(req *http.Request) (*routers.Route, map[string]string, error) {
+	route, params, err := s.router.FindRoute(req)
+	if errors.Is(err, routers.ErrMethodNotAllowed) && req.Method == http.MethodHead {
+		get := *req
+		get.Method = http.MethodGet
+		return s.router.FindRoute(&get)
+	}
+	return route, params, err
 }
