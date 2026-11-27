@@ -3,11 +3,12 @@
 // algorithm, and serves the reverse proxy and Prometheus metrics
 // endpoint until it receives a shutdown signal.
 //
-// Sending the process SIGHUP re-reads the same config file and swaps the
-// new routes, rate-limit rules, client tiers, algorithm, auth, and CORS
-// settings into the running gateway without dropping in-flight requests.
-// An invalid new config is logged and ignored; the gateway keeps running
-// on the previous one.
+// Sending the process SIGHUP re-reads the same config file — and the
+// OpenAPI specs routes validate requests against — and swaps the new
+// routes, rate-limit rules, client tiers, algorithm, auth, CORS settings,
+// and specs into the running gateway without dropping in-flight requests.
+// An invalid new config or spec is logged and ignored; the gateway keeps
+// running on the previous one.
 //
 // With tls.enabled the gateway serves HTTPS (optionally verifying client
 // certificates), and SIGHUP also reloads the server certificate and key;
