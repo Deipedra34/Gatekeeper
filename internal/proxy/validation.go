@@ -51,6 +51,11 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	if res.Outcome != validation.Invalid || cfg.ReportOnly() {
 		return req, true
 	}
+	// Like any other response on the route, the rejection gets the
+	// route's response transform (its security headers, say).
+	if rt.respTransform != nil {
+		w = rt.respTransform.Wrap(w, r.transformVars(rt, req), func() { r.countTransform(rt, transformResponseHeaders) })
+	}
 	rid, _ := middleware.RequestIDFrom(req.Context())
 	validation.WriteError(w, res.Status(cfg.RejectStatus), res, rid)
 	return req, false
