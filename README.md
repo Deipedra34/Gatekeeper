@@ -1837,7 +1837,7 @@ HTTP/1.1 200 OK
 {"message":"hello from mock-backend","method":"POST","path":"/api/orders", ...}
 ```
 
-An invalid one doesn't (the response is the one under [Error responses](#error-responses)):
+An invalid one doesn't. The response is the one under [Error responses](#error-responses), without `request_id`, since the demo config leaves [request IDs](#request-ids) off:
 
 ```bash
 curl -i http://localhost:8080/api/orders -H "X-API-Key: demo-free-key" \
@@ -1852,7 +1852,7 @@ curl -s "http://localhost:8080/api/orders?limit=500&status=lost" -H "X-API-Key: 
 ```
 
 ```json
-{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","request_id":"5e9acea2-0f5c-4c6a-95c3-0f2c853d9e06","violations":[{"in":"query","field":"limit","message":"must be at most 100"},{"in":"query","field":"status","message":"must be one of the allowed values"}]}}
+{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","violations":[{"in":"query","field":"limit","message":"must be at most 100"},{"in":"query","field":"status","message":"must be one of the allowed values"}]}}
 ```
 
 ```bash
@@ -1860,7 +1860,7 @@ curl -s http://localhost:8080/api/orders/abc -H "X-API-Key: demo-free-key"
 ```
 
 ```json
-{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","request_id":"6fd31f86-78f4-4b8d-8b71-7819c79c0b14","violations":[{"in":"path","field":"orderId","message":"must be an integer"}]}}
+{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","violations":[{"in":"path","field":"orderId","message":"must be an integer"}]}}
 ```
 
 Without an API key, the same request gets `401 Unauthorized` before validation ever sees it.
@@ -2295,7 +2295,7 @@ curl -i "http://localhost:8080/api/orders?limit=500" -H "X-API-Key: demo-free-ke
 HTTP/1.1 400 Bad Request
 Content-Type: application/json
 
-{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","request_id":"...","violations":[{"in":"query","field":"limit","message":"must be at most 100"}]}}
+{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","violations":[{"in":"query","field":"limit","message":"must be at most 100"}]}}
 ```
 
 Send more than 10 requests in quick succession with the same key and you'll start getting `429 Too Many Requests` back, same as in [Example usage](#example-usage). `curl http://localhost:8080/metrics` and the gateway's own logs (`docker-compose logs gatekeeper`) work as usual too.
