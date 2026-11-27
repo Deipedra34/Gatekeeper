@@ -2481,6 +2481,18 @@ What's covered:
   - Cache purge by route, URL prefix, and everything; rate limit inspect and reset; backend drain and enable shifting real traffic; circuit breaker reset.
   - Audit log lines (with trace IDs, without secrets or bodies), one span per call, metrics, JSON errors, body size limit, and shutdown.
   - `/admin/...` on the public listener reaching the backend, never the admin API.
+- OpenAPI request validation (`internal/validation`, `internal/proxy/validation_test.go` and `validation_paths_test.go`, `internal/gateway/validation_test.go` and `validation_reload_test.go`, `internal/admin/validation_test.go`, `internal/config/validation_test.go`):
+  - Specs in YAML and JSON; missing, unparseable, invalid, and Swagger 2.0 specs failing with a clear error; local `$ref`s resolved and remote ones refused without a request being made.
+  - Valid requests passing; missing required fields, wrong types, enum, format (`email`, `uuid`, `date-time`), bound, length, and pattern violations; unknown properties; malformed JSON; invalid query, path, and header parameters; credentials never validated.
+  - Unknown paths and methods forwarded or rejected; a wrong or missing `Content-Type` with and without `validate_content_type`; form bodies with `validate_non_json_bodies`.
+  - Bodies over `max_body_bytes`, with a `Content-Length` (never read) and chunked (read just past the limit), restored intact; bodies reaching the backend byte for byte, and replayed on retries.
+  - Deeply nested JSON rejected before it's decoded; the timeout giving up on a slow check; a panicking validator recovered; concurrent use under `-race`.
+  - Error bodies never echoing what the client sent, including with OpenAPI 3.1 specs; violation lists capped; property names made safe for logs.
+  - Invalid requests never reaching the backend, cache, or circuit breaker, a traffic split variant, or a fault; `report_only` forwarding them; auth and rate limiting running first; request IDs in error bodies.
+  - Spec paths matched after `strip_prefix` and `rewrite`, and headers a transform sets satisfying the spec; WebSocket upgrades, health check paths, and `/metrics` skipped; routes without validation unchanged.
+  - Metrics, the `validation.result` span attribute, rate-limited log lines without values, and the request log note.
+  - Startup failing on a broken spec; reloads with a changed, invalid, or deleted spec (the old one kept), the dry-run reload, unchanged specs reused, and reloads under concurrent load dropping nothing.
+  - `GET /admin/v1/validation`.
 - A full end-to-end test (`TestGateway_EndToEnd`) that wires config → storage → limiters → the whole middleware chain → the proxy, then drives it through auth, CORS, per-tier rate limiting, and routing together, not in isolation.
 
 ## Load testing
@@ -2578,6 +2590,26 @@ BenchmarkAccessControl/allowed/lists_and_memory_bans-24   497.1 ns/op   464 B/op
 ```
 
 A lookup is a binary search over merged ranges, so it stays in the tens of nanoseconds, without allocating, from 10 entries to 100,000. The 100,000-entry list is even faster than the 10,000-entry one, because its many overlapping ranges merge into fewer. Checking every prefix in turn costs ~700x more at 10,000 entries. Compiling 100,000 entries takes ~28ms, once per load or reload. The middleware as a whole adds well under a microsecond to a request. With Redis, the ban check adds one `GET` round trip, about the same as a rate limiter check.
+
+### Request validation
+
+[`internal/validation/bench_test.go`](internal/validation/bench_test.go) measures the validator on its own, and [`internal/proxy/validation_bench_test.go`](internal/proxy/validation_bench_test.go) measures a route through the whole router to a local backend, with validation off and on, so the difference is validation's overhead. From a local run (Windows, 13th Gen Intel Core i9-13900KF):
+
+```
+BenchmarkCheck_QueryParameters-32               10235 ns/op     2404 B/op     37 allocs/op
+BenchmarkCheck_UnknownOperation-32              641.1 ns/op      110 B/op      2 allocs/op
+BenchmarkCheck_JSONBody-32                      16751 ns/op     4900 B/op     64 allocs/op
+BenchmarkCheck_InvalidJSONBody-32               23857 ns/op     9061 B/op    149 allocs/op
+BenchmarkCheck_JSONBody64KiB-32                265839 ns/op   246.69 MB/s   629002 B/op   111 allocs/op
+BenchmarkNestsDeeper_1MiB-32                  1108711 ns/op   945.77 MB/s
+BenchmarkRouter_Validation/off/GET-32           61494 ns/op    55854 B/op    133 allocs/op
+BenchmarkRouter_Validation/on/GET-32            73487 ns/op    58412 B/op    168 allocs/op
+BenchmarkRouter_Validation/off/POST-32          64412 ns/op    57854 B/op    144 allocs/op
+BenchmarkRouter_Validation/on/POST-32           91148 ns/op    63812 B/op    210 allocs/op
+BenchmarkRouter_Validation/on/POST-invalid-32   22048 ns/op    14201 B/op    126 allocs/op
+```
+
+Checking query parameters costs about 10µs, and a small JSON body about 17µs, most of it in kin-openapi's decoding and schema walk. Through the router, that's about 12µs on a `GET` and 27µs on a small `POST`, next to roughly 60µs for proxying to a backend over loopback. A rejected request is answered in about a third of the time a forwarded one takes, since it never reaches the backend. Body checks scale with size, about 250 MB/s for JSON, so the 1 MiB default limit bounds a check to a few milliseconds. The nesting scan that runs first is about four times faster than that, and allocates nothing (a test checks it with `testing.AllocsPerRun`; the benchmark's long iterations pick up the runtime's own allocations, so it doesn't report them). A route without validation pays one nil check.
 
 ## Architecture Decisions
 
