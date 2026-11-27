@@ -32,6 +32,7 @@ import (
 	"gatekeeper/internal/split"
 	"gatekeeper/internal/tracing"
 	"gatekeeper/internal/transform"
+	"gatekeeper/internal/validation"
 	"gatekeeper/internal/websocket"
 )
 
@@ -78,6 +79,10 @@ type route struct {
 	// variant names the variant serving the request, on a route copy
 	// selectVariant made; "" otherwise.
 	variant string
+
+	// validator checks requests against the route's OpenAPI spec; nil
+	// when it has no validation enabled.
+	validator *validation.Validator
 }
 
 // Router dispatches requests to the backend whose route matches, based
@@ -174,6 +179,7 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 	}
 	r.backends = lb.NewSet(r.registry, prevSet, log.Default())
 
+	specs := map[string]*validation.Spec{}
 	for _, rt := range routes {
 		label := routeLabel(rt)
 		var (
@@ -201,6 +207,11 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			r.backends.Discard()
 			return nil, fmt.Errorf("proxy: route %s: transform: %w", label, err)
 		}
+		validator, err := r.buildValidator(rt, label, specs)
+		if err != nil {
+			r.backends.Discard()
+			return nil, err
+		}
 		proxy := &httputil.ReverseProxy{
 			Director:     director,
 			ErrorHandler: errorHandler(label),
@@ -222,6 +233,7 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 			ws:               newWSSettings(rt),
 			split:            sr,
 			variants:         variants,
+			validator:        validator,
 		})
 	}
 	if r.prev == nil {
@@ -416,6 +428,16 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if rt == nil {
 		http.Error(w, "no backend route configured for this request", http.StatusNotFound)
 		return
+	}
+
+	// Before anything that costs more or has effects (see validation.go):
+	// an invalid request never picks a variant, gets a fault, touches the
+	// cache, or reaches a backend or its circuit breaker.
+	if rt.validator != nil {
+		var ok bool
+		if req, ok = r.validate(rt, w, req); !ok {
+			return
+		}
 	}
 
 	if rt.split != nil {
