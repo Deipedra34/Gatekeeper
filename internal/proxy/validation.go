@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"time"
 
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/fault"
@@ -73,10 +74,11 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	// A copy, so the body validation puts back is this request's alone.
 	req = req.WithContext(req.Context())
 	cfg := rt.validator.Config()
+	start := time.Now()
 	view := r.validationView(rt, req)
 	res := rt.validator.Check(req.Context(), view)
 	req.Body = view.Body
-	r.recordValidation(rt, res, cfg)
+	r.recordValidation(rt, res, cfg, time.Since(start))
 	if res.Outcome != validation.Invalid || cfg.ReportOnly() {
 		return req, true
 	}
@@ -128,10 +130,11 @@ func validationResult(res validation.Result, cfg config.RouteValidation) string 
 }
 
 // recordValidation counts res in /metrics.
-func (r *Router) recordValidation(rt *route, res validation.Result, cfg config.RouteValidation) {
+func (r *Router) recordValidation(rt *route, res validation.Result, cfg config.RouteValidation, took time.Duration) {
 	if r.metrics == nil {
 		return
 	}
+	r.metrics.ValidationDuration.WithLabelValues(rt.label).Observe(took.Seconds())
 	result := validationResult(res, cfg)
 	r.metrics.ValidationRequests.WithLabelValues(rt.label, result).Inc()
 	switch result {

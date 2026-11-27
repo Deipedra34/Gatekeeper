@@ -188,6 +188,10 @@ type Metrics struct {
 	ValidationRejected   *prometheus.CounterVec
 	ValidationReportOnly *prometheus.CounterVec
 
+	// ValidationDuration is how long checking a request against its
+	// route's spec took, reading its body included, by route.
+	ValidationDuration *prometheus.HistogramVec
+
 	backends *backendCollector
 }
 
@@ -581,6 +585,11 @@ func New() *Metrics {
 			Name: "gatekeeper_validation_report_only_violations_total",
 			Help: "Total number of requests that failed OpenAPI validation in report_only mode and were forwarded anyway, by route and reason.",
 		}, []string{"route", "reason"}),
+		ValidationDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gatekeeper_validation_duration_seconds",
+			Help:    "Time spent checking requests against a route's OpenAPI spec, reading the body included, by route.",
+			Buckets: []float64{0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"route"}),
 		activeBans: &activeBansCollector{
 			desc: prometheus.NewDesc("gatekeeper_access_control_active_bans",
 				"Number of client addresses currently banned, across every instance sharing the store.", nil, nil),
@@ -633,6 +642,7 @@ func New() *Metrics {
 		m.ValidationRequests,
 		m.ValidationRejected,
 		m.ValidationReportOnly,
+		m.ValidationDuration,
 		m.backends,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
