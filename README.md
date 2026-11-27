@@ -1669,6 +1669,281 @@ curl -s -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/
 
 Runtime rules are **per instance** and live in memory. They survive reloads (unless their route is removed), but not restarts. API keys a rule targets are shown as fingerprints, here and in `/admin/v1/config`.
 
+## OpenAPI request validation
+
+A route can check its requests against an OpenAPI 3.x spec before forwarding them. The method and path have to resolve to an operation in the spec. That operation's path, query, and header parameters, and its JSON request body, are then checked against their schemas: types, required fields, enums, formats, minimums and maximums, lengths, and patterns. In `enforce` mode an invalid request gets a 400 with a JSON list of what's wrong, and never reaches the cache, the circuit breaker, or a backend. In `report_only` mode it's logged and counted, then forwarded anyway, which is how you roll validation out without breaking clients.
+
+It's off by default. A route without a `validation` section, or with `enabled: false`, is proxied exactly as before, and the per-request cost is one nil check. Validation uses [kin-openapi](https://github.com/getkin/kin-openapi) rather than a validator of its own; see [ADR 12](docs/adr/0012-openapi-request-validation.md).
+
+A small spec, [`examples/openapi/orders.yaml`](examples/openapi/orders.yaml) (shortened here):
+
+```yaml
+openapi: 3.0.3
+info: {title: Orders API (Gatekeeper demo), version: 1.0.0}
+servers:
+  - url: /api                      # the path is kept, a host would be ignored
+paths:
+  /orders:
+    get:
+      operationId: listOrders
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100}}
+        - {name: status, in: query, schema: {type: string, enum: [pending, shipped, cancelled]}}
+    post:
+      operationId: createOrder
+      parameters:
+        - {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 8}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [customer_email, items]
+              properties:
+                customer_email: {type: string, format: email}
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [sku, quantity]
+                    properties:
+                      sku: {type: string, pattern: "^[A-Z]{3}-[0-9]{4}$"}
+                      quantity: {type: integer, minimum: 1, maximum: 1000}
+  /orders/{orderId}:
+    parameters:
+      - {name: orderId, in: path, required: true, schema: {type: integer, minimum: 1}}
+    get: {operationId: getOrder}
+```
+
+### Configuration
+
+Enforce, the default mode:
+
+```yaml
+routes:
+  - path_prefix: "/api/orders"
+    target: "http://localhost:9002"
+    validation:
+      enabled: true
+      openapi_file: examples/openapi/orders.yaml   # YAML or JSON, relative to the working directory
+      mode: enforce                # the default
+      reject_status: 400           # or 422
+```
+
+Report only, with everything else spelled out at its default:
+
+```yaml
+    validation:
+      enabled: true
+      openapi_file: specs/orders.json
+      mode: report_only               # log and count invalid requests, forward them anyway
+      reject_unknown_operations: false  # true: a path or method the spec doesn't have is invalid
+      validate_content_type: false    # true: a body without a Content-Type, or of a type the operation doesn't declare, is invalid
+      validate_non_json_bodies: false # true: also check form and text bodies kin-openapi can decode
+      max_body_bytes: 1048576         # 1 MiB; a larger body is invalid (413)
+      max_json_depth: 32              # deeper nesting is invalid, without decoding the body
+      timeout: 100ms                  # a check that takes longer is invalid
+```
+
+Each spec is loaded and checked when the config is: at startup, where a missing or invalid spec stops the gateway with an error naming the route and the file, and on every reload (see [below](#reloading-specs)). Relative `$ref`s to other local files work; `$ref`s to URLs are refused, so loading a spec never touches the network.
+
+### What is checked
+
+- **The operation.** The method and path have to match an operation. A `HEAD` matches the path's `GET` if it has no `HEAD` of its own. With `reject_unknown_operations: false` (the default), a request that matches nothing is forwarded unchecked and counted as `unmatched`.
+- **Server URLs.** Only the path of each `servers` URL counts: with `url: https://api.example.com/v1`, `/v1/orders` matches the spec's `/orders`, whatever host the request came to.
+- **Path, query, and header parameters**, including required ones that are missing.
+- **The request body**, when it's JSON (`application/json` or any `+json` type) and its Content-Type is one the operation declares. A JSON body sent without a Content-Type is checked as the operation's JSON type, so leaving the header out doesn't get a body past validation. A missing body is invalid when the operation marks it `required`.
+- **Formats:** `date`, `date-time`, `byte`, `email`, `uuid`, `ipv4`, `ipv6`, and the integer formats.
+- **Not credentials.** Authentication is the gateway's job, and it has already run. The spec's security requirements are ignored, and so are its cookie parameters and its header parameters for `Authorization`, `Proxy-Authorization`, `Cookie`, and the API key header (`auth.header`). Those headers are removed from the copy of the request that gets validated, so their values never reach the validator, its errors, or the logs.
+
+Nothing is changed on the way through. Defaults the spec declares aren't added to the request, and the backend gets the body byte for byte as the client sent it.
+
+### Paths, strip_prefix, and rewrite
+
+The spec describes the backend's API, so a request is validated as the backend will receive it: the path after the route's `strip_prefix` and `rewrite`, and the query and headers after its request transform. Write the spec's paths the way the backend sees them:
+
+```yaml
+  - path_prefix: "/shop/v2"
+    target: "http://orders:9000"
+    transform:
+      request:
+        strip_prefix: true           # /shop/v2/orders reaches the backend as /orders...
+        set_headers: {X-Tenant: acme}  # ...with X-Tenant set, which satisfies a required X-Tenant in the spec
+    validation:
+      enabled: true
+      openapi_file: specs/orders.yaml  # paths: /orders, /orders/{orderId}
+```
+
+A `rewrite` works the same way: `/legacy/order-list` rewritten to `/orders` is matched against `/orders`. A spec whose paths include the gateway's prefix can say so with a server URL instead: `servers: [{url: /shop/v2}]` with `strip_prefix: false`.
+
+### Size and safety limits
+
+- **Bounded body reads.** At most `max_body_bytes` are read for validation. A body whose `Content-Length` is already over the limit isn't read at all, and a chunked one is read only until it passes the limit. Either way it's invalid (`body_too_large`, answered 413 in enforce mode). In `report_only` mode the backend still gets the whole body: what was read goes back in front of what wasn't.
+- **No double reads.** The body is read once. kin-openapi checks its own copy, and the backend reads the same bytes through a fresh reader, so retries replay it as before.
+- **Nesting.** Before a JSON body is decoded, one pass over its bytes (with no allocations) checks it doesn't nest objects and arrays deeper than `max_json_depth`. A body of 100,000 `[` costs one linear pass over its bytes, not 100,000 levels of recursion.
+- **Time.** The schema checks run with a `timeout`; a check that takes longer is given up on and the request is invalid (`timeout`). Regular expressions in specs are Go's RE2, which runs in linear time.
+- **Bounded errors.** An error lists at most 20 faults (`violations_truncated` says when there were more), with property names cut to 64 bytes and stripped of control characters.
+- **Never validated:** WebSocket upgrades, the metrics path, the health check paths `/healthz`, `/health`, `/livez`, and `/readyz` (exactly those paths, not what's below them), and the admin API, which has a listener of its own. Health check probes aren't recognised by `User-Agent` here, since any client could claim to be one.
+
+### Error responses
+
+An invalid request is answered with `reject_status` (400 by default, or 422), except `body_too_large`, which gets 413, and `internal` (the validator itself failed), which gets 500. The body uses the same envelope as the admin API's errors:
+
+```json
+{
+  "error": {
+    "code": "request_validation_failed",
+    "message": "the request does not match the API specification",
+    "reason": "parameter",
+    "request_id": "6724d95d-9ec1-4413-8c0f-3f633cec0703",
+    "violations": [
+      {"in": "header", "field": "Idempotency-Key", "message": "is required"},
+      {"in": "body", "field": "/customer_email", "message": "must be a valid email"},
+      {"in": "body", "message": "has a property the schema does not allow"},
+      {"in": "body", "field": "/items/0/quantity", "message": "must be at least 1"},
+      {"in": "body", "field": "/items/0/sku", "message": "must match the pattern ^[A-Z]{3}-[0-9]{4}$"}
+    ]
+  }
+}
+```
+
+- `reason` is one of `unknown_operation`, `content_type`, `body_too_large`, `parameter`, `body`, `timeout`, or `internal`. A request failing several ways gets the first of those that applies, and every violation is still listed.
+- `in` is `path`, `query`, `header`, `body`, or `request`. `field` is the parameter's name, or the JSON pointer of the body value at fault.
+- `request_id` is there when [request IDs](#request-ids) are on, and matches the `X-Request-ID` response header.
+- Messages are written from the spec (its types, bounds, and patterns), never from what the client sent. Neither the body nor any value from it, the query, or a header is echoed back.
+
+Like any other response on the route, a rejection gets the route's response transform, security headers included.
+
+### Trying it out
+
+The [docker-compose stack](#run-the-full-stack-with-docker-compose) validates `/api/orders` against the example spec. A valid order goes through:
+
+```bash
+curl -i http://localhost:8080/api/orders -H "X-API-Key: demo-free-key" \
+  -H "Content-Type: application/json" -H "Idempotency-Key: order-7f3a9c21" \
+  -d '{"customer_email":"ada@example.com","items":[{"sku":"ABC-1234","quantity":2}]}'
+```
+
+```
+HTTP/1.1 200 OK
+
+{"message":"hello from mock-backend","method":"POST","path":"/api/orders", ...}
+```
+
+An invalid one doesn't (the response is the one under [Error responses](#error-responses)):
+
+```bash
+curl -i http://localhost:8080/api/orders -H "X-API-Key: demo-free-key" \
+  -H "Content-Type: application/json" \
+  -d '{"customer_email":"not-an-email","items":[{"sku":"abc","quantity":0}],"discount":50}'
+```
+
+Bad query and path parameters:
+
+```bash
+curl -s "http://localhost:8080/api/orders?limit=500&status=lost" -H "X-API-Key: demo-free-key"
+```
+
+```json
+{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","request_id":"5e9acea2-0f5c-4c6a-95c3-0f2c853d9e06","violations":[{"in":"query","field":"limit","message":"must be at most 100"},{"in":"query","field":"status","message":"must be one of the allowed values"}]}}
+```
+
+```bash
+curl -s http://localhost:8080/api/orders/abc -H "X-API-Key: demo-free-key"
+```
+
+```json
+{"error":{"code":"request_validation_failed","message":"the request does not match the API specification","reason":"parameter","request_id":"6fd31f86-78f4-4b8d-8b71-7819c79c0b14","violations":[{"in":"path","field":"orderId","message":"must be an integer"}]}}
+```
+
+Without an API key, the same request gets `401 Unauthorized` before validation ever sees it.
+
+### How it fits with the rest of the pipeline
+
+Validation runs inside the router, once the route is known: **after** access control, auth, CORS, and rate limiting, and **before** the traffic split, fault injection, request transforms, the cache, retries, the circuit breaker, and the backend. See [ADR 12](docs/adr/0012-openapi-request-validation.md) for why.
+
+- **Auth runs first**, so a client without credentials learns nothing about the spec from its errors.
+- **Rate limiting runs first** too. Validation is the most expensive step before the backend, and this way its cost per client is bounded by the client's limit. An invalid request spends rate limit budget like any other, so a client can't flood the gateway with invalid payloads for free.
+- **Transforms:** the request is validated as transformed, on a copy (see [above](#paths-strip_prefix-and-rewrite)). The real request is transformed afterwards, as before.
+- **Caching:** an invalid `GET` never reads from or writes to the cache, and a valid one is checked before its cache lookup, so a cached response is never served for an invalid request.
+- **Retries and load balancing:** a valid request's body is replayed on every attempt, to whichever backend each attempt picks. A rejected request makes no attempt at all.
+- **Circuit breakers** never hear of rejected requests, so a flood of bad requests can't trip them.
+- **Traffic splits:** a rejected request picks no variant and doesn't count toward a variant's guardrails.
+- **Fault injection:** a rejected request is never faulted.
+
+### Reloading specs
+
+Specs are re-read on every reload: `SIGHUP`, or `POST /admin/v1/reload`. Requests already in flight finish on the spec they started with, and new ones get the new spec, with nothing dropped. If a spec is now missing or invalid, the whole reload is refused and logged, and the specs (and config) in force are kept. `POST /admin/v1/reload?dry_run=true` checks the specs too.
+
+A spec is compiled once per file, however many routes use it, and the compiled spec is what each request uses. A reload that finds a spec and every file its `$ref`s pull in unchanged reuses the compiled spec instead of compiling it again. Startup and every reload log which spec each route enforces:
+
+```
+validation: route /api/orders: rejecting requests that don't match examples/openapi/orders.yaml ("Orders API (Gatekeeper demo)" 1.0.0, OpenAPI 3.0.3, 4 operations, sha256 c282bd8b19cb)
+```
+
+### Logs, metrics, and tracing
+
+Invalid requests are logged at a limited rate (a burst of 10, then one a second, with a count of the lines dropped). The line names the route, the method and path (never the query), the operation, the reason, and the first few faults, without any values:
+
+```
+validation: route /api/orders: rejected POST "/api/orders" operation="createOrder" reason=parameter: header Idempotency-Key is required; body /customer_email must be a valid email; body has a property the schema does not allow (+2 more) request_id=6724d95d-9ec1-4413-8c0f-3f633cec0703
+```
+
+The request's own log line ends with `validation=rejected`, or `validation=report_only` when it was forwarded anyway:
+
+```
+POST /api/orders 400 0.4ms 127.0.0.1:55963 validation=rejected
+```
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `gatekeeper_validation_requests_total` | `route`, `result`: `passed`, `rejected`, `report_only`, `unmatched` | Requests checked against the route's spec |
+| `gatekeeper_validation_rejected_total` | `route`, `reason` | Invalid requests rejected in enforce mode |
+| `gatekeeper_validation_report_only_violations_total` | `route`, `reason` | Invalid requests forwarded in report_only mode |
+| `gatekeeper_validation_duration_seconds` | `route` | Time spent validating, reading the body included (histogram) |
+
+`reason` is one of the seven above, so the labels stay bounded. With [tracing](#distributed-tracing) on, each validated request gets a `validation` span with `validation.result` (the same values as `result`), `gatekeeper.validation.reason`, and `gatekeeper.validation.operation` (the operationId, or the method and path template from the spec). The server span carries `validation.result` too. The body and parameter values never become span data. The [Grafana dashboard](#grafana-dashboard) has a **Request validation** row.
+
+### Validation endpoint
+
+With the [admin API](#admin-api) enabled, `GET /admin/v1/validation` lists every validated route: its mode and settings, the spec it enforces (file, title, version, SHA-256, and when it was loaded), and its counts since the gateway started, which survive reloads.
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:9090/admin/v1/validation
+```
+
+```json
+{
+  "routes": [
+    {
+      "route": "/api/orders",
+      "route_id": "0ef7787276b2",
+      "mode": "enforce",
+      "spec": {
+        "file": "examples/openapi/orders.yaml",
+        "title": "Orders API (Gatekeeper demo)",
+        "version": "1.0.0",
+        "openapi": "3.0.3",
+        "operations": 4,
+        "sha256": "c282bd8b19cb72832e2abc9a3ebebee82234a04633a7b90d1fb5889c867bbf0b",
+        "loaded_at": "2026-11-27T18:12:02.8279019Z",
+        "ignored_credential_parameters": 0
+      },
+      "settings": {"reject_status": 400, "reject_unknown_operations": false, "validate_content_type": false,
+                   "validate_non_json_bodies": false, "max_body_bytes": 1048576, "max_json_depth": 32, "timeout": "100ms"},
+      "counters": {"validated": 5, "passed": 2, "rejected": 3, "report_only": 0, "unmatched": 0,
+                   "rejected_by_reason": {"parameter": 3}, "report_only_by_reason": {}}
+    }
+  ],
+  "reasons": ["unknown_operation", "content_type", "body_too_large", "parameter", "body", "timeout", "internal"]
+}
+```
+
+Counts are per instance. The metrics above are the place to see them across a fleet.
+
 ## Setup
 
 Requires Go 1.26+ (see `go.mod`). Redis is optional, only needed if you set `storage.backend: redis`.
