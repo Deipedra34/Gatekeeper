@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/cache"
 	"gatekeeper/internal/circuitbreaker"
 	"gatekeeper/internal/config"
@@ -107,6 +108,9 @@ type Router struct {
 
 	// metricsPath is never validated (see WithMetricsPath).
 	metricsPath string
+	// validationLog rate limits the log lines of invalid requests (see
+	// WithValidationLog).
+	validationLog *accesscontrol.LogThrottle
 }
 
 // Option customises a Router built by NewRouter.
@@ -169,6 +173,9 @@ func NewRouter(routes []config.Route, proxyCfg config.ProxyConfig, m *metrics.Me
 	}
 	if r.apiKeyHeader == "" {
 		r.apiKeyHeader = "X-API-Key"
+	}
+	if r.validationLog == nil {
+		r.validationLog = accesscontrol.NewLogThrottle(log.Default(), validationLogInterval, validationLogBurst)
 	}
 	if r.registry == nil {
 		r.registry = lb.NewRegistry()

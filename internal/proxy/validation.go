@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"gatekeeper/internal/accesscontrol"
 	"gatekeeper/internal/config"
 	"gatekeeper/internal/fault"
 	"gatekeeper/internal/middleware"
@@ -30,6 +32,59 @@ import (
 // validated even when a route's prefix covers it.
 func WithMetricsPath(path string) Option {
 	return func(r *Router) { r.metricsPath = path }
+}
+
+// WithValidationLog has the router log invalid requests through t,
+// which rate limits them, instead of a throttle of its own. The gateway
+// passes one long-lived throttle to every router it builds, so a reload
+// in the middle of a flood doesn't reset the limit.
+func WithValidationLog(t *accesscontrol.LogThrottle) Option {
+	return func(r *Router) { r.validationLog = t }
+}
+
+// Without WithValidationLog, a router logs at most validationLogBurst
+// invalid requests at once, then one per validationLogInterval.
+const (
+	validationLogInterval = time.Second
+	validationLogBurst    = 10
+)
+
+// maxLoggedViolations bounds the violations named in a log line.
+const maxLoggedViolations = 3
+
+// logValidation logs an invalid request — rejected or, in report_only
+// mode, forwarded — at a limited rate. The line names the route, the
+// method and path, the operation, the reason, and which fields failed
+// and why: never their values, the query string, or the body.
+func (r *Router) logValidation(rt *route, req *http.Request, res validation.Result, result string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "validation: route %s: %s %s %q", rt.label, result, tracing.Method(req.Method), req.URL.Path)
+	if res.Operation != "" {
+		fmt.Fprintf(&b, " operation=%q", res.Operation)
+	}
+	fmt.Fprintf(&b, " reason=%s", res.Reason)
+	for i, v := range res.Violations {
+		if i == maxLoggedViolations {
+			fmt.Fprintf(&b, " (+%d more)", len(res.Violations)-i)
+			break
+		}
+		sep := "; "
+		if i == 0 {
+			sep = ": "
+		}
+		b.WriteString(sep + v.In)
+		if v.Field != "" {
+			b.WriteString(" " + v.Field)
+		}
+		b.WriteString(" " + v.Message)
+	}
+	if id, ok := middleware.RequestIDFrom(req.Context()); ok {
+		b.WriteString(" request_id=" + id)
+	}
+	if sc := trace.SpanContextFromContext(req.Context()); sc.HasTraceID() {
+		b.WriteString(" trace_id=" + sc.TraceID().String())
+	}
+	r.validationLog.Printf("%s", b.String())
 }
 
 // skipValidation reports whether req is never validated, whatever its
@@ -86,7 +141,11 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	result := validationResult(res, cfg)
 	r.recordValidation(rt, res, result, time.Since(start))
 	traceValidation(span, req, res, result)
-	if res.Outcome != validation.Invalid || cfg.ReportOnly() {
+	if res.Outcome != validation.Invalid {
+		return req, true
+	}
+	r.logValidation(rt, req, res, result)
+	if cfg.ReportOnly() {
 		return req, true
 	}
 	// Like any other response on the route, the rejection gets the

@@ -81,6 +81,9 @@ type Gateway struct {
 	// accessLog rate limits access control log lines. It outlives
 	// reloads, so a reload mid-flood doesn't reset the limit.
 	accessLog *accesscontrol.LogThrottle
+	// validationLog does the same for the log lines of requests that
+	// fail OpenAPI validation.
+	validationLog *accesscontrol.LogThrottle
 
 	// tracer is the tracing pipeline the current request pipeline uses.
 	// It's rebuilt on Reload only when the tracing section changed.
@@ -124,6 +127,8 @@ func New(cfg *config.Config, configPath string, st store.Store, m *metrics.Metri
 		backends:   lb.NewRegistry(),
 		retiring:   map[*tracing.Provider]*time.Timer{},
 		accessLog:  accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
+
+		validationLog: accesscontrol.NewLogThrottle(logger, accessLogInterval, accessLogBurst),
 	}
 	g.splits = split.NewRegistry(split.WithEvents(g.onSplitEvent))
 	g.faults = fault.NewRegistry(fault.WithEvents(g.onFaultEvent))
@@ -330,6 +335,7 @@ func (g *Gateway) build(cfg *config.Config, tp *tracing.Provider, prev *proxy.Ro
 		proxy.WithWebSocketHub(g.wsHub), proxy.WithBackendRegistry(g.backends), proxy.WithTransformConfig(cfg.Transform),
 		proxy.WithSplitRegistry(g.splits), proxy.WithAPIKeyHeader(cfg.Auth.Header),
 		proxy.WithFaultRegistry(g.faults), proxy.WithMetricsPath(cfg.Metrics.Path),
+		proxy.WithValidationLog(g.validationLog),
 	}
 	if prev != nil {
 		opts = append(opts, proxy.WithPrevious(prev))
