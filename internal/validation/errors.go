@@ -129,7 +129,7 @@ func (c *collector) note(reason string, v Violation) {
 
 // reasonOrder is the precedence of reasons: a request failing several
 // ways is reported under the first that applies.
-var reasonOrder = []string{ReasonUnknownOperation, ReasonBodyTooLarge, ReasonParameter, ReasonBody}
+var reasonOrder = []string{ReasonUnknownOperation, ReasonContentType, ReasonBodyTooLarge, ReasonParameter, ReasonBody}
 
 func reasonRank(reason string) int {
 	for i, r := range reasonOrder {

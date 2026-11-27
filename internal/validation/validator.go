@@ -43,6 +43,9 @@ func (o Outcome) String() string {
 const (
 	// ReasonUnknownOperation: no operation matches the method and path.
 	ReasonUnknownOperation = "unknown_operation"
+	// ReasonContentType: the body's Content-Type is missing or isn't one
+	// the operation declares (with validate_content_type on).
+	ReasonContentType = "content_type"
 	// ReasonBodyTooLarge: the body is larger than max_body_bytes.
 	ReasonBodyTooLarge = "body_too_large"
 	// ReasonParameter: a path, query, or header parameter is missing or

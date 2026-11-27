@@ -38,8 +38,9 @@ func hasBody(req *http.Request) bool {
 // A body is checked when it's JSON and its Content-Type is one the
 // operation declares; a body without a Content-Type is checked as the
 // operation's JSON media type, when it has one. Any other body goes to
-// the backend unread. A missing body is left to kin-openapi, which
-// reports it if the operation requires one.
+// the backend unread — unless validate_content_type is on, which makes
+// a missing or undeclared Content-Type invalid. A missing body is left
+// to kin-openapi, which reports it if the operation requires one.
 func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody, opts *openapi3filter.Options) *Result {
 	if !hasBody(req) {
 		opts.ExcludeRequestBody = false
@@ -47,6 +48,9 @@ func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody,
 	}
 	ct := req.Header.Get("Content-Type")
 	mediaType, declared := declaredMediaType(rb, ct)
+	if v.cfg.ValidateContentType && (ct == "" || !declared) {
+		return contentTypeResult(rb, ct)
+	}
 	if !declared || !isJSON(mediaType) {
 		return nil
 	}
@@ -152,6 +156,26 @@ func nestsDeeper(data []byte, max int) bool {
 		}
 	}
 	return false
+}
+
+// contentTypeResult is the result for a body sent with Content-Type ct,
+// which rb doesn't declare (or with none at all). It lists the media
+// types the operation does accept, from the spec, not the one sent.
+func contentTypeResult(rb *openapi3.RequestBody, ct string) *Result {
+	accepted := make([]string, 0, len(rb.Content))
+	for k := range rb.Content {
+		accepted = append(accepted, k)
+	}
+	slices.Sort(accepted)
+	msg := "is required with a request body"
+	if ct != "" {
+		msg = "is not a media type this operation accepts"
+	}
+	if len(accepted) > 0 {
+		msg += "; use " + strings.Join(accepted, " or ")
+	}
+	return &Result{Outcome: Invalid, Reason: ReasonContentType,
+		Violations: []Violation{{In: "header", Field: "Content-Type", Message: msg}}}
 }
 
 // declaredMediaType returns the media type of a body sent with
