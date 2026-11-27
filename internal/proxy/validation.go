@@ -45,11 +45,27 @@ func (r *Router) validate(rt *route, w http.ResponseWriter, req *http.Request) (
 	// A copy, so the body validation puts back is this request's alone.
 	req = req.WithContext(req.Context())
 	cfg := rt.validator.Config()
-	res := rt.validator.Check(req.Context(), req)
+	view := r.validationView(rt, req)
+	res := rt.validator.Check(req.Context(), view)
+	req.Body = view.Body
 	if res.Outcome != validation.Invalid || cfg.ReportOnly() {
 		return req, true
 	}
 	rid, _ := middleware.RequestIDFrom(req.Context())
 	validation.WriteError(w, res.Status(cfg.RejectStatus), res, rid)
 	return req, false
+}
+
+// validationView is req as rt's backend will receive it, which is what
+// the spec describes: its path after strip_prefix and rewrite, and its
+// query and headers after the route's request transform. The transform
+// runs on a copy; req itself is transformed later, as always, by
+// prepare. A route without a request transform validates req itself.
+func (r *Router) validationView(rt *route, req *http.Request) *http.Request {
+	if rt.reqTransform == nil {
+		return req
+	}
+	view := req.Clone(req.Context())
+	rt.reqTransform.Apply(view, r.transformVars(rt, req))
+	return view
 }
