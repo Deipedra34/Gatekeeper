@@ -299,6 +299,10 @@ type Route struct {
 	// share of the route's requests, for resilience testing. Nil (the
 	// default) injects nothing and costs nothing.
 	FaultInjection *RouteFaultConfig `yaml:"fault_injection,omitempty"`
+
+	// Validation checks requests against an OpenAPI spec before they're
+	// forwarded. Nil (the default) checks nothing and costs nothing.
+	Validation *RouteValidation `yaml:"validation,omitempty"`
 }
 
 // DefaultWSIdleTimeout is the WebSocket idle timeout applied to a route
@@ -509,6 +513,7 @@ func (c *Config) applyDefaults() {
 	c.applyAccessControlDefaults()
 	c.applyTrafficSplitDefaults()
 	c.FaultInjection.applyDefaults()
+	c.applyValidationDefaults()
 
 	if c.Metrics.Path == "" {
 		c.Metrics.Path = "/metrics"
@@ -675,6 +680,9 @@ func (c *Config) validate() error {
 		return err
 	}
 	if err := c.FaultInjection.validate(); err != nil {
+		return err
+	}
+	if err := c.validateValidation(); err != nil {
 		return err
 	}
 
