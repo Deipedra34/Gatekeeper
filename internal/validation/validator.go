@@ -43,6 +43,8 @@ func (o Outcome) String() string {
 const (
 	// ReasonUnknownOperation: no operation matches the method and path.
 	ReasonUnknownOperation = "unknown_operation"
+	// ReasonBodyTooLarge: the body is larger than max_body_bytes.
+	ReasonBodyTooLarge = "body_too_large"
 	// ReasonParameter: a path, query, or header parameter is missing or
 	// doesn't match its schema.
 	ReasonParameter = "parameter"

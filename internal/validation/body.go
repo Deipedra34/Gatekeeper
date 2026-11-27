@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -50,12 +51,13 @@ func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody,
 		return nil
 	}
 
-	data, err := io.ReadAll(req.Body)
-	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(data))
+	data, complete, err := v.readBody(req)
 	if err != nil {
 		return &Result{Outcome: Invalid, Reason: ReasonBody,
 			Violations: []Violation{{In: "body", Message: "could not be read"}}}
+	}
+	if !complete {
+		return v.tooLarge()
 	}
 
 	in.Body = io.NopCloser(bytes.NewReader(data))
@@ -65,6 +67,52 @@ func (v *Validator) prepareBody(req, in *http.Request, rb *openapi3.RequestBody,
 	}
 	opts.ExcludeRequestBody = false
 	return nil
+}
+
+// readBody reads req's body for validation, up to max_body_bytes, and
+// puts it back on req for the backend: req.Body then yields exactly the
+// bytes the client sent, all of them, whether or not they were all read
+// here. complete is false when the body is larger than the limit; data
+// is then only its beginning, and the rest is still unread.
+//
+// A body whose Content-Length is already over the limit isn't read at
+// all.
+func (v *Validator) readBody(req *http.Request) (data []byte, complete bool, err error) {
+	limit := v.cfg.MaxBodyBytes
+	if req.ContentLength > limit {
+		return nil, false, nil
+	}
+	orig := req.Body
+	data, err = io.ReadAll(io.LimitReader(orig, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		// Whatever was read goes back in front of whatever wasn't.
+		req.Body = &restoredBody{Reader: io.MultiReader(bytes.NewReader(data), orig), closer: orig}
+		return data, false, err
+	}
+	// All of it: the original body is spent, so it's closed now and the
+	// backend reads the buffered copy.
+	_ = orig.Close()
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	return data, true, nil
+}
+
+// restoredBody is a request body put back after validation read its
+// beginning: those bytes, then the rest of the original body.
+type restoredBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (b *restoredBody) Close() error { return b.closer.Close() }
+
+// tooLarge is the result for a body over max_body_bytes.
+func (v *Validator) tooLarge() *Result {
+	return &Result{
+		Outcome: Invalid,
+		Reason:  ReasonBodyTooLarge,
+		Violations: []Violation{{In: "body",
+			Message: "is larger than the " + strconv.FormatInt(v.cfg.MaxBodyBytes, 10) + " bytes this route validates"}},
+	}
 }
 
 // declaredMediaType returns the media type of a body sent with
