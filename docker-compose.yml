@@ -8,6 +8,10 @@
 # Then, from the host:
 #   curl -i http://localhost:8080/api/ping -H "X-API-Key: demo-free-key"
 #
+# /api/orders is validated against examples/openapi/orders.yaml, so this
+# one is rejected with 400 and a JSON list of what's wrong:
+#   curl -i "http://localhost:8080/api/orders?limit=500" -H "X-API-Key: demo-free-key"
+#
 # See README.md for more.
 
 services:
@@ -47,3 +51,5 @@ services:
       # variant, which points at "redis" and "mock-backend" by their
       # service name instead of localhost.
       - ./configs/config.docker.yaml:/app/configs/config.yaml:ro
+      # The OpenAPI spec the /api/orders route validates requests against.
+      - ./examples/openapi:/app/examples/openapi:ro

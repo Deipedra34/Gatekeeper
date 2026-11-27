@@ -69,8 +69,16 @@ routes:
     ws_max_connections_per_client: 10
   - path_prefix: "/api/users"
     target: "http://mock-backend:9000"
+  # Requests are checked against examples/openapi/orders.yaml (mounted
+  # by docker-compose.yml) before they're forwarded; invalid ones get a
+  # 400 with a JSON body saying which fields failed. Try:
+  #   curl -i "http://localhost:8080/api/orders?limit=500" -H "X-API-Key: demo-free-key"
   - path_prefix: "/api/orders"
     target: "http://mock-backend:9000"
+    validation:
+      enabled: true
+      openapi_file: "examples/openapi/orders.yaml"
+      mode: enforce
   - path_prefix: "/"
     target: "http://mock-backend:9000"
 
