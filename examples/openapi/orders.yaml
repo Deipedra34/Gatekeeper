@@ -1,0 +1,97 @@
+# Example OpenAPI spec for Gatekeeper's request validation (see the
+# "OpenAPI request validation" section of README.md).
+#
+# The docker-compose demo validates its /api/orders route against this
+# file (configs/config.docker.yaml). The server URL's path, /api, is
+# part of every operation's path, so /orders here matches /api/orders on
+# the gateway; a server's host, if it had one, would be ignored.
+#
+# The security scheme and the X-API-Key it names are left to the
+# gateway's own auth: validation never checks or sees credentials.
+openapi: 3.0.3
+info:
+  title: Orders API (Gatekeeper demo)
+  version: 1.0.0
+  description: A small orders API, for trying out OpenAPI request validation.
+servers:
+  - url: /api
+security:
+  - apiKey: []
+paths:
+  /orders:
+    get:
+      operationId: listOrders
+      summary: List orders
+      parameters:
+        - name: limit
+          in: query
+          description: How many orders to return
+          schema: { type: integer, minimum: 1, maximum: 100 }
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, shipped, cancelled] }
+      responses:
+        "200":
+          description: The orders
+    post:
+      operationId: createOrder
+      summary: Place an order
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: A key of the client's choosing, so a retried request isn't placed twice
+          schema: { type: string, minLength: 8, maxLength: 64, pattern: "^[A-Za-z0-9_-]+$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewOrder" }
+      responses:
+        "201":
+          description: The order was placed
+  /orders/{orderId}:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema: { type: integer, minimum: 1 }
+    get:
+      operationId: getOrder
+      summary: Get one order
+      responses:
+        "200":
+          description: The order
+    delete:
+      operationId: cancelOrder
+      summary: Cancel an order
+      responses:
+        "204":
+          description: The order was cancelled
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    NewOrder:
+      type: object
+      additionalProperties: false
+      required: [customer_email, items]
+      properties:
+        customer_email: { type: string, format: email }
+        priority: { type: string, enum: [standard, express] }
+        note: { type: string, maxLength: 500 }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: "#/components/schemas/OrderItem" }
+    OrderItem:
+      type: object
+      additionalProperties: false
+      required: [sku, quantity]
+      properties:
+        sku: { type: string, pattern: "^[A-Z]{3}-[0-9]{4}$" }
+        quantity: { type: integer, minimum: 1, maximum: 1000 }
