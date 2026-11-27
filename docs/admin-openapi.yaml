@@ -586,6 +586,27 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/TooManyAuthFailures" }
 
+  /admin/v1/validation:
+    get:
+      tags: [read]
+      summary: OpenAPI request validation specs and counts
+      description: |
+        Every route that validates requests against an OpenAPI spec: the
+        spec as loaded at startup or by the last reload (file, title,
+        version, SHA-256, when it was loaded), the route's validation
+        settings, and its counts since the gateway started, which survive
+        reloads. Routes without validation enabled aren't listed.
+      operationId: listValidation
+      responses:
+        "200":
+          description: The validated routes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "429": { $ref: "#/components/responses/TooManyAuthFailures" }
+
 components:
   securitySchemes:
     bearerToken:
@@ -1084,3 +1105,60 @@ components:
         dry_run: { type: boolean }
         note: { type: string, description: Set for a config rule }
         rule: { $ref: "#/components/schemas/FaultRule" }
+
+    ValidationCounts:
+      type: object
+      properties:
+        validated: { type: integer, description: Every request checked; the sum of the four below }
+        passed: { type: integer }
+        rejected: { type: integer, description: "Invalid, in enforce mode" }
+        report_only: { type: integer, description: "Invalid, forwarded anyway in report_only mode" }
+        unmatched: { type: integer, description: "No operation matched; forwarded unchecked" }
+        rejected_by_reason:
+          type: object
+          additionalProperties: { type: integer }
+          example: { body: 12, parameter: 3 }
+        report_only_by_reason:
+          type: object
+          additionalProperties: { type: integer }
+
+    ValidationRoute:
+      type: object
+      properties:
+        route: { type: string, example: /api/orders }
+        route_id: { type: string }
+        mode: { type: string, enum: [enforce, report_only] }
+        spec:
+          type: object
+          properties:
+            file: { type: string, example: examples/openapi/orders.yaml }
+            title: { type: string }
+            version: { type: string }
+            openapi: { type: string, example: 3.0.3 }
+            operations: { type: integer }
+            sha256: { type: string }
+            loaded_at: { type: string, format: date-time }
+            ignored_credential_parameters:
+              type: integer
+              description: Cookie and credential header parameters, which auth checks instead
+        settings:
+          type: object
+          properties:
+            reject_status: { type: integer, enum: [400, 422] }
+            reject_unknown_operations: { type: boolean }
+            validate_content_type: { type: boolean }
+            validate_non_json_bodies: { type: boolean }
+            max_body_bytes: { type: integer }
+            max_json_depth: { type: integer }
+            timeout: { type: string, example: 100ms }
+        counters: { $ref: "#/components/schemas/ValidationCounts" }
+
+    ValidationList:
+      type: object
+      properties:
+        routes: { type: array, items: { $ref: "#/components/schemas/ValidationRoute" } }
+        reasons:
+          type: array
+          description: Every reason a request can be invalid, in order of precedence
+          items: { type: string }
+          example: [unknown_operation, content_type, body_too_large, parameter, body, timeout, internal]
