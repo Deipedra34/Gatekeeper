@@ -139,10 +139,12 @@ func (v *Validator) Check(ctx context.Context, req *http.Request) Result {
 	}
 	res := Result{Outcome: Passed, Operation: operationName(route)}
 
-	// kin-openapi gets a shallow copy of its own, with no body: it never
-	// touches the request that goes on to the backend.
+	// kin-openapi gets a shallow copy of its own, with no body and no
+	// credentials: it never touches the request that goes on to the
+	// backend, and never sees a secret.
 	in := req.WithContext(ctx)
 	in.Body = http.NoBody
+	in.Header = v.spec.withoutSecrets(req.Header)
 	opts := v.options
 	err = openapi3filter.ValidateRequest(ctx, &openapi3filter.RequestValidationInput{
 		Request:    in,

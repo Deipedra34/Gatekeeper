@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -44,18 +45,30 @@ type Spec struct {
 	Operations int
 	// LoadedAt is when the file was loaded.
 	LoadedAt time.Time
+	// IgnoredParameters counts the parameters left unchecked because
+	// they carry credentials (see ParseSpec).
+	IgnoredParameters int
 
 	doc    *openapi3.T
 	router routers.Router
+
+	// secretHeaders are the canonical names of the headers that carry
+	// credentials, which validation never sees.
+	secretHeaders []string
 }
 
+// builtinSecretHeaders always carry credentials, whatever the config.
+var builtinSecretHeaders = []string{"Authorization", "Proxy-Authorization", "Cookie"}
+
 // LoadSpec reads, parses, and checks the OpenAPI spec at path.
-func LoadSpec(path string) (*Spec, error) {
+// secretHeaders are headers carrying credentials besides Authorization,
+// Proxy-Authorization, and Cookie (the API key header); see ParseSpec.
+func LoadSpec(path string, secretHeaders ...string) (*Spec, error) {
 	data, err := readSpecFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return ParseSpec(path, data)
+	return ParseSpec(path, data, secretHeaders...)
 }
 
 func readSpecFile(path string) ([]byte, error) {
@@ -93,7 +106,15 @@ func specFileError(path string, err error) error {
 // path (YAML or JSON). Relative $refs to other local files resolve
 // against path's directory; references to anything else — http(s) URLs
 // included — are refused, so loading a spec never reaches the network.
-func ParseSpec(path string, data []byte) (*Spec, error) {
+//
+// Credentials are left to the gateway's own auth, which has already run
+// by the time a request is validated: the spec's security requirements
+// are dropped, and so are its cookie parameters and its header
+// parameters for Authorization, Proxy-Authorization, Cookie, and
+// secretHeaders. Those headers are also removed from the copy of each
+// request that is validated, so their values never reach the validator,
+// its errors, or the logs.
+func ParseSpec(path string, data []byte, secretHeaders ...string) (*Spec, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("OpenAPI spec %s: %w", path, err)
@@ -115,6 +136,8 @@ func ParseSpec(path string, data []byte) (*Spec, error) {
 	// Only the path of a server URL matters here: the gateway, not the
 	// spec, decides which host and scheme a request arrived on.
 	pathOnlyServers(doc)
+	secrets := canonicalSecrets(secretHeaders)
+	ignored := dropCredentials(doc, secrets)
 	router, err := gorillamux.NewRouter(doc)
 	if err != nil {
 		return nil, fmt.Errorf("OpenAPI spec %s: compiling its paths: %w", path, err)
@@ -128,6 +151,9 @@ func ParseSpec(path string, data []byte) (*Spec, error) {
 		LoadedAt: time.Now(),
 		doc:      doc,
 		router:   router,
+
+		IgnoredParameters: ignored,
+		secretHeaders:     secrets,
 	}
 	if doc.Info != nil {
 		s.Title, s.Version = doc.Info.Title, doc.Info.Version
@@ -195,4 +221,65 @@ func (s *Spec) findRoute(req *http.Request) (*routers.Route, map[string]string, 
 		return s.router.FindRoute(&get)
 	}
 	return route, params, err
+}
+
+// canonicalSecrets returns the built-in credential headers plus extra,
+// canonicalised and without duplicates.
+func canonicalSecrets(extra []string) []string {
+	out := make([]string, 0, len(builtinSecretHeaders)+len(extra))
+	for _, name := range append(append([]string(nil), builtinSecretHeaders...), extra...) {
+		if name == "" {
+			continue
+		}
+		canon := http.CanonicalHeaderKey(name)
+		if !slices.Contains(out, canon) {
+			out = append(out, canon)
+		}
+	}
+	return out
+}
+
+// dropCredentials removes from doc what validation must not look at:
+// security requirements, cookie parameters, and header parameters named
+// in secrets. It returns how many parameters it removed.
+func dropCredentials(doc *openapi3.T, secrets []string) int {
+	doc.Security = nil
+	if doc.Paths == nil {
+		return 0
+	}
+	removed := 0
+	keep := func(params openapi3.Parameters) openapi3.Parameters {
+		out := params[:0:0]
+		for _, ref := range params {
+			if p := ref.Value; p != nil {
+				if p.In == openapi3.ParameterInCookie ||
+					(p.In == openapi3.ParameterInHeader && slices.Contains(secrets, http.CanonicalHeaderKey(p.Name))) {
+					removed++
+					continue
+				}
+			}
+			out = append(out, ref)
+		}
+		return out
+	}
+	for _, item := range doc.Paths.Map() {
+		item.Parameters = keep(item.Parameters)
+		for _, op := range item.Operations() {
+			op.Security = nil
+			op.Parameters = keep(op.Parameters)
+		}
+	}
+	return removed
+}
+
+// withoutSecrets returns h minus the spec's credential headers. Values
+// are shared with h, not copied.
+func (s *Spec) withoutSecrets(h http.Header) http.Header {
+	out := make(http.Header, len(h))
+	for name, values := range h {
+		if !slices.Contains(s.secretHeaders, http.CanonicalHeaderKey(name)) {
+			out[name] = values
+		}
+	}
+	return out
 }
