@@ -35,6 +35,7 @@ I built it as a reference implementation more than a one-off tool. All three rat
 - **IP access control and auto-ban.** Optional allow and deny lists of IPv4/IPv6 addresses and CIDR ranges, global and per route, checked first so a blocked address costs one lookup and no rate limit tokens. The client address comes from the connection, and `X-Forwarded-For` is believed only from configured trusted proxies. Addresses that keep hitting the rate limiter, failing auth, or getting denied are banned for a while, with escalating bans for repeat offenders, shared across instances through Redis. There are metrics, rate-limited logs, and admin endpoints to list, ban, and unban.
 - **Traffic splitting for canary and A/B releases.** Optional per-route variants, each with its own load-balanced backend group, split by weight. Clients stay on their variant through a stable hash of their IP, API key, JWT subject, or certificate, or a signed cookie. Allowlisted testers can force a variant with a header, match rules pin requests by header, cookie, or path, and a rollout raises a canary's weight in steps. Guardrails roll a variant back automatically when its 5xx rate or p95 latency gets worse than the baseline's, with a minimum sample and a cooldown. Per-variant metrics, log fields, span attributes, Grafana panels, and admin endpoints to set weights, pause, resume, promote, and roll back.
 - **Fault injection for resilience testing.** Optional per-route rules delay, abort, or reset a percentage of requests, targeted by header, path, method, variant, backend, or client allowlist. Faults go through the same retries, circuit breakers, and health checks a real failure would. A global kill switch, automatic expiry, startup and reload warnings, an "active" gauge, and a guard against 100% aborts in production keep it from causing harm. Includes metrics, log fields, span attributes, Grafana panels, and admin endpoints to add and remove rules at runtime.
+- **OpenAPI request validation.** Optional per-route checks against an OpenAPI 3.x spec (YAML or JSON) with [kin-openapi](https://github.com/getkin/kin-openapi): the operation, path, query, and header parameters, and the JSON body, with types, required fields, enums, formats, bounds, and patterns. `enforce` mode answers invalid requests with a 400 (or 422) listing which fields failed, never echoing values, before they reach the cache, circuit breaker, or backend. `report_only` logs and counts them and forwards them anyway. Paths are matched after `strip_prefix` and `rewrite`, bodies are read within a size limit and restored intact, and nesting depth and validation time are bounded. Credentials are left to auth. Specs reload with the config, and an invalid one keeps the old. Includes metrics, a span attribute, rate-limited logs, Grafana panels, and an admin endpoint.
 - **Graceful degradation.** If Redis goes down — at startup or mid-run — Gatekeeper falls back to in-memory limiting and logs a warning instead of taking the gateway down with it.
 
 ## Installation
@@ -160,6 +161,7 @@ internal/server/       the listeners: plain HTTP or HTTPS (mTLS, certificate hot
 internal/lb/           load balancing: backend pools, strategies, consistent hashing, active/passive health checks, draining
 internal/split/        traffic splitting: stable hashing, sticky assignment, overrides and rules, rollouts, auto-rollback guardrails
 internal/fault/        fault injection: rules, targeting, percentages, exemptions, expiry, and the registry the router asks per request
+internal/validation/   OpenAPI request validation: spec loading, operation matching, parameter and body checks (kin-openapi), body limits, error bodies, counts
 internal/admin/        the admin API: its own listener, token/mTLS auth, audit log, and the status/config/backends/cache/ratelimit endpoints
 internal/tracing/      OpenTelemetry setup (exporters, sampling, OTEL_* overrides), the server span, and span/propagation helpers
 internal/certgen/      throwaway CA / server / client certificate generation for tests and scripts/gencerts
@@ -168,6 +170,7 @@ internal/websocket/    WebSocket upgrade detection, the frame relay, and the hub
 internal/middleware/   logging, CORS, API key + JWT auth, rate-limit middleware
 internal/metrics/      Prometheus collectors + /metrics handler
 configs/                example config.yaml
+examples/openapi/      an example OpenAPI spec, validated by the docker-compose demo
 scripts/loadtest/      goroutine-based load generator (see "Load testing" below)
 scripts/wsclient/      tiny WebSocket client for trying out WebSocket proxying
 observability/         OpenTelemetry Collector config for docker-compose.tracing.yml
@@ -2563,7 +2566,7 @@ A lookup is a binary search over merged ranges, so it stays in the tens of nanos
 
 ## Architecture Decisions
 
-Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address, how traffic splits assign clients and roll back, where injected faults take effect and how they're kept safe — live in [`docs/adr/`](docs/adr/).
+Short records of the reasoning behind Gatekeeper's key architectural choices — why Token Bucket is the default, why Redis coordination uses Lua scripts, why storage sits behind a `Store` interface, why `FallbackStore` exists, why the admin API has its own listener, how transformations stay safe, how IP access lists are matched and who is trusted to report a client's address, how traffic splits assign clients and roll back, where injected faults take effect and how they're kept safe, why request validation uses kin-openapi and where it runs — live in [`docs/adr/`](docs/adr/).
 
 ## Configuration reference
 
@@ -2586,6 +2589,7 @@ access_control: { mode: off|denylist|allowlist_only, allow: [...], deny: [...], 
              # per route: access_control: { mode, allow, deny, deny_status }
 fault_injection: { global_enabled, environment: production|staging|development|test, exempt_paths: [...] }
              # per route: fault_injection: { enabled, delay: { percentage, fixed | min, max }, abort: { percentage, status }, connection_reset: { percentage }, match: { header: { name, value }, path_prefixes, methods, variants, backends, clients: { tiers, api_keys, cidrs } }, max_duration, count_as_backend_failure, allow_full_abort }
+             # per route: validation: { enabled, openapi_file, mode: enforce|report_only, reject_status: 400|422, reject_unknown_operations, validate_content_type, validate_non_json_bodies, max_body_bytes, max_json_depth, timeout }
 admin:       { enabled, listen, tokens: [ { id, sha256 } ], mtls: { enabled, allowed_cns: [...] }, allowed_cidrs: [...], tls: { ...same as tls... }, auth_failures: { max_failures, window }, read_timeout, write_timeout, idle_timeout, max_body_bytes, audit_log }
 ```
 
