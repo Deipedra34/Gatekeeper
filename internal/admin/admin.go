@@ -1,6 +1,7 @@
 // Package admin serves Gatekeeper's admin API: read-only views of the
 // running gateway (status, redacted config, routes, backends, rate limit
-// state, cache stats, access control lists and bans) and operator
+// state, cache stats, access control lists and bans, fault rules, and
+// OpenAPI validation specs and counts) and operator
 // actions (reload, cache purge, rate limit reset, backend drain/enable,
 // circuit breaker reset, IP ban and unban, traffic split weights,
 // rollouts, promotion, and rollback).
